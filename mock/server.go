@@ -20,10 +20,13 @@ import (
 	"time"
 )
 
-// MockS3Server provides a comprehensive mock implementation of the AWS S3 API
+// Use a separate random source to avoid affecting global rand state
+var mockRand = rand.New(rand.NewSource(time.Now().UnixNano()))
+
+// Server provides a comprehensive mock implementation of the AWS S3 API
 // for testing purposes. It implements all S3 operations used by the client library
 // including object operations, multipart uploads, list operations, and S3 Select.
-type MockS3Server struct {
+type Server struct {
 	server   *httptest.Server
 	objects  map[string]*MockObject
 	uploads  map[string]*MockMultipartUpload
@@ -33,6 +36,7 @@ type MockS3Server struct {
 	requests []RequestLog
 	errors   *ErrorSimulation
 	baseURL  string
+	debug    bool
 }
 
 // MockObject represents an S3 object stored in the mock server
@@ -81,9 +85,9 @@ type ErrorSimulation struct {
 	ErrorRate        float64 // 0.0 to 1.0
 }
 
-// NewMockS3Server creates a new mock S3 server for the specified bucket and region
-func NewMockS3Server(bucket, region string) *MockS3Server {
-	mock := &MockS3Server{
+// New creates a new mock S3 server for the specified bucket and region
+func New(bucket, region string) *Server {
+	mock := &Server{
 		objects: make(map[string]*MockObject),
 		uploads: make(map[string]*MockMultipartUpload),
 		bucket:  bucket,
@@ -98,19 +102,19 @@ func NewMockS3Server(bucket, region string) *MockS3Server {
 }
 
 // URL returns the base URL of the mock server
-func (m *MockS3Server) URL() string {
+func (m *Server) URL() string {
 	return m.baseURL
 }
 
 // Close shuts down the mock server and cleans up resources
-func (m *MockS3Server) Close() {
+func (m *Server) Close() {
 	if m.server != nil {
 		m.server.Close()
 	}
 }
 
 // Clear removes all objects and uploads from the mock server
-func (m *MockS3Server) Clear() {
+func (m *Server) Clear() {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
@@ -120,12 +124,12 @@ func (m *MockS3Server) Clear() {
 }
 
 // PutObject adds an object to the mock server
-func (m *MockS3Server) PutObject(key string, content []byte) string {
+func (m *Server) PutObject(key string, content []byte) string {
 	return m.PutObjectWithMetadata(key, content, nil)
 }
 
 // PutObjectWithMetadata adds an object with metadata to the mock server
-func (m *MockS3Server) PutObjectWithMetadata(key string, content []byte, metadata map[string]string) string {
+func (m *Server) PutObjectWithMetadata(key string, content []byte, metadata map[string]string) string {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
@@ -144,7 +148,7 @@ func (m *MockS3Server) PutObjectWithMetadata(key string, content []byte, metadat
 }
 
 // GetObject retrieves an object from the mock server
-func (m *MockS3Server) GetObject(key string) (*MockObject, bool) {
+func (m *Server) GetObject(key string) (*MockObject, bool) {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 
@@ -153,7 +157,7 @@ func (m *MockS3Server) GetObject(key string) (*MockObject, bool) {
 }
 
 // DeleteObject removes an object from the mock server
-func (m *MockS3Server) DeleteObject(key string) bool {
+func (m *Server) DeleteObject(key string) bool {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
@@ -165,7 +169,7 @@ func (m *MockS3Server) DeleteObject(key string) bool {
 }
 
 // ListObjects returns a list of object keys matching the given prefix
-func (m *MockS3Server) ListObjects(prefix string) []string {
+func (m *Server) ListObjects(prefix string) []string {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 
@@ -181,14 +185,14 @@ func (m *MockS3Server) ListObjects(prefix string) []string {
 }
 
 // PopulateTestData adds multiple test objects to the mock server
-func (m *MockS3Server) PopulateTestData(data map[string][]byte) {
+func (m *Server) PopulateTestData(data map[string][]byte) {
 	for key, content := range data {
 		m.PutObject(key, content)
 	}
 }
 
 // GetRequestLog returns all logged requests
-func (m *MockS3Server) GetRequestLog() []RequestLog {
+func (m *Server) GetRequestLog() []RequestLog {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 
@@ -199,21 +203,35 @@ func (m *MockS3Server) GetRequestLog() []RequestLog {
 }
 
 // EnableErrorSimulation enables error simulation with the given configuration
-func (m *MockS3Server) EnableErrorSimulation(config ErrorSimulation) {
+func (m *Server) EnableErrorSimulation(config ErrorSimulation) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 	m.errors = &config
 }
 
 // DisableErrorSimulation disables all error simulation
-func (m *MockS3Server) DisableErrorSimulation() {
+func (m *Server) DisableErrorSimulation() {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 	m.errors = &ErrorSimulation{}
 }
 
+// EnableDebug enables debug logging
+func (m *Server) EnableDebug() {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	m.debug = true
+}
+
+// DisableDebug disables debug logging
+func (m *Server) DisableDebug() {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	m.debug = false
+}
+
 // ServeHTTP handles HTTP requests to the mock S3 server
-func (m *MockS3Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+func (m *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Log the request
 	m.logRequest(r)
 
@@ -292,7 +310,7 @@ func (m *MockS3Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // logRequest logs details about an HTTP request
-func (m *MockS3Server) logRequest(r *http.Request) {
+func (m *Server) logRequest(r *http.Request) {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
@@ -320,11 +338,11 @@ func (m *MockS3Server) logRequest(r *http.Request) {
 }
 
 // shouldSimulateError determines if an error should be simulated
-func (m *MockS3Server) shouldSimulateError() bool {
+func (m *Server) shouldSimulateError() bool {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 
-	if m.errors.ErrorRate > 0 && rand.Float64() < m.errors.ErrorRate {
+	if m.errors.ErrorRate > 0 && mockRand.Float64() < m.errors.ErrorRate {
 		return true
 	}
 
@@ -332,7 +350,7 @@ func (m *MockS3Server) shouldSimulateError() bool {
 }
 
 // writeErrorResponse writes an AWS-compatible error response
-func (m *MockS3Server) writeErrorResponse(w http.ResponseWriter, code, message string, statusCode int) {
+func (m *Server) writeErrorResponse(w http.ResponseWriter, code, message string, statusCode int) {
 	errorResponse := struct {
 		XMLName xml.Name `xml:"Error"`
 		Code    string   `xml:"Code"`
@@ -435,11 +453,11 @@ func parseRange(rangeHeader string, contentLength int64) (start, end int64, err 
 
 // generateUploadID generates a unique upload ID for multipart uploads
 func generateUploadID() string {
-	return fmt.Sprintf("upload-%d-%d", time.Now().UnixNano(), rand.Int63())
+	return fmt.Sprintf("upload-%d-%d", time.Now().UnixNano(), mockRand.Int63())
 }
 
 // handleGetObject handles GET requests for objects
-func (m *MockS3Server) handleGetObject(w http.ResponseWriter, r *http.Request, key string) {
+func (m *Server) handleGetObject(w http.ResponseWriter, r *http.Request, key string) {
 	m.mutex.RLock()
 	obj, exists := m.objects[key]
 	m.mutex.RUnlock()
@@ -477,7 +495,7 @@ func (m *MockS3Server) handleGetObject(w http.ResponseWriter, r *http.Request, k
 }
 
 // handleHeadObject handles HEAD requests for objects
-func (m *MockS3Server) handleHeadObject(w http.ResponseWriter, r *http.Request, key string) {
+func (m *Server) handleHeadObject(w http.ResponseWriter, r *http.Request, key string) {
 	m.mutex.RLock()
 	obj, exists := m.objects[key]
 	m.mutex.RUnlock()
@@ -495,7 +513,7 @@ func (m *MockS3Server) handleHeadObject(w http.ResponseWriter, r *http.Request, 
 }
 
 // handlePutObject handles PUT requests for objects
-func (m *MockS3Server) handlePutObject(w http.ResponseWriter, r *http.Request, key string) {
+func (m *Server) handlePutObject(w http.ResponseWriter, r *http.Request, key string) {
 	content, err := io.ReadAll(r.Body)
 	if err != nil {
 		m.writeErrorResponse(w, "InvalidRequest", "Failed to read request body", http.StatusBadRequest)
@@ -509,7 +527,7 @@ func (m *MockS3Server) handlePutObject(w http.ResponseWriter, r *http.Request, k
 }
 
 // handleDeleteObject handles DELETE requests for objects
-func (m *MockS3Server) handleDeleteObject(w http.ResponseWriter, r *http.Request, key string) {
+func (m *Server) handleDeleteObject(w http.ResponseWriter, r *http.Request, key string) {
 	deleted := m.DeleteObject(key)
 	if deleted {
 		w.WriteHeader(http.StatusNoContent)
@@ -545,11 +563,12 @@ type CommonPrefix struct {
 }
 
 // handleListObjects handles GET requests for listing objects
-func (m *MockS3Server) handleListObjects(w http.ResponseWriter, r *http.Request, query url.Values) {
+func (m *Server) handleListObjects(w http.ResponseWriter, r *http.Request, query url.Values) {
 	prefix := query.Get("prefix")
 	delimiter := query.Get("delimiter")
 	maxKeysStr := query.Get("max-keys")
 	continuationToken := query.Get("continuation-token")
+	startAfter := query.Get("start-after")
 
 	maxKeys := 1000 // Default
 	if maxKeysStr != "" {
@@ -569,11 +588,18 @@ func (m *MockS3Server) handleListObjects(w http.ResponseWriter, r *http.Request,
 	}
 	sort.Strings(allKeys)
 
-	// Handle continuation token (simple implementation)
+	// Handle continuation token and start-after
 	startIndex := 0
+	startKey := ""
 	if continuationToken != "" {
+		startKey = continuationToken
+	} else if startAfter != "" {
+		startKey = startAfter
+	}
+
+	if startKey != "" {
 		for i, key := range allKeys {
-			if key > continuationToken {
+			if key > startKey {
 				startIndex = i
 				break
 			}
@@ -584,9 +610,13 @@ func (m *MockS3Server) handleListObjects(w http.ResponseWriter, r *http.Request,
 	var commonPrefixes []CommonPrefix
 	prefixSet := make(map[string]bool)
 
+	// Process keys and build response
 	count := 0
+	lastKey := ""
+
 	for i := startIndex; i < len(allKeys) && count < maxKeys; i++ {
 		key := allKeys[i]
+		lastKey = key
 
 		if delimiter != "" {
 			// Check if this key should be grouped under a common prefix
@@ -616,10 +646,13 @@ func (m *MockS3Server) handleListObjects(w http.ResponseWriter, r *http.Request,
 		count++
 	}
 
-	isTruncated := startIndex+count < len(allKeys)
+	// Determine if truncated and next token
+	isTruncated := false
 	var nextToken string
-	if isTruncated && len(allKeys) > startIndex+count {
-		nextToken = allKeys[startIndex+count-1]
+
+	if count >= maxKeys && startIndex+count < len(allKeys) {
+		isTruncated = true
+		nextToken = lastKey
 	}
 
 	response := ListObjectsV2Response{
@@ -647,7 +680,7 @@ type InitiateMultipartUploadResponse struct {
 }
 
 // handleInitiateMultipartUpload handles POST requests to initiate multipart uploads
-func (m *MockS3Server) handleInitiateMultipartUpload(w http.ResponseWriter, r *http.Request, key string) {
+func (m *Server) handleInitiateMultipartUpload(w http.ResponseWriter, r *http.Request, key string) {
 	uploadID := generateUploadID()
 
 	m.mutex.Lock()
@@ -673,7 +706,7 @@ func (m *MockS3Server) handleInitiateMultipartUpload(w http.ResponseWriter, r *h
 }
 
 // handleUploadPart handles PUT requests for uploading parts
-func (m *MockS3Server) handleUploadPart(w http.ResponseWriter, r *http.Request, key string, query url.Values) {
+func (m *Server) handleUploadPart(w http.ResponseWriter, r *http.Request, key string, query url.Values) {
 	uploadID := query.Get("uploadId")
 	partNumberStr := query.Get("partNumber")
 
@@ -735,7 +768,7 @@ type CompleteMultipartUploadResponse struct {
 }
 
 // handleCompleteMultipartUpload handles POST requests to complete multipart uploads
-func (m *MockS3Server) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Request, key string, query url.Values) {
+func (m *Server) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Request, key string, query url.Values) {
 	uploadID := query.Get("uploadId")
 
 	m.mutex.RLock()
@@ -791,7 +824,7 @@ func (m *MockS3Server) handleCompleteMultipartUpload(w http.ResponseWriter, r *h
 }
 
 // handleAbortMultipartUpload handles DELETE requests to abort multipart uploads
-func (m *MockS3Server) handleAbortMultipartUpload(w http.ResponseWriter, r *http.Request, key string, query url.Values) {
+func (m *Server) handleAbortMultipartUpload(w http.ResponseWriter, r *http.Request, key string, query url.Values) {
 	uploadID := query.Get("uploadId")
 
 	m.mutex.Lock()
@@ -809,7 +842,7 @@ func (m *MockS3Server) handleAbortMultipartUpload(w http.ResponseWriter, r *http
 }
 
 // handleS3Select handles POST requests for S3 Select operations
-func (m *MockS3Server) handleS3Select(w http.ResponseWriter, r *http.Request, key string) {
+func (m *Server) handleS3Select(w http.ResponseWriter, r *http.Request, key string) {
 	m.mutex.RLock()
 	_, exists := m.objects[key]
 	m.mutex.RUnlock()
@@ -836,7 +869,7 @@ func (m *MockS3Server) handleS3Select(w http.ResponseWriter, r *http.Request, ke
 }
 
 // writeS3SelectFrame writes a simulated S3 Select data frame
-func (m *MockS3Server) writeS3SelectFrame(w http.ResponseWriter, data string) {
+func (m *Server) writeS3SelectFrame(w http.ResponseWriter, data string) {
 	// Simplified S3 Select frame format
 	// In reality, this would be much more complex with proper binary encoding
 	payload := []byte(data)
@@ -856,7 +889,7 @@ func (m *MockS3Server) writeS3SelectFrame(w http.ResponseWriter, data string) {
 }
 
 // writeS3SelectEndFrame writes the end frame for S3 Select
-func (m *MockS3Server) writeS3SelectEndFrame(w http.ResponseWriter) {
+func (m *Server) writeS3SelectEndFrame(w http.ResponseWriter) {
 	// Write end frame
 	endFrame := make([]byte, 16)
 	binary.BigEndian.PutUint32(endFrame[0:4], 16) // total length
@@ -867,13 +900,13 @@ func (m *MockS3Server) writeS3SelectEndFrame(w http.ResponseWriter) {
 // Testing utility functions
 
 // ObjectExists checks if an object exists in the mock server
-func (m *MockS3Server) ObjectExists(key string) bool {
+func (m *Server) ObjectExists(key string) bool {
 	_, exists := m.GetObject(key)
 	return exists
 }
 
 // ObjectContent returns the content of an object if it exists
-func (m *MockS3Server) ObjectContent(key string) ([]byte, bool) {
+func (m *Server) ObjectContent(key string) ([]byte, bool) {
 	obj, exists := m.GetObject(key)
 	if !exists {
 		return nil, false
@@ -882,13 +915,13 @@ func (m *MockS3Server) ObjectContent(key string) ([]byte, bool) {
 }
 
 // RequestCount returns the number of requests made to the server
-func (m *MockS3Server) RequestCount() int {
+func (m *Server) RequestCount() int {
 	logs := m.GetRequestLog()
 	return len(logs)
 }
 
 // HasRequestWithMethod checks if a request with the specified method was made
-func (m *MockS3Server) HasRequestWithMethod(method string) bool {
+func (m *Server) HasRequestWithMethod(method string) bool {
 	logs := m.GetRequestLog()
 	for _, log := range logs {
 		if log.Method == method {
@@ -899,7 +932,7 @@ func (m *MockS3Server) HasRequestWithMethod(method string) bool {
 }
 
 // GetRequestsWithMethod returns all requests with the specified method
-func (m *MockS3Server) GetRequestsWithMethod(method string) []RequestLog {
+func (m *Server) GetRequestsWithMethod(method string) []RequestLog {
 	logs := m.GetRequestLog()
 	var filtered []RequestLog
 	for _, log := range logs {
@@ -911,7 +944,7 @@ func (m *MockS3Server) GetRequestsWithMethod(method string) []RequestLog {
 }
 
 // GetMultipartUpload returns a multipart upload by ID
-func (m *MockS3Server) GetMultipartUpload(uploadID string) (*MockMultipartUpload, bool) {
+func (m *Server) GetMultipartUpload(uploadID string) (*MockMultipartUpload, bool) {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 
@@ -920,7 +953,7 @@ func (m *MockS3Server) GetMultipartUpload(uploadID string) (*MockMultipartUpload
 }
 
 // ListMultipartUploads returns all active multipart uploads
-func (m *MockS3Server) ListMultipartUploads() map[string]*MockMultipartUpload {
+func (m *Server) ListMultipartUploads() map[string]*MockMultipartUpload {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 
@@ -933,7 +966,7 @@ func (m *MockS3Server) ListMultipartUploads() map[string]*MockMultipartUpload {
 }
 
 // SetObjectMetadata sets metadata for an existing object
-func (m *MockS3Server) SetObjectMetadata(key string, metadata map[string]string) bool {
+func (m *Server) SetObjectMetadata(key string, metadata map[string]string) bool {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
@@ -947,7 +980,7 @@ func (m *MockS3Server) SetObjectMetadata(key string, metadata map[string]string)
 }
 
 // GetObjectMetadata returns metadata for an object
-func (m *MockS3Server) GetObjectMetadata(key string) (map[string]string, bool) {
+func (m *Server) GetObjectMetadata(key string) (map[string]string, bool) {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 

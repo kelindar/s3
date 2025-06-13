@@ -13,7 +13,7 @@ import (
 // TestMockS3ServerBasicOperations demonstrates basic usage of the mock S3 server
 func TestMockS3ServerBasicOperations(t *testing.T) {
 	// Create mock server
-	mockServer := NewMockS3Server("test-bucket", "us-east-1")
+	mockServer := New("test-bucket", "us-east-1")
 	defer mockServer.Close()
 
 	// Create S3 client pointing to mock server
@@ -56,7 +56,7 @@ func TestMockS3ServerBasicOperations(t *testing.T) {
 
 // TestMockS3ServerListOperations demonstrates list operations
 func TestMockS3ServerListOperations(t *testing.T) {
-	mockServer := NewMockS3Server("test-bucket", "us-east-1")
+	mockServer := New("test-bucket", "us-east-1")
 	defer mockServer.Close()
 
 	// Populate test data
@@ -81,7 +81,7 @@ func TestMockS3ServerListOperations(t *testing.T) {
 
 // TestMockS3ServerRangeRequests demonstrates range request handling
 func TestMockS3ServerRangeRequests(t *testing.T) {
-	mockServer := NewMockS3Server("test-bucket", "us-east-1")
+	mockServer := New("test-bucket", "us-east-1")
 	defer mockServer.Close()
 
 	// Create large test content
@@ -113,7 +113,7 @@ func TestMockS3ServerRangeRequests(t *testing.T) {
 
 // TestMockS3ServerMultipartUpload demonstrates multipart upload operations
 func TestMockS3ServerMultipartUpload(t *testing.T) {
-	mockServer := NewMockS3Server("test-bucket", "us-east-1")
+	mockServer := New("test-bucket", "us-east-1")
 	defer mockServer.Close()
 
 	// Create S3 client
@@ -162,7 +162,7 @@ func TestMockS3ServerMultipartUpload(t *testing.T) {
 
 // TestMockS3ServerErrorSimulation demonstrates error simulation capabilities
 func TestMockS3ServerErrorSimulation(t *testing.T) {
-	mockServer := NewMockS3Server("test-bucket", "us-east-1")
+	mockServer := New("test-bucket", "us-east-1")
 	defer mockServer.Close()
 
 	// Enable error simulation
