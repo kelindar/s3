@@ -31,10 +31,11 @@ import (
 
 	"github.com/kelindar/s3/aws"
 	"github.com/kelindar/s3/fsutil"
+	"github.com/kelindar/s3/mock"
+	"github.com/stretchr/testify/assert"
 )
 
-// If you have AWS credentials available
-// and a test bucket set up, you can run
+// If you have AWS credentials available and a test bucket set up, you can run
 // this "integration test"
 func TestAWS(t *testing.T) {
 	bucket := os.Getenv("AWS_TEST_BUCKET")
@@ -48,6 +49,28 @@ func TestAWS(t *testing.T) {
 	if err != nil {
 		t.Skipf("skipping; couldn't derive key: %s", err)
 	}
+
+	testIntegration(t, bucket, prefix, key)
+}
+
+func TestBucket(t *testing.T) {
+	r := rand.New(rand.NewSource(time.Now().Unix()))
+
+	bucket := "test-bucket"
+	prefix := fmt.Sprintf("go-test-%d", r.Int())
+
+	// Create mock server
+	mockServer := mock.New(bucket, "us-east-1")
+	defer mockServer.Close()
+
+	// Create S3 client pointing to mock server
+	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
+	key.BaseURI = mockServer.URL()
+
+	testIntegration(t, bucket, prefix, key)
+}
+
+func testIntegration(t *testing.T, bucket, prefix string, key *aws.SigningKey) {
 
 	b := &BucketFS{
 		Key:      key,
@@ -98,10 +121,7 @@ func TestAWS(t *testing.T) {
 		return b.Remove(p)
 	}
 	// remove everything left under the prefix
-	err = fs.WalkDir(b, prefix, rm)
-	if err != nil {
-		t.Fatalf("removing left-over items: %s", err)
-	}
+	assert.NoError(t, fs.WalkDir(b, prefix, rm))
 }
 
 func testReadDir(t *testing.T, b *BucketFS, prefix string) {
