@@ -32,7 +32,7 @@ A lightweight, high-performance AWS S3 client library for Go that implements the
 
 **Not For:**
 - ❌ Applications requiring the full AWS SDK feature set (SQS, DynamoDB, etc.)
-- ❌ Use cases requiring advanced S3 features (bucket policies, lifecycle rules, object locking, versioning management, etc.)
+- ❌ Requiring advanced S3 features (bucket policies, lifecycle, object locking, versioning, etc.)
 - ❌ Projects that need official AWS support and enterprise features
 
 
