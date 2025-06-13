@@ -846,6 +846,7 @@ func (m *Server) handleCopyPart(w http.ResponseWriter, r *http.Request, upload *
 	// Return copy part result XML
 	response := fmt.Sprintf(`<CopyPartResult><ETag>%s</ETag></CopyPartResult>`, etag)
 	w.Header().Set("Content-Type", "application/xml")
+	w.Header().Set("ETag", etag)
 	w.WriteHeader(http.StatusOK)
 	w.Write([]byte(response))
 }

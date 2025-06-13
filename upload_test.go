@@ -42,8 +42,7 @@ func TestUpload(t *testing.T) {
 	}
 
 	// Test Start
-	err := up.Start()
-	assert.NoError(t, err)
+	assert.NoError(t, up.Start())
 	assert.NotEmpty(t, up.ID(), "upload ID should be set")
 
 	// Upload two parts in reverse order to test that the final
@@ -54,18 +53,16 @@ func TestUpload(t *testing.T) {
 	}
 
 	// Upload part 2 first
-	err = up.Upload(2, part)
-	assert.NoError(t, err)
+	assert.NoError(t, up.Upload(2, part))
 	assert.Equal(t, 1, up.CompletedParts())
 
 	// Upload part 1 second
-	err = up.Upload(1, part)
-	assert.NoError(t, err)
+	assert.NoError(t, up.Upload(1, part))
 	assert.Equal(t, 2, up.CompletedParts())
 
 	// Complete the upload
-	err = up.Close(nil)
-	assert.NoError(t, err)
+
+	assert.NoError(t, up.Close(nil))
 	assert.NotEmpty(t, up.ETag(), "final ETag should be set")
 
 	// Abort shouldn't do anything after completion
@@ -79,16 +76,9 @@ func TestUpload(t *testing.T) {
 		Object: "test-object-2",
 	}
 
-	err = up2.Start()
-	assert.NoError(t, err)
-
-	// Upload a part
-	err = up2.Upload(1, part)
-	assert.NoError(t, err)
-
-	// Test Abort
-	err = up2.Abort()
-	assert.NoError(t, err, "abort should work")
+	assert.NoError(t, up2.Start())
+	assert.NoError(t, up2.Upload(1, part))
+	assert.NoError(t, up2.Abort(), "abort should work")
 }
 
 func TestUploader_NextPart(t *testing.T) {
