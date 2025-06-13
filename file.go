@@ -83,14 +83,17 @@ func (f *File) Read(p []byte) (int, error) {
 		f.body.Close()
 		f.body = nil
 	}
+
 	err := f.ctx.Err()
 	if err != nil {
 		return 0, err
 	}
+
 	f.body, err = f.Reader.RangeReader(f.pos, f.Size()-f.pos)
 	if err != nil {
 		return 0, err
 	}
+
 	n, err := f.body.Read(p)
 	f.pos += int64(n)
 	return n, err
@@ -199,6 +202,7 @@ func (p *Prefix) VisitDir(name, seek, pattern string, walk fsutil.VisitDirFn) er
 		if err != nil && err != io.EOF {
 			return &fs.PathError{Op: "visit", Path: subp.Path, Err: err}
 		}
+
 		// despite being called "start-after", the
 		// S3 API includes the seek key in the list
 		// response, which is not consistent with
@@ -206,6 +210,7 @@ func (p *Prefix) VisitDir(name, seek, pattern string, walk fsutil.VisitDirFn) er
 		if len(d) > 0 && d[0].Name() == seek {
 			d = d[1:]
 		}
+
 		for i := range d {
 			err := walk(d[i])
 			if err != nil {

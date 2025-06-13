@@ -1,6 +1,18 @@
-# S3 - Lightweight AWS S3 Client
+<p align="center">
+<img width="200" height="110" src=".github/logo.png" border="0" alt="kelindar/s3">
+<br>
+<img src="https://img.shields.io/github/go-mod/go-version/kelindar/s3" alt="Go Version">
+<a href="https://pkg.go.dev/github.com/kelindar/s3"><img src="https://pkg.go.dev/badge/github.com/kelindar/s3" alt="PkgGoDev"></a>
+<a href="https://goreportcard.com/report/github.com/kelindar/s3"><img src="https://goreportcard.com/badge/github.com/kelindar/s3" alt="Go Report Card"></a>
+<a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License"></a>
+<a href="https://coveralls.io/github/kelindar/s3"><img src="https://coveralls.io/repos/github/kelindar/s3/badge.svg" alt="Coverage"></a>
+</p>
+
+# Slim AWS S3 (and compatible) client
 
 A lightweight, high-performance AWS S3 client library for Go that implements the standard `fs.FS` interface, allowing you to work with S3 buckets as if they were local filesystems.
+
+> **Attribution**: This library is extracted from [Sneller's lightweight S3 client](https://github.com/SnellerInc/sneller/tree/main/aws/s3). Most of the credit goes to the Sneller team for the original implementation and design.
 
 ## Features
 
@@ -12,6 +24,16 @@ A lightweight, high-performance AWS S3 client library for Go that implements the
 - **Context Support**: Full context cancellation support
 - **Lazy Loading**: Optional HEAD-only requests until actual read
 - **Multiple Auth Methods**: Environment variables, IAM roles, manual keys
+
+**Use When:**
+- ✅ Building applications that need to treat S3 as a filesystem (compatible with `fs.FS`)
+- ✅ Requiring lightweight, minimal-dependency S3 operations
+- ✅ Working with large files that benefit from range reads and multipart uploads
+
+**Not For:**
+- ❌ Applications requiring the full AWS SDK feature set (SQS, DynamoDB, etc.)
+- ❌ Use cases requiring advanced S3 features (bucket policies, lifecycle rules, object locking, versioning management, etc.)
+- ❌ Projects that need official AWS support and enterprise features
 
 ## Installation
 
@@ -40,13 +62,9 @@ func main() {
     if err != nil {
         panic(err)
     }
-    
-    // Create BucketFS instance
-    bucket := &s3.BucketFS{
-        Key:    key,
-        Bucket: "my-bucket",
-        Ctx:    context.Background(),
-    }
+
+    // Create Bucket instance
+    bucket := s3.NewBucket(context.Background(), key, "my-bucket")
     
     // Upload a file
     etag, err := bucket.Put("hello.txt", []byte("Hello, World!"))
@@ -101,11 +119,20 @@ key := aws.DeriveKey(
 ### File Operations
 
 ```go
+import (
+    "errors"
+    "io"
+    "io/fs"
+)
+
 // Upload a file
 etag, err := bucket.Put("path/to/file.txt", []byte("content"))
 
 // Read a file
 file, err := bucket.Open("path/to/file.txt")
+if err != nil {
+    panic(err)
+}
 defer file.Close()
 content, err := io.ReadAll(file)
 
@@ -119,6 +146,11 @@ if errors.Is(err, fs.ErrNotExist) {
 ### Directory Operations
 
 ```go
+import (
+    "fmt"
+    "io/fs"
+)
+
 // List directory contents
 entries, err := fs.ReadDir(bucket, "path/to/directory")
 for _, entry := range entries {
@@ -138,7 +170,11 @@ err = fs.WalkDir(bucket, ".", func(path string, d fs.DirEntry, err error) error 
 ### Pattern Matching
 
 ```go
-import "github.com/kelindar/s3/fsutil"
+import (
+    "fmt"
+    "io/fs"
+    "github.com/kelindar/s3/fsutil"
+)
 
 // Find all .txt files
 err := fsutil.WalkGlob(bucket, "", "*.txt", func(path string, f fs.File, err error) error {
@@ -154,8 +190,10 @@ err := fsutil.WalkGlob(bucket, "", "*.txt", func(path string, f fs.File, err err
 ### Range Reads
 
 ```go
+import "io"
+
 // Read first 1KB of a file
-reader, err := bucket.OpenRange("large-file.dat", etag, 0, 1024)
+reader, err := bucket.OpenRange("large-file.dat", "", 0, 1024)
 if err != nil {
     panic(err)
 }
@@ -167,6 +205,8 @@ data, err := io.ReadAll(reader)
 ### Multi-part Upload
 
 ```go
+import "github.com/kelindar/s3"
+
 uploader := &s3.Uploader{
     Key:         key,
     Bucket:      "my-bucket",
@@ -185,71 +225,22 @@ err = uploader.Upload(1, part1Data) // []byte with len >= 5MB
 err = uploader.Upload(2, part2Data)
 
 // Complete upload
-etag, err := uploader.Close()
+err = uploader.Close(nil)
 ```
 
-## Configuration Options
-
-### BucketFS Options
+### Bucket Options
 
 ```go
-bucket := &s3.BucketFS{
-    Key:      key,           // Required: Signing key
-    Bucket:   "my-bucket",   // Required: S3 bucket name
-    Client:   httpClient,    // Optional: Custom HTTP client
-    Ctx:      ctx,           // Optional: Context for requests
-    DelayGet: true,          // Optional: Use HEAD instead of GET for Open()
-}
-```
-
-### Custom HTTP Client
-
-```go
-import "net/http"
-
-client := &http.Client{
-    Timeout: 30 * time.Second,
-    Transport: &http.Transport{
-        MaxIdleConns:        100,
-        MaxIdleConnsPerHost: 10,
-    },
-}
-
-bucket := &s3.BucketFS{
-    Key:    key,
-    Bucket: "my-bucket",
-    Client: client,
-    Ctx:    context.Background(),
-}
-```
-
-## Advanced Features
-
-### S3 Select (Parquet)
-
-Query Parquet files directly in S3:
-
-```go
-file, err := bucket.Open("data.parquet")
-if err != nil {
-    panic(err)
-}
-defer file.Close()
-
-s3File := file.(*s3.File)
-reader, err := s3File.SelectJSON("SELECT * FROM S3Object LIMIT 100", "parquet")
-if err != nil {
-    panic(err)
-}
-defer reader.Close()
-
-// Read JSON results
-results, err := io.ReadAll(reader)
+bucket := s3.NewBucket(ctx, key, "my-bucket")
+bucket.Client = httpClient   // Optional: Custom HTTP client
+bucket.Lazy = true           // Optional: Use HEAD instead of GET for Open()
 ```
 
 ### Working with Subdirectories
 
 ```go
+import "io/fs"
+
 // Create a sub-filesystem for a specific prefix
 subFS, err := bucket.Sub("data/2023/")
 if err != nil {
@@ -265,6 +256,12 @@ files, err := fs.ReadDir(subFS, ".")
 The library uses standard Go `fs` package errors:
 
 ```go
+import (
+    "errors"
+    "fmt"
+    "io/fs"
+)
+
 file, err := bucket.Open("nonexistent.txt")
 if errors.Is(err, fs.ErrNotExist) {
     fmt.Println("File not found")
