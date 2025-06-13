@@ -263,6 +263,8 @@ func AmbientKey(service string, derive DeriveFn) (*SigningKey, error) {
 	switch service {
 	case "s3":
 		baseURI = S3EndPoint(region)
+	case "b2":
+		baseURI = B2EndPoint(region)
 	default:
 		return nil, fmt.Errorf("unknown service %s", service)
 	}
@@ -279,6 +281,12 @@ func S3EndPoint(region string) string {
 	}
 	endPoint = strings.TrimSuffix(endPoint, "/")
 	return endPoint
+}
+
+// B2EndPoint returns the endpoint of the Backblaze B2
+// object storage service.
+func B2EndPoint(region string) string {
+	return fmt.Sprintf("https://s3.%s.backblazeb2.com", region)
 }
 
 type scanspec struct {

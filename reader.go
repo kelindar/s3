@@ -428,9 +428,11 @@ func DeriveForBucket(bucket string) aws.DeriveFn {
 		if !ValidBucket(bucket) {
 			return nil, badBucket(bucket)
 		}
-		if service != "s3" {
+
+		if service != "s3" && service != "b2" {
 			return nil, fmt.Errorf("s3.DeriveForBucket: expected service \"s3\"; got %q", service)
 		}
+
 		k := aws.DeriveKey(baseURI, id, secret, region, service)
 		k.Token = token
 		bregion, err := BucketRegion(k, bucket)
