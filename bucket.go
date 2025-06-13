@@ -31,37 +31,38 @@ import (
 
 // Bucket implements fs.FS, fs.ReadDirFS, and fs.SubFS.
 type Bucket struct {
-	Key    *aws.SigningKey
-	Bucket string
-	Client *http.Client
-	Ctx    context.Context
+	key *aws.SigningKey
+	bkt string
+	ctx context.Context
 
-	// DelayGet, if true, causes the
-	// Open call to use a HEAD operation
-	// rather than a GET operation.
-	// The first call to fs.File.Read will
+	// Client is the HTTP client used to make requests. If it is nil, then
+	// DefaultClient will be used.
+	Client *http.Client
+
+	// Lazy, if true, causes the initial Open call to use a HEAD operation
+	// rather than a GET operation. The first call to fs.File.Read will
 	// cause the full GET to be performed.
-	DelayGet bool
+	Lazy bool
 }
 
 // NewBucket creates a new Bucket instance.
 func NewBucket(ctx context.Context, key *aws.SigningKey, bucket string) *Bucket {
 	return &Bucket{
-		Key:    key,
-		Bucket: bucket,
-		Ctx:    ctx,
+		key: key,
+		bkt: bucket,
+		ctx: ctx,
 	}
 }
 
 func (b *Bucket) sub(name string) *Prefix {
-	return b.subctx(b.Ctx, name)
+	return b.subctx(b.ctx, name)
 }
 
 func (b *Bucket) subctx(ctx context.Context, name string) *Prefix {
 	return &Prefix{
-		Key:    b.Key,
+		Key:    b.key,
 		Client: b.Client,
-		Bucket: b.Bucket,
+		Bucket: b.bkt,
 		Path:   name,
 		Ctx:    ctx,
 	}
@@ -97,11 +98,11 @@ func (b *Bucket) Put(where string, contents []byte) (string, error) {
 }
 
 func (b *Bucket) put(where string, contents []byte) (string, error) {
-	req, err := http.NewRequestWithContext(b.Ctx, http.MethodPut, uri(b.Key, b.Bucket, where), nil)
+	req, err := http.NewRequestWithContext(b.ctx, http.MethodPut, uri(b.key, b.bkt, where), nil)
 	if err != nil {
 		return "", err
 	}
-	b.Key.SignV4(req, contents)
+	b.key.SignV4(req, contents)
 	client := b.Client
 	if client == nil {
 		client = &DefaultClient
@@ -142,8 +143,8 @@ func (b *Bucket) OpenRange(name, etag string, start, width int64) (io.ReadCloser
 	}
 	r := Reader{
 		Client: b.Client,
-		Key:    b.Key,
-		Bucket: b.Bucket,
+		Key:    b.key,
+		Bucket: b.bkt,
 		Path:   name,
 		ETag:   etag,
 	}
@@ -174,7 +175,7 @@ func (b *Bucket) Open(name string) (fs.File, error) {
 		// try a HEAD or GET operation; these
 		// are cheaper and faster than
 		// full listing operations
-		f, err := Open(b.Key, b.Bucket, name, !b.DelayGet)
+		f, err := Open(b.key, b.bkt, name, !b.Lazy)
 		if err == nil || !errors.Is(err, fs.ErrNotExist) {
 			return f, err
 		}
@@ -226,11 +227,11 @@ func (b *Bucket) Remove(fullpath string) error {
 	if !fs.ValidPath(fullpath) {
 		return fmt.Errorf("%s: %s", fullpath, fs.ErrInvalid)
 	}
-	req, err := http.NewRequestWithContext(b.Ctx, http.MethodDelete, uri(b.Key, b.Bucket, fullpath), nil)
+	req, err := http.NewRequestWithContext(b.ctx, http.MethodDelete, uri(b.key, b.bkt, fullpath), nil)
 	if err != nil {
 		return err
 	}
-	b.Key.SignV4(req, nil)
+	b.key.SignV4(req, nil)
 	client := b.Client
 	if client == nil {
 		client = &DefaultClient

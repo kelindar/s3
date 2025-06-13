@@ -71,7 +71,7 @@ func TestBucket(t *testing.T) {
 
 func testIntegration(t *testing.T, bucket, prefix string, key *aws.SigningKey) {
 	b := NewBucket(context.Background(), key, bucket)
-	b.DelayGet = true
+	b.Lazy = true
 
 	tests := []struct {
 		name string
@@ -378,7 +378,7 @@ func TestBucket_DelayGet(t *testing.T) {
 	key.BaseURI = mockServer.URL()
 
 	b := NewBucket(context.Background(), key, bucket)
-	b.DelayGet = true
+	b.Lazy = true
 
 	// Create test content
 	content := []byte("DelayGet test content")

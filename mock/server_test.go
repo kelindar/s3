@@ -35,11 +35,7 @@ func TestMockS3ServerBasicOperations(t *testing.T) {
 	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
 	key.BaseURI = mockServer.URL()
 
-	bucket := &s3.Bucket{
-		Key:    key,
-		Bucket: "test-bucket",
-		Ctx:    context.Background(),
-	}
+	bucket := s3.NewBucket(context.Background(), key, "test-bucket")
 
 	// Test PUT operation
 	testContent := []byte("Hello, World!")
@@ -108,11 +104,7 @@ func TestMockS3ServerRangeRequests(t *testing.T) {
 	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
 	key.BaseURI = mockServer.URL()
 
-	bucket := &s3.Bucket{
-		Key:    key,
-		Bucket: "test-bucket",
-		Ctx:    context.Background(),
-	}
+	bucket := s3.NewBucket(context.Background(), key, "test-bucket")
 
 	// Test range read (start=100, width=101 to read bytes 100-200 inclusive)
 	reader, err := bucket.OpenRange("large-file.bin", "", 100, 101)
@@ -322,11 +314,7 @@ func TestMockS3ServerErrorSimulation(t *testing.T) {
 	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
 	key.BaseURI = mockServer.URL()
 
-	bucket := &s3.Bucket{
-		Key:    key,
-		Bucket: "test-bucket",
-		Ctx:    context.Background(),
-	}
+	bucket := s3.NewBucket(context.Background(), key, "test-bucket")
 
 	// This should fail due to error simulation
 	_, err := bucket.Put("test-file.txt", []byte("test"))
