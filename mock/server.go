@@ -724,6 +724,14 @@ func (m *Server) handleUploadPart(w http.ResponseWriter, r *http.Request, key st
 		return
 	}
 
+	// Check if this is a copy part operation
+	copySource := r.Header.Get("x-amz-copy-source")
+	if copySource != "" {
+		m.handleCopyPart(w, r, upload, partNumber, copySource)
+		return
+	}
+
+	// Regular upload part
 	content, err := io.ReadAll(r.Body)
 	if err != nil {
 		m.writeErrorResponse(w, "InvalidRequest", "Failed to read request body", http.StatusBadRequest)
@@ -743,6 +751,103 @@ func (m *Server) handleUploadPart(w http.ResponseWriter, r *http.Request, key st
 
 	w.Header().Set("ETag", etag)
 	w.WriteHeader(http.StatusOK)
+}
+
+// handleCopyPart handles copy part operations for multipart uploads
+func (m *Server) handleCopyPart(w http.ResponseWriter, r *http.Request, upload *Multipart, partNumber int, copySource string) {
+	// Parse copy source: /bucket/key
+	if !strings.HasPrefix(copySource, "/") {
+		m.writeErrorResponse(w, "InvalidRequest", "Invalid copy source format", http.StatusBadRequest)
+		return
+	}
+
+	copySource = copySource[1:] // Remove leading slash
+	parts := strings.SplitN(copySource, "/", 2)
+	if len(parts) != 2 {
+		m.writeErrorResponse(w, "InvalidRequest", "Invalid copy source format", http.StatusBadRequest)
+		return
+	}
+
+	sourceBucket := parts[0]
+	sourceKey := parts[1]
+
+	// For simplicity, we only support copying from the same bucket in the mock
+	if sourceBucket != m.bucket {
+		m.writeErrorResponse(w, "NoSuchBucket", "Source bucket not found", http.StatusNotFound)
+		return
+	}
+
+	// Get the source object
+	m.mutex.RLock()
+	sourceObj, exists := m.objects[sourceKey]
+	m.mutex.RUnlock()
+
+	if !exists {
+		m.writeErrorResponse(w, "NoSuchKey", "Source object not found", http.StatusNotFound)
+		return
+	}
+
+	// Check if-match condition
+	ifMatch := r.Header.Get("x-amz-copy-source-if-match")
+	if ifMatch != "" && ifMatch != sourceObj.ETag {
+		m.writeErrorResponse(w, "PreconditionFailed", "Copy source if-match condition failed", http.StatusPreconditionFailed)
+		return
+	}
+
+	// Handle range if specified
+	var content []byte
+	rangeHeader := r.Header.Get("x-amz-copy-source-range")
+	if rangeHeader != "" {
+		// Parse range: bytes=start-end
+		if !strings.HasPrefix(rangeHeader, "bytes=") {
+			m.writeErrorResponse(w, "InvalidRequest", "Invalid range format", http.StatusBadRequest)
+			return
+		}
+		rangeSpec := rangeHeader[6:] // Remove "bytes="
+		rangeParts := strings.Split(rangeSpec, "-")
+		if len(rangeParts) != 2 {
+			m.writeErrorResponse(w, "InvalidRequest", "Invalid range format", http.StatusBadRequest)
+			return
+		}
+
+		start, err := strconv.ParseInt(rangeParts[0], 10, 64)
+		if err != nil {
+			m.writeErrorResponse(w, "InvalidRequest", "Invalid range start", http.StatusBadRequest)
+			return
+		}
+
+		end, err := strconv.ParseInt(rangeParts[1], 10, 64)
+		if err != nil {
+			m.writeErrorResponse(w, "InvalidRequest", "Invalid range end", http.StatusBadRequest)
+			return
+		}
+
+		if start < 0 || end >= int64(len(sourceObj.Content)) || start > end {
+			m.writeErrorResponse(w, "InvalidRange", "Invalid range", http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+
+		content = sourceObj.Content[start : end+1]
+	} else {
+		content = sourceObj.Content
+	}
+
+	etag := generateETag(content)
+
+	m.mutex.Lock()
+	upload.Parts[partNumber] = &PartInfo{
+		PartNumber: partNumber,
+		ETag:       etag,
+		Size:       int64(len(content)),
+		Content:    content,
+	}
+	m.mutex.Unlock()
+
+	// Return copy part result XML
+	response := fmt.Sprintf(`<CopyPartResult><ETag>%s</ETag></CopyPartResult>`, etag)
+	w.Header().Set("Content-Type", "application/xml")
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(response))
 }
 
 // CompleteMultipartUploadRequest represents the XML request for completing multipart upload
