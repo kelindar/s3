@@ -1,1 +1,3 @@
 .aws
+coverage.out
+coverage.html
