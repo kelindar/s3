@@ -17,7 +17,6 @@ package s3
 
 import (
 	"context"
-	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
@@ -95,25 +94,6 @@ func (f *File) Read(p []byte) (int, error) {
 	n, err := f.body.Read(p)
 	f.pos += int64(n)
 	return n, err
-}
-
-type inputParquet struct {
-	XMLName xml.Name `xml:"Parquet"`
-}
-
-type s3select struct {
-	XMLName    xml.Name `xml:"SelectObjectContentRequest"`
-	NS         string   `xml:"xmlns,attr"`
-	Expression string   `xml:"Expression"`
-	Type       string   `xml:"ExpressionType"`
-	Input      struct {
-		Kind any
-	} `xml:"InputSerialization"`
-	Output struct {
-		JSON struct {
-			Delimiter string `xml:"RecordDelimiter"`
-		} `xml:"JSON"`
-	} `xml:"OutputSerialization"`
 }
 
 // Info implements fs.DirEntry.Info
