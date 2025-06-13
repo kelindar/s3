@@ -33,7 +33,7 @@ func TestMockS3ServerBasicOperations(t *testing.T) {
 	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
 	key.BaseURI = mockServer.URL()
 
-	bucket := &s3.BucketFS{
+	bucket := &s3.Bucket{
 		Key:    key,
 		Bucket: "test-bucket",
 		Ctx:    context.Background(),
@@ -106,7 +106,7 @@ func TestMockS3ServerRangeRequests(t *testing.T) {
 	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
 	key.BaseURI = mockServer.URL()
 
-	bucket := &s3.BucketFS{
+	bucket := &s3.Bucket{
 		Key:    key,
 		Bucket: "test-bucket",
 		Ctx:    context.Background(),
@@ -184,7 +184,7 @@ func TestMockS3ServerErrorSimulation(t *testing.T) {
 	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
 	key.BaseURI = mockServer.URL()
 
-	bucket := &s3.BucketFS{
+	bucket := &s3.Bucket{
 		Key:    key,
 		Bucket: "test-bucket",
 		Ctx:    context.Background(),

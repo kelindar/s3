@@ -17,26 +17,20 @@ package s3
 
 import (
 	"context"
-	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"net/http"
-	"net/url"
 	"path"
-	"slices"
-	"sort"
 	"strings"
-	"time"
 
 	"github.com/kelindar/s3/aws"
 	"github.com/kelindar/s3/fsutil"
 )
 
-// BucketFS implements fs.FS,
-// fs.ReadDirFS, and fs.SubFS.
-type BucketFS struct {
+// Bucket implements fs.FS, fs.ReadDirFS, and fs.SubFS.
+type Bucket struct {
 	Key    *aws.SigningKey
 	Bucket string
 	Client *http.Client
@@ -50,11 +44,11 @@ type BucketFS struct {
 	DelayGet bool
 }
 
-func (b *BucketFS) sub(name string) *Prefix {
+func (b *Bucket) sub(name string) *Prefix {
 	return b.subctx(b.Ctx, name)
 }
 
-func (b *BucketFS) subctx(ctx context.Context, name string) *Prefix {
+func (b *Bucket) subctx(ctx context.Context, name string) *Prefix {
 	return &Prefix{
 		Key:    b.Key,
 		Client: b.Client,
@@ -65,7 +59,7 @@ func (b *BucketFS) subctx(ctx context.Context, name string) *Prefix {
 }
 
 // WithContext implements db.ContextFS
-func (b *BucketFS) WithContext(ctx context.Context) fs.FS {
+func (b *Bucket) WithContext(ctx context.Context) fs.FS {
 	return b.subctx(ctx, ".")
 }
 
@@ -79,7 +73,7 @@ func badpath(op, name string) error {
 
 // Put performs a PutObject operation at the object key 'where'
 // and returns the ETag of the newly-created object.
-func (b *BucketFS) Put(where string, contents []byte) (string, error) {
+func (b *Bucket) Put(where string, contents []byte) (string, error) {
 	where = path.Clean(where)
 	if !fs.ValidPath(where) {
 		return "", badpath("s3 PUT", where)
@@ -93,7 +87,7 @@ func (b *BucketFS) Put(where string, contents []byte) (string, error) {
 	return b.put(where, contents)
 }
 
-func (b *BucketFS) put(where string, contents []byte) (string, error) {
+func (b *Bucket) put(where string, contents []byte) (string, error) {
 	req, err := http.NewRequestWithContext(b.Ctx, http.MethodPut, uri(b.Key, b.Bucket, where), nil)
 	if err != nil {
 		return "", err
@@ -116,7 +110,7 @@ func (b *BucketFS) put(where string, contents []byte) (string, error) {
 }
 
 // Sub implements fs.SubFS.Sub.
-func (b *BucketFS) Sub(dir string) (fs.FS, error) {
+func (b *Bucket) Sub(dir string) (fs.FS, error) {
 	dir = path.Clean(dir)
 	if !fs.ValidPath(dir) {
 		return nil, badpath("sub", dir)
@@ -132,7 +126,7 @@ func (b *BucketFS) Sub(dir string) (fs.FS, error) {
 // starting at byte [start] and continuing for [width] bytes.
 // If [etag] does not match the ETag of the object, then
 // [ErrETagChanged] will be returned.
-func (b *BucketFS) OpenRange(name, etag string, start, width int64) (io.ReadCloser, error) {
+func (b *Bucket) OpenRange(name, etag string, start, width int64) (io.ReadCloser, error) {
 	name = path.Clean(name)
 	if !fs.ValidPath(name) || name == "." {
 		return nil, badpath("OpenRange", name)
@@ -155,7 +149,7 @@ func (b *BucketFS) OpenRange(name, etag string, start, width int64) (io.ReadClos
 // leads to multiple objects.
 // If name does not refer to an object or a path prefix,
 // then Open returns an error matching fs.ErrNotExist.
-func (b *BucketFS) Open(name string) (fs.File, error) {
+func (b *Bucket) Open(name string) (fs.File, error) {
 	// interpret a trailing / to mean
 	// a directory
 	isDir := strings.HasSuffix(name, "/")
@@ -181,7 +175,7 @@ func (b *BucketFS) Open(name string) (fs.File, error) {
 }
 
 // VisitDir implements fs.VisitDirFS
-func (b *BucketFS) VisitDir(name, seek, pattern string, walk fsutil.VisitDirFn) error {
+func (b *Bucket) VisitDir(name, seek, pattern string, walk fsutil.VisitDirFn) error {
 	name = path.Clean(name)
 	if !fs.ValidPath(name) {
 		return badpath("visitdir", name)
@@ -193,7 +187,7 @@ func (b *BucketFS) VisitDir(name, seek, pattern string, walk fsutil.VisitDirFn) 
 }
 
 // ReadDir implements fs.ReadDirFS
-func (b *BucketFS) ReadDir(name string) ([]fs.DirEntry, error) {
+func (b *Bucket) ReadDir(name string) ([]fs.DirEntry, error) {
 	name = path.Clean(name)
 	if !fs.ValidPath(name) {
 		return nil, badpath("readdir", name)
@@ -217,617 +211,28 @@ func (b *BucketFS) ReadDir(name string) ([]fs.DirEntry, error) {
 	return ret, nil
 }
 
-// Prefix implements fs.File, fs.ReadDirFile,
-// and fs.DirEntry, and fs.FS.
-type Prefix struct {
-	// Key is the signing key used to sign requests.
-	Key *aws.SigningKey `xml:"-"`
-	// Bucket is the bucket at the root of the "filesystem"
-	Bucket string `xml:"-"`
-	// Path is the path of this prefix.
-	// The value of Path should always be
-	// a valid path (see fs.ValidPath) plus
-	// a trailing forward slash to indicate
-	// that this is a pseudo-directory prefix.
-	Path   string          `xml:"Prefix"`
-	Client *http.Client    `xml:"-"`
-	Ctx    context.Context `xml:"-"`
-
-	// listing token;
-	// "" means start from the beginning
-	token string
-	// if true, ReadDir returns io.EOF
-	dirEOF bool
-}
-
-func (p *Prefix) join(extra string) string {
-	if p.Path == "." {
-		// root of bucket
-		return extra
+// Remove removes the object at fullpath.
+func (b *Bucket) Remove(fullpath string) error {
+	fullpath = path.Clean(fullpath)
+	if !fs.ValidPath(fullpath) {
+		return fmt.Errorf("%s: %s", fullpath, fs.ErrInvalid)
 	}
-	return path.Join(p.Path, extra)
-}
-
-func (p *Prefix) sub(name string) *Prefix {
-	return p.subctx(p.Ctx, name)
-}
-
-func (p *Prefix) subctx(ctx context.Context, name string) *Prefix {
-	return &Prefix{
-		Key:    p.Key,
-		Client: p.Client,
-		Bucket: p.Bucket,
-		Path:   p.join(name),
-		Ctx:    ctx,
-	}
-}
-
-// WithContext implements db.ContextFS
-func (p *Prefix) WithContext(ctx context.Context) fs.FS {
-	return p.subctx(ctx, ".")
-}
-
-// Open opens the object or pseudo-directory
-// at the provided path.
-// The returned fs.File will be a *File if
-// the combined Prefix and path lead to an object;
-// if the combind prefix and path produce another
-// complete object prefix, then a *Prefix will
-// be returned. If the combined prefix and path
-// do not produce a prefix that is present within
-// the target bucket, then an error matching
-// fs.ErrNotExist is returned.
-func (p *Prefix) Open(file string) (fs.File, error) {
-	file = path.Clean(file)
-	if file == "." {
-		return p, nil
-	}
-	if !fs.ValidPath(file) {
-		return nil, badpath("open", file)
-	}
-	return p.sub(file).openDir()
-}
-
-func (p *Prefix) openDir() (fs.File, error) {
-	if p.Path == "" || p.Path == "." {
-		// the root directory trivially exists
-		return p, nil
-	}
-	ret, err := p.list(1, "", "", "")
+	req, err := http.NewRequestWithContext(b.Ctx, http.MethodDelete, uri(b.Key, b.Bucket, fullpath), nil)
 	if err != nil {
-		return nil, err
+		return err
 	}
-	// if we got anything at all, it exists
-	if len(ret.Contents) == 0 && len(ret.CommonPrefixes) == 0 {
-		return nil, &fs.PathError{Op: "open", Path: p.Path, Err: fs.ErrNotExist}
+	b.Key.SignV4(req, nil)
+	client := b.Client
+	if client == nil {
+		client = &DefaultClient
 	}
-	if strings.HasSuffix(p.Path, "/") {
-		return p, nil
-	}
-	path := p.Path + "/"
-	return &Prefix{
-		Key:    p.Key,
-		Bucket: p.Bucket,
-		Client: p.Client,
-		Path:   path,
-		Ctx:    p.Ctx,
-	}, nil
-}
-
-// Name implements fs.DirEntry.Name
-func (p *Prefix) Name() string {
-	return path.Base(p.Path)
-}
-
-// Type implements fs.DirEntry.Type
-func (p *Prefix) Type() fs.FileMode {
-	return fs.ModeDir
-}
-
-// Info implements fs.DirEntry.Info
-func (p *Prefix) Info() (fs.FileInfo, error) {
-	return p.Stat()
-}
-
-// IsDir implements fs.FileInfo.IsDir
-func (p *Prefix) IsDir() bool { return true }
-
-// ModTime implements fs.FileInfo.ModTime
-//
-// Note: currently ModTime returns the zero time.Time,
-// as S3 prefixes don't have a meaningful modification time.
-func (p *Prefix) ModTime() time.Time { return time.Time{} }
-
-// Mode implements fs.FileInfo.Mode
-func (p *Prefix) Mode() fs.FileMode { return fs.ModeDir | 0755 }
-
-// Sys implements fs.FileInfo.Sys
-func (p *Prefix) Sys() interface{} { return nil }
-
-// Size implements fs.FileInfo.Size
-func (p *Prefix) Size() int64 { return 0 }
-
-// Stat implements fs.File.Stat
-func (p *Prefix) Stat() (fs.FileInfo, error) {
-	return p, nil
-}
-
-// Read implements fs.File.Read.
-//
-// Read always returns an error.
-func (p *Prefix) Read(_ []byte) (int, error) {
-	return 0, &fs.PathError{
-		Op:   "read",
-		Path: p.Path,
-		Err:  fs.ErrInvalid,
-	}
-}
-
-// Close implements fs.File.Close
-func (p *Prefix) Close() error {
-	return nil
-}
-
-// File implements fs.File
-type File struct {
-	// Reader is a reader that points to
-	// the associated s3 object.
-	Reader
-
-	ctx  context.Context // from parent bucket
-	body io.ReadCloser   // actual body; populated lazily
-	pos  int64           // current read offset
-}
-
-// Name implements fs.FileInfo.Name
-func (f *File) Name() string {
-	return path.Base(f.Reader.Path)
-}
-
-// Path returns the full path to the
-// S3 object within its bucket.
-// See also blockfmt.NamedFile
-func (f *File) Path() string {
-	return f.Reader.Path
-}
-
-// Mode implements fs.FileInfo.Mode
-func (f *File) Mode() fs.FileMode { return 0644 }
-
-// Open implements fsutil.Opener
-func (f *File) Open() (fs.File, error) { return f, nil }
-
-// Read implements fs.File.Read
-//
-// Note: Read is not safe to call from
-// multiple goroutines simultaneously.
-// Use ReadAt for parallel reads.
-//
-// Also note: the first call to Read performs
-// an HTTP request to S3 to read the entire
-// contents of the object starting at the
-// current read offset (zero by default, or
-// another offset set via Seek).
-// If you need to read a sub-range of the
-// object, consider using f.Reader.RangeReader
-func (f *File) Read(p []byte) (int, error) {
-	if f.body != nil {
-		n, err := f.body.Read(p)
-		f.pos += int64(n)
-		if n > 0 || errors.Is(err, io.EOF) {
-			return n, err
-		}
-		// fall through here and re-try the request;
-		// occasionally S3 will send us an RST for not
-		// reading the response fast enough
-		f.body.Close()
-		f.body = nil
-	}
-	err := f.ctx.Err()
+	res, err := flakyDo(client, req)
 	if err != nil {
-		return 0, err
-	}
-	f.body, err = f.Reader.RangeReader(f.pos, f.Size()-f.pos)
-	if err != nil {
-		return 0, err
-	}
-	n, err := f.body.Read(p)
-	f.pos += int64(n)
-	return n, err
-}
-
-type inputParquet struct {
-	XMLName xml.Name `xml:"Parquet"`
-}
-
-type s3select struct {
-	XMLName    xml.Name `xml:"SelectObjectContentRequest"`
-	NS         string   `xml:"xmlns,attr"`
-	Expression string   `xml:"Expression"`
-	Type       string   `xml:"ExpressionType"`
-	Input      struct {
-		Kind any
-	} `xml:"InputSerialization"`
-	Output struct {
-		JSON struct {
-			Delimiter string `xml:"RecordDelimiter"`
-		} `xml:"JSON"`
-	} `xml:"OutputSerialization"`
-}
-
-// SelectJSON runs [query] on [f] and returns the response
-// as a JSON stream.
-func (f *File) SelectJSON(query, infmt string) (io.ReadCloser, error) {
-	if infmt != "parquet" {
-		return nil, fmt.Errorf("s3 SELECT input format %q not supported", infmt)
-	}
-	body := s3select{}
-	body.NS = "http://s3.amazonaws.com/doc/2006-03-01/"
-	body.Expression = query
-	body.Type = "SQL"
-	body.Input.Kind = &inputParquet{}
-	body.Output.JSON.Delimiter = "\n"
-	buf, err := xml.Marshal(&body)
-	if err != nil {
-		return nil, err // ... possible?
-	}
-	buf = append([]byte("<?xml version=\"1.0\" encoding=\"UTF-8\"?>"), buf...)
-	if !ValidBucket(f.Bucket) {
-		return nil, fmt.Errorf("invalid S3 bucket %q", f.Bucket)
-	}
-	req, err := http.NewRequest("POST", uri(f.Key, f.Bucket, f.Reader.Path), nil)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("If-Not-Modified", f.ETag)
-	req.URL.RawQuery += "select=&select-type=2"
-	f.Key.SignV4(req, buf)
-	c := f.Client
-	if c == nil {
-		c = &DefaultClient
-	}
-	res, err := flakyDo(c, req)
-	if err != nil {
-		return nil, err
-	}
-	switch res.StatusCode {
-	case 200:
-		return &s3SelectReader{src: res.Body}, nil
-	case 403:
-		return nil, fs.ErrPermission
-	case 404:
-		res.Body.Close()
-		return nil, fs.ErrNotExist
-	default:
-		msg, _ := io.ReadAll(res.Body)
-		res.Body.Close()
-		return nil, fmt.Errorf("s3 select: %s", msg)
-	}
-}
-
-// Info implements fs.DirEntry.Info
-//
-// Info returns exactly the same thing as f.Stat
-func (f *File) Info() (fs.FileInfo, error) {
-	return f.Stat()
-}
-
-// Type implements fs.DirEntry.Type
-//
-// Type returns exactly the same thing as f.Mode
-func (f *File) Type() fs.FileMode { return f.Mode() }
-
-// Close implements fs.File.Close
-func (f *File) Close() error {
-	if f.body == nil {
-		return nil
-	}
-	err := f.body.Close()
-	f.body = nil
-	f.pos = 0
-	return err
-}
-
-// Seek implements io.Seeker
-//
-// Seek rejects offsets that are beyond
-// the size of the underlying object.
-func (f *File) Seek(offset int64, whence int) (int64, error) {
-	var newpos int64
-	switch whence {
-	case io.SeekStart:
-		newpos = offset
-	case io.SeekCurrent:
-		newpos = f.pos + offset
-	case io.SeekEnd:
-		newpos = f.Reader.Size + offset
-	default:
-		panic("invalid seek whence")
-	}
-	if newpos < 0 || newpos > f.Reader.Size {
-		return f.pos, fmt.Errorf("invalid seek offset %d", newpos)
-	}
-	// current data is invalid
-	// if the position has changed
-	if newpos != f.pos && f.body != nil {
-		f.body.Close()
-		f.body = nil
-	}
-	f.pos = newpos
-	return f.pos, nil
-}
-
-func (f *File) Size() int64 {
-	return f.Reader.Size
-}
-
-// IsDir implements fs.DirEntry.IsDir.
-// IsDir always returns false.
-func (f *File) IsDir() bool { return false }
-
-// ModTime implements fs.DirEntry.ModTime.
-// This returns the same value as f.Reader.LastModified.
-func (f *File) ModTime() time.Time { return f.Reader.LastModified }
-
-// Sys implements fs.FileInfo.Sys.
-func (f *File) Sys() interface{} { return nil }
-
-// Stat implements fs.File.Stat
-func (f *File) Stat() (fs.FileInfo, error) {
-	return f, nil
-}
-
-// split a glob pattern on the first meta-character
-// so that we can list from the most specific prefix
-func splitMeta(pattern string) (string, string) {
-	for i := 0; i < len(pattern); i++ {
-		switch pattern[i] {
-		case '*', '?', '\\', '[':
-			return pattern[:i], pattern[i:]
-		default:
-		}
-	}
-	return pattern, ""
-}
-
-// VisitDir implements fs.VisitDirFS
-func (p *Prefix) VisitDir(name, seek, pattern string, walk fsutil.VisitDirFn) error {
-	if !ValidBucket(p.Bucket) {
-		return badBucket(p.Bucket)
-	}
-	subp := p
-	if name != "." {
-		subp = p.sub(name)
-		if !strings.HasSuffix(subp.Path, "/") {
-			subp.Path += "/"
-		}
-	}
-	token := ""
-	for {
-		d, tok, err := subp.readDirAt(-1, token, seek, pattern)
-		if err != nil && err != io.EOF {
-			return &fs.PathError{Op: "visit", Path: subp.Path, Err: err}
-		}
-		// despite being called "start-after", the
-		// S3 API includes the seek key in the list
-		// response, which is not consistent with
-		// fsutil.VisitDir, so filter it out here...
-		if len(d) > 0 && d[0].Name() == seek {
-			d = d[1:]
-		}
-		for i := range d {
-			err := walk(d[i])
-			if err != nil {
-				return err
-			}
-		}
-		if err == io.EOF {
-			return nil
-		}
-		token = tok
-	}
-}
-
-// ReadDir implements fs.ReadDirFile
-//
-// Every returned fs.DirEntry will be either
-// a Prefix or a File struct.
-func (p *Prefix) ReadDir(n int) ([]fs.DirEntry, error) {
-	if p.dirEOF {
-		return nil, io.EOF
-	}
-	d, next, err := p.readDirAt(n, p.token, "", "")
-	if err == io.EOF {
-		p.dirEOF = true
-		if len(d) > 0 || n < 0 {
-			// the spec for fs.ReadDirFile says
-			// ReadDir(-1) shouldn't produce an explicit EOF
-			err = nil
-		}
-	}
-	if err != nil {
-		return nil, &fs.PathError{Op: "readdir", Path: p.Path, Err: err}
-	}
-	p.token = next
-	return d, nil
-}
-
-type listResponse struct {
-	IsTruncated    bool     `xml:"IsTruncated"`
-	Contents       []File   `xml:"Contents"`
-	CommonPrefixes []Prefix `xml:"CommonPrefixes"`
-	EncodingType   string   `xml:"EncodingType"`
-	NextToken      string   `xml:"NextContinuationToken"`
-}
-
-func (p *Prefix) list(n int, token, seek, prefix string) (*listResponse, error) {
-	if !ValidBucket(p.Bucket) {
-		return nil, badBucket(p.Bucket)
-	}
-	parts := []string{
-		"delimiter=%2F",
-		"list-type=2",
-	}
-	// make sure there's a '/' at the end and
-	// append the prefix
-	path := p.Path
-	if path != "" && path != "." {
-		if !strings.HasSuffix(path, "/") {
-			path += "/" + prefix
-		} else {
-			path += prefix
-		}
-	} else {
-		// NOTE: if p.Path was "." this will replace
-		// it with prefix which may be ""; this is
-		// the intended behavior
-		path = prefix
-	}
-	if path != "" {
-		parts = append(parts, "prefix="+queryEscape(path))
-	}
-	// the seek parameter is only meaningful
-	// if it is "larger" than the prefix being listed;
-	// otherwise we should reject it
-	// (AWS S3 accepts redundant start-after params,
-	// but Minio rejects them)
-	if seek != "" && (seek < prefix || !strings.HasPrefix(seek, prefix)) {
-		return nil, fmt.Errorf("seek %q not compatible with prefix %q", seek, prefix)
-	}
-	if seek != "" {
-		parts = append(parts, "start-after="+queryEscape(p.join(seek)))
-	}
-	if n > 0 {
-		parts = append(parts, fmt.Sprintf("max-keys=%d", n))
-	}
-	if token != "" {
-		parts = append(parts, "continuation-token="+url.QueryEscape(token))
-	}
-	sort.Strings(parts)
-	query := "?" + strings.Join(parts, "&")
-	req, err := http.NewRequestWithContext(p.Ctx, http.MethodGet, rawURI(p.Key, p.Bucket, query), nil)
-	if err != nil {
-		return nil, fmt.Errorf("creating http request: %w", err)
-	}
-	p.Key.SignV4(req, nil)
-	res, err := flakyDo(p.client(), req)
-	if err != nil {
-		return nil, fmt.Errorf("executing request: %w", err)
+		return err
 	}
 	defer res.Body.Close()
-	if res.StatusCode != 200 {
-		if res.StatusCode == 403 {
-			return nil, fs.ErrPermission
-		}
-		if res.StatusCode == 404 {
-			// this can actually mean the bucket doesn't exist,
-			// but for practical purposes we can treat it
-			// as an empty filesystem
-			return nil, fs.ErrNotExist
-		}
-		return nil, fmt.Errorf("s3 list objects s3://%s/%s: %s", p.Bucket, p.Path, res.Status)
+	if res.StatusCode != 204 {
+		return fmt.Errorf("s3 DELETE: %s %s", res.Status, extractMessage(res.Body))
 	}
-	ret := &listResponse{}
-	err = xml.NewDecoder(res.Body).Decode(ret)
-	if err != nil {
-		return nil, fmt.Errorf("xml decoding response: %w", err)
-	}
-	return ret, nil
-}
-
-func patmatch(pattern, name string) (bool, error) {
-	if pattern == "" {
-		return true, nil
-	}
-	return path.Match(pattern, name)
-}
-
-func ignoreKey(key string, dirOK bool) bool {
-	name := path.Base(key)
-	return key == "" ||
-		!dirOK && key[len(key)-1] == '/' ||
-		name == "." || name == ".."
-}
-
-// readDirAt reads n entries (or all if n < 0)
-// from a directory using the given continuation
-// token, returning the directory entries, the
-// next continuation token, and any error.
-//
-// If seek is provided, this will be appended to
-// the prefix path passed as the start-after
-// parameter to the list call.
-//
-// If pattern is provided, the returned entries
-// will be filtered against this pattern, and
-// the prefix before the first meta-character
-// will be used to determine a prefix that will
-// be appended to the path passed as the prefix
-// parameter to the list call.
-//
-// If the full directory listing was read in one
-// call, this returns the list of directory
-// entries, an empty continuation token, and
-// io.EOF. Note that this behavior differs from
-// fs.ReadDirFile.ReadDir.
-func (p *Prefix) readDirAt(n int, token, seek, pattern string) (d []fs.DirEntry, next string, err error) {
-	prefix, _ := splitMeta(pattern)
-	ret, err := p.list(n, token, seek, prefix)
-	if err != nil {
-		return nil, "", err
-	}
-	out := make([]fs.DirEntry, 0, len(ret.Contents)+len(ret.CommonPrefixes))
-	for i := range ret.Contents {
-		if ignoreKey(ret.Contents[i].Path(), false) {
-			continue
-		}
-		name := ret.Contents[i].Name()
-		match, err := patmatch(pattern, name)
-		if err != nil {
-			return nil, "", err
-		} else if !match {
-			continue
-		}
-		ret.Contents[i].Key = p.Key
-		ret.Contents[i].Client = p.client()
-		ret.Contents[i].Bucket = p.Bucket
-		// FIXME: we're using the "wrong" context here
-		// because we really just wanted to use the
-		// embedded context for limiting the time spent
-		// scanning and not the time spent reading the
-		// input file...
-		ret.Contents[i].ctx = context.Background()
-		out = append(out, &ret.Contents[i])
-	}
-	for i := range ret.CommonPrefixes {
-		if ignoreKey(ret.CommonPrefixes[i].Path, true) {
-			continue
-		}
-		name := ret.CommonPrefixes[i].Name()
-		match, err := patmatch(pattern, name)
-		if err != nil {
-			return nil, "", err
-		} else if !match {
-			continue
-		}
-		ret.CommonPrefixes[i].Key = p.Key
-		ret.CommonPrefixes[i].Bucket = p.Bucket
-		ret.CommonPrefixes[i].Client = p.Client
-		ret.CommonPrefixes[i].Ctx = p.Ctx
-		out = append(out, &ret.CommonPrefixes[i])
-	}
-	slices.SortFunc(out, func(a, b fs.DirEntry) int {
-		return strings.Compare(a.Name(), b.Name())
-	})
-	if !ret.IsTruncated {
-		err = io.EOF
-	}
-	return out, ret.NextToken, err
-}
-
-func (p *Prefix) client() *http.Client {
-	if p.Client == nil {
-		return &DefaultClient
-	}
-	return p.Client
+	return nil
 }

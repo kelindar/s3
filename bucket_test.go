@@ -70,7 +70,7 @@ func TestBucket(t *testing.T) {
 }
 
 func testIntegration(t *testing.T, bucket, prefix string, key *aws.SigningKey) {
-	b := &BucketFS{
+	b := &Bucket{
 		Key:      key,
 		Bucket:   bucket,
 		DelayGet: true,
@@ -79,7 +79,7 @@ func testIntegration(t *testing.T, bucket, prefix string, key *aws.SigningKey) {
 
 	tests := []struct {
 		name string
-		run  func(t *testing.T, b *BucketFS, prefix string)
+		run  func(t *testing.T, b *Bucket, prefix string)
 	}{
 		{
 			"BasicCRUD",
@@ -122,7 +122,7 @@ func testIntegration(t *testing.T, bucket, prefix string, key *aws.SigningKey) {
 	assert.NoError(t, fs.WalkDir(b, prefix, rm))
 }
 
-func testReadDir(t *testing.T, b *BucketFS, prefix string) {
+func testReadDir(t *testing.T, b *Bucket, prefix string) {
 	fullp := path.Join(prefix, "xyz-does-not-exist")
 	items, err := fs.ReadDir(b, fullp)
 	assert.Empty(t, items, "expected no items for non-existent directory")
@@ -130,7 +130,7 @@ func testReadDir(t *testing.T, b *BucketFS, prefix string) {
 }
 
 // write an object, read it back, and delete it
-func testBasicCrud(t *testing.T, b *BucketFS, prefix string) {
+func testBasicCrud(t *testing.T, b *Bucket, prefix string) {
 	contents := []byte("here are some object contents")
 	fullp := path.Join(prefix, "foo/bar/filename-with:chars= space")
 
@@ -162,7 +162,7 @@ func testBasicCrud(t *testing.T, b *BucketFS, prefix string) {
 	}
 }
 
-func testWalkGlob(t *testing.T, b *BucketFS, prefix string) {
+func testWalkGlob(t *testing.T, b *Bucket, prefix string) {
 	// dirs to create; create some placeholder
 	// dirs with bad names to test that those are
 	// ignored in listing
@@ -229,7 +229,7 @@ func testWalkGlob(t *testing.T, b *BucketFS, prefix string) {
 	}
 }
 
-func testWalkGlobRoot(t *testing.T, b *BucketFS, prefix string) {
+func testWalkGlobRoot(t *testing.T, b *Bucket, prefix string) {
 	name := prefix + ".txt"
 	_, err := b.put(name, nil)
 	assert.NoError(t, err, "creating test file")
