@@ -8,13 +8,13 @@
 <a href="https://coveralls.io/github/kelindar/s3"><img src="https://coveralls.io/repos/github/kelindar/s3/badge.svg" alt="Coverage"></a>
 </p>
 
-# Slim AWS S3 (and compatible) client
+## Slim AWS S3 client
 
 A lightweight, high-performance AWS S3 client library for Go that implements the standard `fs.FS` interface, allowing you to work with S3 buckets as if they were local filesystems.
 
 > **Attribution**: This library is extracted from [Sneller's lightweight S3 client](https://github.com/SnellerInc/sneller/tree/main/aws/s3). Most of the credit goes to the Sneller team for the original implementation and design.
 
-## Features
+### Features
 
 - **Standard `fs.FS` Interface**: Compatible with any Go code that accepts `fs.FS`
 - **Lightweight**: Minimal dependencies, focused on performance
@@ -35,13 +35,8 @@ A lightweight, high-performance AWS S3 client library for Go that implements the
 - ❌ Use cases requiring advanced S3 features (bucket policies, lifecycle rules, object locking, versioning management, etc.)
 - ❌ Projects that need official AWS support and enterprise features
 
-## Installation
 
-```bash
-go get github.com/kelindar/s3
-```
-
-## Quick Start
+### Quick Start
 
 ```go
 package main
@@ -88,11 +83,9 @@ func main() {
 }
 ```
 
-## Authentication
-
 ### Ambient Credentials (Recommended)
 
-The library automatically discovers credentials from:
+This is the recommended way to use the library, as it automatically discovers credentials from the environment, IAM roles, and other sources. It supports the following sources:
 - Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`)
 - IAM roles (EC2, ECS, Lambda)
 - AWS credentials file (`~/.aws/credentials`)
@@ -104,6 +97,8 @@ key, err := aws.AmbientKey("s3", s3.DeriveForBucket("my-bucket"))
 
 ### Manual Credentials
 
+If you prefer to manage credentials manually, you can derive a signing key directly:
+
 ```go
 key := aws.DeriveKey(
     "",                    // baseURI (empty for AWS S3)
@@ -114,17 +109,21 @@ key := aws.DeriveKey(
 )
 ```
 
-## Usage Examples
+### Bucket Options
+
+You can customize the behavior of the bucket by setting options:
+
+```go
+bucket := s3.NewBucket(ctx, key, "my-bucket")
+bucket.Client = httpClient   // Optional: Custom HTTP client
+bucket.Lazy = true           // Optional: Use HEAD instead of GET for Open()
+```
 
 ### File Operations
 
-```go
-import (
-    "errors"
-    "io"
-    "io/fs"
-)
+If you need to work with files, the library provides standard `fs.FS` operations. Here's an example of uploading, reading, and checking for file existence:
 
+```go
 // Upload a file
 etag, err := bucket.Put("path/to/file.txt", []byte("content"))
 
@@ -145,12 +144,9 @@ if errors.Is(err, fs.ErrNotExist) {
 
 ### Directory Operations
 
-```go
-import (
-    "fmt"
-    "io/fs"
-)
+If you need to work with directories, the library provides standard `fs.ReadDirFS` operations. Here's an example of listing directory contents and walking the directory tree:
 
+```go
 // List directory contents
 entries, err := fs.ReadDir(bucket, "path/to/directory")
 for _, entry := range entries {
@@ -169,10 +165,10 @@ err = fs.WalkDir(bucket, ".", func(path string, d fs.DirEntry, err error) error 
 
 ### Pattern Matching
 
+The library supports pattern matching using the `fsutil.WalkGlob` function. Here's an example of finding all `.txt` files:
+
 ```go
 import (
-    "fmt"
-    "io/fs"
     "github.com/kelindar/s3/fsutil"
 )
 
@@ -189,9 +185,9 @@ err := fsutil.WalkGlob(bucket, "", "*.txt", func(path string, f fs.File, err err
 
 ### Range Reads
 
-```go
-import "io"
+If you need to read a specific range of bytes from a file, you can use the `OpenRange` function. In the following example, we read the first 1KB of a file:
 
+```go
 // Read first 1KB of a file
 reader, err := bucket.OpenRange("large-file.dat", "", 0, 1024)
 if err != nil {
@@ -204,9 +200,9 @@ data, err := io.ReadAll(reader)
 
 ### Multi-part Upload
 
-```go
-import "github.com/kelindar/s3"
+If you need to upload a large file, you can use the `Uploader` type. The following example uploads a file in two parts:
 
+```go
 uploader := &s3.Uploader{
     Key:         key,
     Bucket:      "my-bucket",
@@ -228,15 +224,10 @@ err = uploader.Upload(2, part2Data)
 err = uploader.Close(nil)
 ```
 
-### Bucket Options
-
-```go
-bucket := s3.NewBucket(ctx, key, "my-bucket")
-bucket.Client = httpClient   // Optional: Custom HTTP client
-bucket.Lazy = true           // Optional: Use HEAD instead of GET for Open()
-```
 
 ### Working with Subdirectories
+
+You can work with subdirectories by creating a sub-filesystem using the `Sub` method. In the following example, we create a sub-filesystem for the `data/2023/` prefix and list all files within that prefix:
 
 ```go
 import "io/fs"
@@ -253,7 +244,7 @@ files, err := fs.ReadDir(subFS, ".")
 
 ## Error Handling
 
-The library uses standard Go `fs` package errors:
+The library uses standard Go `fs` package errors. You can check for specific errors using the `errors.Is` function:
 
 ```go
 import (
