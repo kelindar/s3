@@ -70,12 +70,8 @@ func TestBucket(t *testing.T) {
 }
 
 func testIntegration(t *testing.T, bucket, prefix string, key *aws.SigningKey) {
-	b := &Bucket{
-		Key:      key,
-		Bucket:   bucket,
-		DelayGet: true,
-		Ctx:      context.Background(),
-	}
+	b := NewBucket(context.Background(), key, bucket)
+	b.DelayGet = true
 
 	tests := []struct {
 		name string
@@ -268,11 +264,7 @@ func TestBucket_OpenRange(t *testing.T) {
 	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
 	key.BaseURI = mockServer.URL()
 
-	b := &Bucket{
-		Key:    key,
-		Bucket: bucket,
-		Ctx:    context.Background(),
-	}
+	b := NewBucket(context.Background(), key, bucket)
 
 	// Create test content
 	content := []byte("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")
@@ -305,11 +297,7 @@ func TestBucket_Remove(t *testing.T) {
 	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
 	key.BaseURI = mockServer.URL()
 
-	b := &Bucket{
-		Key:    key,
-		Bucket: bucket,
-		Ctx:    context.Background(),
-	}
+	b := NewBucket(context.Background(), key, bucket)
 
 	// Create test object
 	content := []byte("content to be removed")
@@ -346,11 +334,7 @@ func TestBucket_Sub(t *testing.T) {
 	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
 	key.BaseURI = mockServer.URL()
 
-	b := &Bucket{
-		Key:    key,
-		Bucket: bucket,
-		Ctx:    context.Background(),
-	}
+	b := NewBucket(context.Background(), key, bucket)
 
 	// Test Sub with valid directory
 	subFS, err := b.Sub("test/subdir")
@@ -372,11 +356,7 @@ func TestBucket_WithContext(t *testing.T) {
 	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
 
 	originalCtx := context.Background()
-	b := &Bucket{
-		Key:    key,
-		Bucket: bucket,
-		Ctx:    originalCtx,
-	}
+	b := NewBucket(originalCtx, key, bucket)
 
 	// Test WithContext
 	newCtx, cancel := context.WithCancel(context.Background())
@@ -397,12 +377,8 @@ func TestBucket_DelayGet(t *testing.T) {
 	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
 	key.BaseURI = mockServer.URL()
 
-	b := &Bucket{
-		Key:      key,
-		Bucket:   bucket,
-		Ctx:      context.Background(),
-		DelayGet: true,
-	}
+	b := NewBucket(context.Background(), key, bucket)
+	b.DelayGet = true
 
 	// Create test content
 	content := []byte("DelayGet test content")
@@ -434,11 +410,7 @@ func TestBucket_VisitDir(t *testing.T) {
 	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
 	key.BaseURI = mockServer.URL()
 
-	b := &Bucket{
-		Key:    key,
-		Bucket: bucket,
-		Ctx:    context.Background(),
-	}
+	b := NewBucket(context.Background(), key, bucket)
 
 	// Create test structure
 	mockServer.PutObject("visit/a.txt", []byte("a"))
@@ -482,11 +454,7 @@ func TestBucket_ErrorHandling(t *testing.T) {
 	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
 	key.BaseURI = mockServer.URL()
 
-	b := &Bucket{
-		Key:    key,
-		Bucket: bucket,
-		Ctx:    context.Background(),
-	}
+	b := NewBucket(context.Background(), key, bucket)
 
 	// Test Put with invalid path
 	_, err := b.Put("../invalid", []byte("content"))

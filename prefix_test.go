@@ -42,11 +42,7 @@ func TestPrefix_BasicProperties(t *testing.T) {
 	mockServer.PutObject("dir1/file2.txt", []byte("content2"))
 	mockServer.PutObject("dir1/subdir/file3.txt", []byte("content3"))
 
-	b := &Bucket{
-		Key:    key,
-		Bucket: bucket,
-		Ctx:    context.Background(),
-	}
+	b := NewBucket(context.Background(), key, bucket)
 
 	// Open directory
 	dir, err := b.Open("dir1")
@@ -90,11 +86,7 @@ func TestPrefix_ReadDir(t *testing.T) {
 	mockServer.PutObject("testdir/subdir/file3.txt", []byte("content3"))
 	mockServer.PutObject("testdir/another/file4.txt", []byte("content4"))
 
-	b := &Bucket{
-		Key:    key,
-		Bucket: bucket,
-		Ctx:    context.Background(),
-	}
+	b := NewBucket(context.Background(), key, bucket)
 
 	// Open directory
 	dir, err := b.Open("testdir")
@@ -144,11 +136,7 @@ func TestPrefix_Open(t *testing.T) {
 	mockServer.PutObject("parent/child/file.txt", []byte("content"))
 	mockServer.PutObject("parent/file2.txt", []byte("content2"))
 
-	b := &Bucket{
-		Key:    key,
-		Bucket: bucket,
-		Ctx:    context.Background(),
-	}
+	b := NewBucket(context.Background(), key, bucket)
 
 	// Open parent directory
 	parent, err := b.Open("parent")
@@ -192,11 +180,7 @@ func TestPrefix_Read(t *testing.T) {
 
 	mockServer.PutObject("dir/file.txt", []byte("content"))
 
-	b := &Bucket{
-		Key:    key,
-		Bucket: bucket,
-		Ctx:    context.Background(),
-	}
+	b := NewBucket(context.Background(), key, bucket)
 
 	dir, err := b.Open("dir")
 	assert.NoError(t, err)
@@ -223,11 +207,7 @@ func TestPrefix_Close(t *testing.T) {
 
 	mockServer.PutObject("dir/file.txt", []byte("content"))
 
-	b := &Bucket{
-		Key:    key,
-		Bucket: bucket,
-		Ctx:    context.Background(),
-	}
+	b := NewBucket(context.Background(), key, bucket)
 
 	dir, err := b.Open("dir")
 	assert.NoError(t, err)
@@ -326,11 +306,7 @@ func TestPrefix_RootDirectory(t *testing.T) {
 	mockServer.PutObject("root1.txt", []byte("content1"))
 	mockServer.PutObject("root2.txt", []byte("content2"))
 
-	b := &Bucket{
-		Key:    key,
-		Bucket: bucket,
-		Ctx:    context.Background(),
-	}
+	b := NewBucket(context.Background(), key, bucket)
 
 	// Open root directory
 	root, err := b.Open(".")
@@ -355,11 +331,7 @@ func TestPrefix_EmptyDirectory(t *testing.T) {
 	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
 	key.BaseURI = mockServer.URL()
 
-	b := &Bucket{
-		Key:    key,
-		Bucket: bucket,
-		Ctx:    context.Background(),
-	}
+	b := NewBucket(context.Background(), key, bucket)
 
 	// Try to open non-existent directory
 	_, err := b.Open("nonexistent")

@@ -44,6 +44,15 @@ type Bucket struct {
 	DelayGet bool
 }
 
+// NewBucket creates a new Bucket instance.
+func NewBucket(ctx context.Context, key *aws.SigningKey, bucket string) *Bucket {
+	return &Bucket{
+		Key:    key,
+		Bucket: bucket,
+		Ctx:    ctx,
+	}
+}
+
 func (b *Bucket) sub(name string) *Prefix {
 	return b.subctx(b.Ctx, name)
 }
