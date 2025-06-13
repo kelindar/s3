@@ -21,6 +21,8 @@ import (
 	"net/http"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func init() {
@@ -49,9 +51,7 @@ func TestCanonical(t *testing.T) {
 	}()
 
 	req, err := http.NewRequest("GET", "https://iam.amazonaws.com/?Action=ListUsers&Version=2010-05-08 HTTP/1.1", nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assert.NoError(t, err)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=utf-8")
 	req.Header.Set("X-Amz-Date", "20150830T123600Z")
 	req.Header.Set("x-amz-content-sha256", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
@@ -68,15 +68,10 @@ x-amz-date:20150830T123600Z
 
 content-type;host;x-amz-date
 e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`
-	if outstr != want {
-		t.Logf("got:\n%s", outstr)
-		t.Error("didn't match")
-	}
+	assert.Equal(t, want, outstr, "canonical request didn't match")
 	h := sha256.Sum256(out.Bytes())
 	hstr := hex.EncodeToString(h[:])
-	if hstr != "f536975d06c0309214f805bb90ccff089219ecd68b2577efef23edd43b7e1a59" {
-		t.Errorf("got hash %s ??", hstr)
-	}
+	assert.Equal(t, "f536975d06c0309214f805bb90ccff089219ecd68b2577efef23edd43b7e1a59", hstr)
 }
 
 // test from
@@ -94,9 +89,7 @@ f536975d06c0309214f805bb90ccff089219ecd68b2577efef23edd43b7e1a59`
 	}
 	s.tosign(&dst, time.Date(2015, time.August, 30, 12, 36, 0, 0, time.UTC), "f536975d06c0309214f805bb90ccff089219ecd68b2577efef23edd43b7e1a59")
 
-	if dst.String() != want {
-		t.Errorf("got:\n%s", dst.String())
-	}
+	assert.Equal(t, want, dst.String())
 }
 
 // test from
@@ -106,9 +99,7 @@ func TestSigningKey(t *testing.T) {
 	k := derive("wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY", when, "us-east-1", "iam")
 	x := hex.EncodeToString(k)
 	const want = "c4afb1cc5771d871763a393e44b703571b55cc28424d1a5e86da6ed3c154a4b9"
-	if x != want {
-		t.Errorf("got %s", x)
-	}
+	assert.Equal(t, want, x)
 
 	const testvec = `AWS4-HMAC-SHA256
 20150830T123600Z
@@ -120,18 +111,14 @@ f536975d06c0309214f805bb90ccff089219ecd68b2577efef23edd43b7e1a59`
 	var dst [2 * sha256.Size]byte
 	sk.sign([]byte(testvec), dst[:], when)
 	const wantsig = "5d672d79c15b13162d9279b0855cfba6789a8edb4c82c400e06b5924a6f2b5d7"
-	if got := string(dst[:]); got != wantsig {
-		t.Errorf("got sig %s", got)
-	}
+	assert.Equal(t, wantsig, string(dst[:]))
 }
 
 // See https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html#query-string-auth-v4-signing-example
 func TestSignURL(t *testing.T) {
 	// derive the key in the preceding day
 	fn, err := time.Parse(longFormat, "20130523T010203Z")
-	if err != nil {
-		t.Fatal(err)
-	}
+	assert.NoError(t, err)
 	setnow(t, fn)
 	input := "https://examplebucket.s3.amazonaws.com/test.txt"
 	k := DeriveKey("", "AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", "us-east-1", "s3")
@@ -139,18 +126,10 @@ func TestSignURL(t *testing.T) {
 	// change the day to "tomorrow" and confirm
 	// that the signature is still produced correctly
 	fn, err = time.Parse(longFormat, "20130524T000000Z")
-	if err != nil {
-		t.Fatal(err)
-	}
+	assert.NoError(t, err)
 	setnow(t, fn)
 	ret, err := k.SignURL(input, 86400*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assert.NoError(t, err)
 	want := "https://examplebucket.s3.amazonaws.com/test.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host&X-Amz-Signature=aeeed9bbccd4d02ee5c0109b86d86835f995330da4c265957d157751f604d404"
-	if ret != want {
-		t.Logf("got : %s", ret)
-		t.Logf("want: %s", want)
-		t.Error("didn't sign correctly")
-	}
+	assert.Equal(t, want, ret, "URL signing didn't match expected result")
 }

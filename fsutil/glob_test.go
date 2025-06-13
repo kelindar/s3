@@ -19,10 +19,10 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"reflect"
-	"slices"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestWalkGlob(t *testing.T) {
@@ -50,13 +50,9 @@ func TestWalkGlob(t *testing.T) {
 		f := filepath.Clean(full)
 		dir, _ := filepath.Split(f)
 		err := os.MkdirAll(filepath.Join(tmp, dir), 0750)
-		if err != nil {
-			t.Fatal(err)
-		}
+		assert.NoError(t, err)
 		err = os.WriteFile(filepath.Join(tmp, f), []byte{}, 0640)
-		if err != nil {
-			t.Fatal(err)
-		}
+		assert.NoError(t, err)
 	}
 	d := os.DirFS(tmp)
 	for i := range cases {
@@ -67,19 +63,13 @@ func TestWalkGlob(t *testing.T) {
 		t.Run(fmt.Sprintf("case-%d", i), func(t *testing.T) {
 			var got []string
 			err := WalkGlob(d, seek, pattern, func(p string, f fs.File, err error) error {
-				if err != nil {
-					t.Fatal(err)
-				}
+				assert.NoError(t, err)
 				f.Close()
 				got = append(got, p)
 				return nil
 			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !reflect.DeepEqual(want, got) {
-				t.Errorf("want %v got %v", want, got)
-			}
+			assert.NoError(t, err)
+			assert.Equal(t, want, got)
 		})
 	}
 }
@@ -94,33 +84,19 @@ func TestOpenGlob(t *testing.T) {
 		f := filepath.Clean(full)
 		dir, _ := filepath.Split(f)
 		err := os.MkdirAll(filepath.Join(tmp, dir), 0750)
-		if err != nil {
-			t.Fatal(err)
-		}
+		assert.NoError(t, err)
 		err = os.WriteFile(filepath.Join(tmp, f), []byte{}, 0640)
-		if err != nil {
-			t.Fatal(err)
-		}
+		assert.NoError(t, err)
 	}
 	d := os.DirFS(tmp)
 	fn, err := OpenGlob(d, "[ax]/b/[cz]")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(fn) != len(dirs) {
-		t.Fatalf("got %d entries?", len(fn))
-	}
-	if fn[0].Path() != "a/b/c" {
-		t.Errorf("path[0] = %q", fn[0].Path())
-	}
-	if fn[1].Path() != "x/b/z" {
-		t.Errorf("path[1] = %q", fn[1].Path())
-	}
+	assert.NoError(t, err)
+	assert.Len(t, fn, len(dirs))
+	assert.Equal(t, "a/b/c", fn[0].Path())
+	assert.Equal(t, "x/b/z", fn[1].Path())
 	for i := range fn {
 		err := fn[i].Close()
-		if err != nil {
-			t.Fatal(err)
-		}
+		assert.NoError(t, err)
 	}
 }
 
@@ -145,14 +121,10 @@ func TestWalkGlobOps(t *testing.T) {
 	for i := range list {
 		if name, ok := strings.CutSuffix(list[i], "/"); ok {
 			err := os.Mkdir(filepath.Join(tmp, name), 0750)
-			if err != nil {
-				t.Fatalf("creating dir %q: %v", name, err)
-			}
+			assert.NoError(t, err, "creating dir %q", name)
 		} else {
 			err := os.WriteFile(filepath.Join(tmp, list[i]), []byte{}, 0640)
-			if err != nil {
-				t.Fatalf("creating file %q: %v", list[i], err)
-			}
+			assert.NoError(t, err, "creating file %q", list[i])
 		}
 	}
 	tfs := &traceFS{fs: os.DirFS(tmp)}
@@ -165,9 +137,7 @@ func TestWalkGlobOps(t *testing.T) {
 		got = append(got, p)
 		return nil
 	})
-	if err != nil {
-		t.Fatal(err)
-	}
+	assert.NoError(t, err)
 	want := []string{
 		"a/b",
 		"a/c",
@@ -175,9 +145,7 @@ func TestWalkGlobOps(t *testing.T) {
 		"b/c",
 		"b/d",
 	}
-	if !slices.Equal(want, got) {
-		t.Errorf("walked files: want %q, got %q", want, got)
-	}
+	assert.Equal(t, want, got, "walked files mismatch")
 	wantops := []string{
 		"open(.)",
 		"visitdir(.)",
@@ -189,11 +157,7 @@ func TestWalkGlobOps(t *testing.T) {
 		"open(b/c)",
 		"open(b/d)",
 	}
-	if !slices.Equal(wantops, tfs.ops) {
-		t.Errorf("ops mismatch:")
-		t.Errorf("  want: %q", wantops)
-		t.Errorf("  got:  %q", tfs.ops)
-	}
+	assert.Equal(t, wantops, tfs.ops, "ops mismatch")
 }
 
 type traceFS struct {

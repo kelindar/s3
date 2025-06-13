@@ -16,6 +16,8 @@ package fsutil
 
 import (
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestMatch(t *testing.T) {
@@ -31,12 +33,8 @@ func testPattern(t *testing.T) {
 		t.Helper()
 		n++
 		found, err := mr.Match(pattern, name)
-		if found != want {
-			t.Errorf("case %d: expected found = %v, got %v", n, want, found)
-		}
-		if err != wanterr {
-			t.Errorf("case %d: expected err = %v, got %v", n, wanterr, err)
-		}
+		assert.Equal(t, want, found, "case %d: expected found = %v, got %v", n, want, found)
+		assert.Equal(t, wanterr, err, "case %d: expected err = %v, got %v", n, wanterr, err)
 	}
 	// test cases from stdlib
 	run("abc", "abc", true, nil)
@@ -155,24 +153,18 @@ func testExpand(t *testing.T) {
 		t.Helper()
 		n++
 		found, err := mr.Match(pattern, name)
+		assert.True(t, found, "case %d: expected match", n)
 		if !found {
-			t.Errorf("case %d: expected match", n)
 			return
 		}
-		if err != merr {
-			t.Errorf("case %d: expected match err = %v, got %v", n, merr, err)
-		}
+		assert.Equal(t, merr, err, "case %d: expected match err = %v, got %v", n, merr, err)
 		if merr != nil {
 			// ignore results
 			return
 		}
 		got, err := mr.Expand(template)
-		if err != eerr {
-			t.Errorf("case %d: expected expand err = %v, got %v", n, eerr, err)
-		}
-		if string(got) != result {
-			t.Errorf("case %d: expected result = %q, got %q", n, result, got)
-		}
+		assert.Equal(t, eerr, err, "case %d: expected expand err = %v, got %v", n, eerr, err)
+		assert.Equal(t, result, string(got), "case %d: expected result = %q, got %q", n, result, got)
 	}
 	run("{x}", "bar", "$x", "bar", nil, nil)
 	run("{_}", "bar", "$_", "bar", nil, nil)
@@ -211,16 +203,12 @@ func testToGlob(t *testing.T) {
 		t.Helper()
 		n++
 		got, err := ToGlob(pattern)
-		if err != wanterr {
-			t.Errorf("case %d: expected err = %v, got %v", n, wanterr, err)
-		}
+		assert.Equal(t, wanterr, err, "case %d: expected err = %v, got %v", n, wanterr, err)
 		if wanterr != nil {
 			// ignore results
 			return
 		}
-		if got != want {
-			t.Errorf("case %d: expected %q, got %q", n, want, got)
-		}
+		assert.Equal(t, want, got, "case %d: expected %q, got %q", n, want, got)
 	}
 	run("{x}", "*", nil)
 	run("{x}-{y}", "*-*", nil)

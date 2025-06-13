@@ -14,7 +14,11 @@
 
 package s3
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+)
 
 func TestValidBuckets(t *testing.T) {
 	bucketNames := []string{
@@ -37,9 +41,7 @@ func TestValidBuckets(t *testing.T) {
 	}
 	for _, bucketName := range bucketNames {
 		t.Run(bucketName, func(t *testing.T) {
-			if !ValidBucket(bucketName) {
-				t.Fail()
-			}
+			assert.True(t, ValidBucket(bucketName), "bucket name %q should be valid", bucketName)
 		})
 	}
 }
@@ -65,9 +67,7 @@ func TestInvalidBuckets(t *testing.T) {
 	}
 	for _, bucketName := range bucketNames {
 		t.Run(bucketName, func(t *testing.T) {
-			if ValidBucket(bucketName) {
-				t.Fail()
-			}
+			assert.False(t, ValidBucket(bucketName), "bucket name %q should be invalid", bucketName)
 		})
 	}
 }

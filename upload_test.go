@@ -22,6 +22,7 @@ import (
 	"testing"
 
 	"github.com/kelindar/s3/aws"
+	"github.com/stretchr/testify/assert"
 )
 
 type testRoundTripper struct {
@@ -47,16 +48,16 @@ func (t *testRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 		defer req.Body.Close()
 	}
 	if req.Method != t.expect.method {
-		t.t.Errorf("method %q expected; got %q", t.expect.method, req.Method)
+		assert.Equal(t.t, t.expect.method, req.Method, "unexpected HTTP method")
 		return nil, errUnexpected
 	}
 	if uri := req.URL.RequestURI(); uri != t.expect.uri {
-		t.t.Errorf("uri %q expected; got %q", t.expect.uri, uri)
+		assert.Equal(t.t, t.expect.uri, uri, "unexpected URI")
 		return nil, errUnexpected
 	}
 	for i := range t.expect.headers {
 		if req.Header.Get(t.expect.headers[i]) == "" {
-			t.t.Errorf("header %q missing", t.expect.headers[i])
+			assert.NotEmpty(t.t, req.Header.Get(t.expect.headers[i]), "header %q missing", t.expect.headers[i])
 			return nil, errUnexpected
 		}
 	}
@@ -65,10 +66,7 @@ func (t *testRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) 
 		if err != nil {
 			return nil, err
 		}
-		if string(body) != t.expect.body {
-			t.t.Errorf("expected body %q; got %q", t.expect.body, body)
-			return nil, errUnexpected
-		}
+		assert.Equal(t.t, t.expect.body, string(body), "unexpected request body")
 	}
 
 	res := &http.Response{
@@ -108,13 +106,9 @@ func TestUpload(t *testing.T) {
 </InitiateMultipartUploadResult>`
 
 	err := up.Start()
-	if err != nil {
-		t.Fatal(err)
-	}
+	assert.NoError(t, err)
 
-	if up.ID() != "the-upload-id" {
-		t.Errorf("bad upload id %q", up.ID())
-	}
+	assert.Equal(t, "the-upload-id", up.ID())
 
 	// upload two parts in reverse order,
 	// so we can test that the final
@@ -128,18 +122,12 @@ func TestUpload(t *testing.T) {
 	trt.response.headers.Set("ETag", "the-ETag-2")
 	part := make([]byte, MinPartSize+1)
 	err = up.Upload(2, part)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if up.CompletedParts() != 1 {
-		t.Errorf("%d completed parts?", up.CompletedParts())
-	}
+	assert.NoError(t, err)
+	assert.Equal(t, 1, up.CompletedParts())
 	trt.expect.uri = "/the-object?partNumber=1&uploadId=the-upload-id"
 	trt.response.headers.Set("ETag", "the-ETag-1")
 	err = up.Upload(1, part)
-	if err != nil {
-		t.Fatal(err)
-	}
+	assert.NoError(t, err)
 
 	trt.expect.method = "POST"
 	trt.expect.uri = "/the-object?uploadId=the-upload-id"
@@ -155,17 +143,11 @@ func TestUpload(t *testing.T) {
 	trt.response.headers = make(http.Header)
 	trt.response.headers.Set("Content-Type", "application/xml")
 	err = up.Close(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if up.ETag() != "the-final-ETag" {
-		t.Errorf("unexpected ETag %q", up.ETag())
-	}
+	assert.NoError(t, err)
+	assert.Equal(t, "the-final-ETag", up.ETag())
 
 	// Abort shouldn't do anything here:
-	if err := up.Abort(); err != nil {
-		t.Errorf("abort: %s", err)
-	}
+	assert.NoError(t, up.Abort(), "abort")
 
 	// rewind the state and try the error case
 	up.finished = false
@@ -178,12 +160,8 @@ func TestUpload(t *testing.T) {
 	trt.response.headers.Set("Content-Type", "application/xml")
 
 	err = up.Close(nil)
-	if err == nil {
-		t.Fatal("no error when <Error/> body returned")
-	}
-	if !strings.Contains(err.Error(), "injected error message") {
-		t.Fatalf("unexpected error message %q", err)
-	}
+	assert.Error(t, err, "should get error when <Error/> body returned")
+	assert.Contains(t, err.Error(), "injected error message")
 
 	// now test Abort
 	trt.expect.method = "DELETE"
@@ -194,7 +172,5 @@ func TestUpload(t *testing.T) {
 	trt.response.code = 204
 	trt.response.headers = make(http.Header)
 	err = up.Abort()
-	if err != nil {
-		t.Errorf("abort: %s", err)
-	}
+	assert.NoError(t, err, "abort")
 }

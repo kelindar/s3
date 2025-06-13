@@ -21,12 +21,13 @@ import (
 	"os"
 	"path"
 	"path/filepath"
-	"reflect"
 	"strconv"
 	"strings"
 	"testing"
 
 	"slices"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestVisitDir(t *testing.T) {
@@ -41,9 +42,7 @@ func TestVisitDir(t *testing.T) {
 	tmp := t.TempDir()
 	for i := range list {
 		err := os.WriteFile(filepath.Join(tmp, list[i]), []byte{}, 0640)
-		if err != nil {
-			t.Fatalf("creating file %q: %v", list[i], err)
-		}
+		assert.NoError(t, err, "creating file %q", list[i])
 	}
 	cases := []struct {
 		seek, pattern string
@@ -63,9 +62,7 @@ func TestVisitDir(t *testing.T) {
 			}
 			if pattern != "" {
 				m, err := path.Match(pattern, list[i])
-				if err != nil {
-					t.Fatal(err)
-				}
+				assert.NoError(t, err)
 				if !m {
 					continue
 				}
@@ -84,15 +81,9 @@ func TestVisitDir(t *testing.T) {
 				got = append(got, d.Name())
 				return nil
 			})
-			if err != nil {
-				t.Fatal(err)
-			}
+			assert.NoError(t, err)
 			want := trivial(seek, pattern)
-			if !reflect.DeepEqual(want, got) {
-				t.Errorf("walk(%q, %q) mismatch:", seek, pattern)
-				t.Errorf("  want: %q", want)
-				t.Errorf("  got:  %q", got)
-			}
+			assert.Equal(t, want, got, "walk(%q, %q) mismatch", seek, pattern)
 		})
 	}
 }
@@ -196,14 +187,10 @@ func FuzzWalkDir(f *testing.F) {
 	for i := range list {
 		if !strings.Contains(list[i], ".") {
 			err := os.Mkdir(filepath.Join(tmp, list[i]), 0750)
-			if err != nil {
-				f.Fatalf("creating dir %q: %v", list[i], err)
-			}
+			assert.NoError(f, err, "creating dir %q", list[i])
 		} else {
 			err := os.WriteFile(filepath.Join(tmp, list[i]), []byte{}, 0640)
-			if err != nil {
-				f.Fatalf("creating file %q: %v", list[i], err)
-			}
+			assert.NoError(f, err, "creating file %q", list[i])
 		}
 	}
 	dir := os.DirFS(tmp)
@@ -253,18 +240,10 @@ func FuzzWalkDir(f *testing.F) {
 		for i, name := range list {
 			t.Run(strconv.Itoa(i), func(t *testing.T) {
 				got, err := flatwalk(WalkDir, dir, name, seek, pattern, limit)
-				if err != nil {
-					t.Fatalf("WalkDir(%q, %q, %q, %q) returned %v", dir, name, seek, pattern, err)
-				}
+				assert.NoError(t, err, "WalkDir(%q, %q, %q, %q) returned error", dir, name, seek, pattern)
 				want, err := flatwalk(trivialWalkDir, dir, name, seek, pattern, limit)
-				if err != nil {
-					t.Fatalf("trivialWalkDir(%q, %q, %q, %q) returned %v", dir, name, seek, pattern, err)
-				}
-				if !reflect.DeepEqual(want, got) {
-					t.Errorf("walk(%q, %q, %q, %d) mismatch:", name, seek, pattern, limit)
-					t.Errorf("  want: %q", want)
-					t.Errorf("  got:  %q", got)
-				}
+				assert.NoError(t, err, "trivialWalkDir(%q, %q, %q, %q) returned error", dir, name, seek, pattern)
+				assert.Equal(t, want, got, "walk(%q, %q, %q, %d) mismatch", name, seek, pattern, limit)
 			})
 		}
 	})
@@ -297,9 +276,8 @@ func FuzzSegments(f *testing.F) {
 	f.Fuzz(func(t *testing.T, p string) {
 		got, gotok := segments(p)
 		want, wantok := trivial(p)
-		if got != want || gotok != wantok {
-			t.Errorf("segments(%q): want (%d, %v), got (%d, %v)", p, want, wantok, got, gotok)
-		}
+		assert.Equal(t, want, got, "segments(%q): want %d, got %d", p, want, got)
+		assert.Equal(t, wantok, gotok, "segments(%q): want ok=%v, got ok=%v", p, wantok, gotok)
 	})
 }
 
@@ -343,9 +321,9 @@ func FuzzTrim(f *testing.F) {
 	f.Fuzz(func(t *testing.T, p string, n uint) {
 		f0, n0, ok0 := trivial(p, int(n))
 		f1, n1, ok1 := trim(p, int(n))
-		if f0 != f1 || n0 != n1 || ok0 != ok1 {
-			t.Errorf("trim(%q, %d): want (%q, %q, %v), got (%q, %q, %v)", p, n, f0, n0, ok0, f1, n1, ok1)
-		}
+		assert.Equal(t, f0, f1, "trim(%q, %d): want front=%q, got front=%q", p, n, f0, f1)
+		assert.Equal(t, n0, n1, "trim(%q, %d): want next=%q, got next=%q", p, n, n0, n1)
+		assert.Equal(t, ok0, ok1, "trim(%q, %d): want ok=%v, got ok=%v", p, n, ok0, ok1)
 	})
 }
 
@@ -382,9 +360,7 @@ func FuzzPathcmp(f *testing.F) {
 			t.Helper()
 			got := pathcmp(a, b)
 			want := trivial(a, b)
-			if got != want {
-				t.Errorf("pathcmp(%q, %q): want %d, got %d", a, b, want, got)
-			}
+			assert.Equal(t, want, got, "pathcmp(%q, %q): want %d, got %d", a, b, want, got)
 		}
 		test(a, b)
 		test(b, a)
@@ -445,9 +421,7 @@ func FuzzTreecmp(f *testing.F) {
 			t.Helper()
 			got := treecmp(a, b)
 			want := trivial(a, b)
-			if got != want {
-				t.Errorf("treecmp(%q, %q): want %d, got %d", a, b, want, got)
-			}
+			assert.Equal(t, want, got, "treecmp(%q, %q): want %d, got %d", a, b, want, got)
 		}
 		test(a, b)
 		test(b, a)

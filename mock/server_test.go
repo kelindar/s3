@@ -10,7 +10,6 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// TestMockS3ServerBasicOperations demonstrates basic usage of the mock S3 server
 func TestMockS3ServerBasicOperations(t *testing.T) {
 	// Create mock server
 	mockServer := New("test-bucket", "us-east-1")
@@ -54,7 +53,6 @@ func TestMockS3ServerBasicOperations(t *testing.T) {
 	assert.True(t, mockServer.HasRequestWithMethod("GET"))
 }
 
-// TestMockS3ServerListOperations demonstrates list operations
 func TestMockS3ServerListOperations(t *testing.T) {
 	mockServer := New("test-bucket", "us-east-1")
 	defer mockServer.Close()
@@ -79,7 +77,6 @@ func TestMockS3ServerListOperations(t *testing.T) {
 	assert.Contains(t, dir1Objects, "dir1/file2.txt")
 }
 
-// TestMockS3ServerRangeRequests demonstrates range request handling
 func TestMockS3ServerRangeRequests(t *testing.T) {
 	mockServer := New("test-bucket", "us-east-1")
 	defer mockServer.Close()
@@ -111,7 +108,6 @@ func TestMockS3ServerRangeRequests(t *testing.T) {
 	assert.Equal(t, testContent[100:201], rangeContent)
 }
 
-// TestMockS3ServerMultipartUpload demonstrates multipart upload operations
 func TestMockS3ServerMultipartUpload(t *testing.T) {
 	mockServer := New("test-bucket", "us-east-1")
 	defer mockServer.Close()
@@ -160,7 +156,6 @@ func TestMockS3ServerMultipartUpload(t *testing.T) {
 	assert.False(t, exists)
 }
 
-// TestMockS3ServerErrorSimulation demonstrates error simulation capabilities
 func TestMockS3ServerErrorSimulation(t *testing.T) {
 	mockServer := New("test-bucket", "us-east-1")
 	defer mockServer.Close()

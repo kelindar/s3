@@ -28,19 +28,18 @@ var mockRand = rand.New(rand.NewSource(time.Now().UnixNano()))
 // including object operations, multipart uploads, list operations, and S3 Select.
 type Server struct {
 	server   *httptest.Server
-	objects  map[string]*MockObject
-	uploads  map[string]*MockMultipartUpload
+	objects  map[string]*Object
+	uploads  map[string]*Multipart
 	mutex    sync.RWMutex
 	bucket   string
 	region   string
 	requests []RequestLog
 	errors   *ErrorSimulation
 	baseURL  string
-	debug    bool
 }
 
-// MockObject represents an S3 object stored in the mock server
-type MockObject struct {
+// Object represents an S3 object stored in the mock server
+type Object struct {
 	Content      []byte
 	ETag         string
 	LastModified time.Time
@@ -48,8 +47,8 @@ type MockObject struct {
 	Metadata     map[string]string
 }
 
-// MockMultipartUpload tracks the state of a multipart upload
-type MockMultipartUpload struct {
+// Multipart tracks the state of a multipart upload
+type Multipart struct {
 	ID       string
 	Bucket   string
 	Key      string
@@ -88,8 +87,8 @@ type ErrorSimulation struct {
 // New creates a new mock S3 server for the specified bucket and region
 func New(bucket, region string) *Server {
 	mock := &Server{
-		objects: make(map[string]*MockObject),
-		uploads: make(map[string]*MockMultipartUpload),
+		objects: make(map[string]*Object),
+		uploads: make(map[string]*Multipart),
 		bucket:  bucket,
 		region:  region,
 		errors:  &ErrorSimulation{},
@@ -118,8 +117,8 @@ func (m *Server) Clear() {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 
-	m.objects = make(map[string]*MockObject)
-	m.uploads = make(map[string]*MockMultipartUpload)
+	m.objects = make(map[string]*Object)
+	m.uploads = make(map[string]*Multipart)
 	m.requests = nil
 }
 
@@ -136,7 +135,7 @@ func (m *Server) PutObjectWithMetadata(key string, content []byte, metadata map[
 	etag := generateETag(content)
 	contentType := detectContentType(key, content)
 
-	m.objects[key] = &MockObject{
+	m.objects[key] = &Object{
 		Content:      content,
 		ETag:         etag,
 		LastModified: time.Now().UTC(),
@@ -148,7 +147,7 @@ func (m *Server) PutObjectWithMetadata(key string, content []byte, metadata map[
 }
 
 // GetObject retrieves an object from the mock server
-func (m *Server) GetObject(key string) (*MockObject, bool) {
+func (m *Server) GetObject(key string) (*Object, bool) {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 
@@ -214,20 +213,6 @@ func (m *Server) DisableErrorSimulation() {
 	m.mutex.Lock()
 	defer m.mutex.Unlock()
 	m.errors = &ErrorSimulation{}
-}
-
-// EnableDebug enables debug logging
-func (m *Server) EnableDebug() {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-	m.debug = true
-}
-
-// DisableDebug disables debug logging
-func (m *Server) DisableDebug() {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
-	m.debug = false
 }
 
 // ServeHTTP handles HTTP requests to the mock S3 server
@@ -684,7 +669,7 @@ func (m *Server) handleInitiateMultipartUpload(w http.ResponseWriter, r *http.Re
 	uploadID := generateUploadID()
 
 	m.mutex.Lock()
-	m.uploads[uploadID] = &MockMultipartUpload{
+	m.uploads[uploadID] = &Multipart{
 		ID:       uploadID,
 		Bucket:   m.bucket,
 		Key:      key,
@@ -944,7 +929,7 @@ func (m *Server) GetRequestsWithMethod(method string) []RequestLog {
 }
 
 // GetMultipartUpload returns a multipart upload by ID
-func (m *Server) GetMultipartUpload(uploadID string) (*MockMultipartUpload, bool) {
+func (m *Server) GetMultipartUpload(uploadID string) (*Multipart, bool) {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 
@@ -953,12 +938,12 @@ func (m *Server) GetMultipartUpload(uploadID string) (*MockMultipartUpload, bool
 }
 
 // ListMultipartUploads returns all active multipart uploads
-func (m *Server) ListMultipartUploads() map[string]*MockMultipartUpload {
+func (m *Server) ListMultipartUploads() map[string]*Multipart {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 
 	// Return a copy to avoid race conditions
-	uploads := make(map[string]*MockMultipartUpload)
+	uploads := make(map[string]*Multipart)
 	for id, upload := range m.uploads {
 		uploads[id] = upload
 	}

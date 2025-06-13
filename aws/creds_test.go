@@ -17,6 +17,8 @@ package aws
 import (
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
 )
 
 func TestScan(t *testing.T) {
@@ -44,30 +46,14 @@ func TestScan(t *testing.T) {
 	spec := make([]scanspec, len(basespec))
 	copy(spec, basespec)
 	err := scan(strings.NewReader(text), "default", spec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if foo != "foo_result" {
-		t.Errorf("foo = %q", foo)
-	}
-	if bar != "bar_result" {
-		t.Errorf("bar = %q", bar)
-	}
-	if baz != "baz_result" {
-		t.Errorf("baz = %q", baz)
-	}
-	if quux != "quux_result" {
-		t.Errorf("quux = %q", quux)
-	}
+	assert.NoError(t, err)
+	assert.Equal(t, "foo_result", foo)
+	assert.Equal(t, "bar_result", bar)
+	assert.Equal(t, "baz_result", baz)
+	assert.Equal(t, "quux_result", quux)
 	copy(spec, basespec)
 	err = scan(strings.NewReader(text), "section2", spec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if foo != "section2_result" {
-		t.Errorf("foo = %q", foo)
-	}
-	if bar != "section2_bar_result" {
-		t.Errorf("bar = %q", bar)
-	}
+	assert.NoError(t, err)
+	assert.Equal(t, "section2_result", foo)
+	assert.Equal(t, "section2_bar_result", bar)
 }
