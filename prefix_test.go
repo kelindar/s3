@@ -15,7 +15,6 @@
 package s3
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"io/fs"
@@ -42,7 +41,7 @@ func TestPrefix_BasicProperties(t *testing.T) {
 	mockServer.PutObject("dir1/file2.txt", []byte("content2"))
 	mockServer.PutObject("dir1/subdir/file3.txt", []byte("content3"))
 
-	b := NewBucket(context.Background(), key, bucket)
+	b := NewBucket(key, bucket)
 
 	// Open directory
 	dir, err := b.Open("dir1")
@@ -86,7 +85,7 @@ func TestPrefix_ReadDir(t *testing.T) {
 	mockServer.PutObject("testdir/subdir/file3.txt", []byte("content3"))
 	mockServer.PutObject("testdir/another/file4.txt", []byte("content4"))
 
-	b := NewBucket(context.Background(), key, bucket)
+	b := NewBucket(key, bucket)
 
 	// Open directory
 	dir, err := b.Open("testdir")
@@ -136,7 +135,7 @@ func TestPrefix_Open(t *testing.T) {
 	mockServer.PutObject("parent/child/file.txt", []byte("content"))
 	mockServer.PutObject("parent/file2.txt", []byte("content2"))
 
-	b := NewBucket(context.Background(), key, bucket)
+	b := NewBucket(key, bucket)
 
 	// Open parent directory
 	parent, err := b.Open("parent")
@@ -180,7 +179,7 @@ func TestPrefix_Read(t *testing.T) {
 
 	mockServer.PutObject("dir/file.txt", []byte("content"))
 
-	b := NewBucket(context.Background(), key, bucket)
+	b := NewBucket(key, bucket)
 
 	dir, err := b.Open("dir")
 	assert.NoError(t, err)
@@ -207,7 +206,7 @@ func TestPrefix_Close(t *testing.T) {
 
 	mockServer.PutObject("dir/file.txt", []byte("content"))
 
-	b := NewBucket(context.Background(), key, bucket)
+	b := NewBucket(key, bucket)
 
 	dir, err := b.Open("dir")
 	assert.NoError(t, err)
@@ -218,36 +217,6 @@ func TestPrefix_Close(t *testing.T) {
 	// Close should always succeed for directories
 	err = prefix.Close()
 	assert.NoError(t, err)
-}
-
-func TestPrefix_WithContext(t *testing.T) {
-	bucket := "test-bucket"
-	mockServer := mock.New(bucket, "us-east-1")
-	defer mockServer.Close()
-
-	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
-	key.BaseURI = mockServer.URL()
-
-	mockServer.PutObject("dir/file.txt", []byte("content"))
-
-	originalCtx := context.Background()
-	newCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	prefix := &Prefix{
-		Key:    key,
-		Bucket: bucket,
-		Path:   "dir/",
-		Ctx:    originalCtx,
-	}
-
-	// Test WithContext
-	newFS := prefix.WithContext(newCtx)
-	newPrefix, ok := newFS.(*Prefix)
-	assert.True(t, ok)
-	assert.Equal(t, newCtx, newPrefix.Ctx)
-	// WithContext calls join(".") which for "dir/" becomes "dir"
-	assert.Equal(t, "dir", newPrefix.Path)
 }
 
 func TestPrefix_VisitDir(t *testing.T) {
@@ -268,7 +237,6 @@ func TestPrefix_VisitDir(t *testing.T) {
 		Key:    key,
 		Bucket: bucket,
 		Path:   "visit/",
-		Ctx:    context.Background(),
 	}
 
 	// Test VisitDir with pattern
@@ -306,7 +274,7 @@ func TestPrefix_RootDirectory(t *testing.T) {
 	mockServer.PutObject("root1.txt", []byte("content1"))
 	mockServer.PutObject("root2.txt", []byte("content2"))
 
-	b := NewBucket(context.Background(), key, bucket)
+	b := NewBucket(key, bucket)
 
 	// Open root directory
 	root, err := b.Open(".")
@@ -331,7 +299,7 @@ func TestPrefix_EmptyDirectory(t *testing.T) {
 	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
 	key.BaseURI = mockServer.URL()
 
-	b := NewBucket(context.Background(), key, bucket)
+	b := NewBucket(key, bucket)
 
 	// Try to open non-existent directory
 	_, err := b.Open("nonexistent")
@@ -347,12 +315,10 @@ func TestPrefix_SubPrefixCreation(t *testing.T) {
 	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
 	key.BaseURI = mockServer.URL()
 
-	ctx := context.Background()
 	prefix := &Prefix{
 		Key:    key,
 		Bucket: bucket,
 		Path:   "parent/",
-		Ctx:    ctx,
 	}
 
 	// Test sub method
@@ -360,14 +326,6 @@ func TestPrefix_SubPrefixCreation(t *testing.T) {
 	assert.Equal(t, "parent/child", sub.Path)
 	assert.Equal(t, key, sub.Key)
 	assert.Equal(t, bucket, sub.Bucket)
-	assert.Equal(t, ctx, sub.Ctx)
-
-	// Test subctx method
-	newCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	subCtx := prefix.subctx(newCtx, "child2")
-	assert.Equal(t, "parent/child2", subCtx.Path)
-	assert.Equal(t, newCtx, subCtx.Ctx)
 
 	// Test join method
 	joined := prefix.join("extra")
@@ -392,7 +350,6 @@ func TestPrefix_OpenDir_ErrorCases(t *testing.T) {
 		Key:    key,
 		Bucket: "invalid_bucket",
 		Path:   "test/",
-		Ctx:    context.Background(),
 	}
 
 	_, err := invalidPrefix.openDir()
@@ -412,7 +369,6 @@ func TestPrefix_List_ErrorCases(t *testing.T) {
 		Key:    key,
 		Bucket: "invalid_bucket",
 		Path:   "test/",
-		Ctx:    context.Background(),
 	}
 
 	_, err := invalidPrefix.list(100, "", "", "")
@@ -436,7 +392,6 @@ func TestPrefix_ReadDirAt_Comprehensive(t *testing.T) {
 		Key:    key,
 		Bucket: bucket,
 		Path:   "test/",
-		Ctx:    context.Background(),
 	}
 
 	// Test readDirAt with different parameters
@@ -474,7 +429,6 @@ func TestPrefix_Client_Method(t *testing.T) {
 		Key:    key,
 		Bucket: bucket,
 		Path:   "test/",
-		Ctx:    context.Background(),
 		Client: nil,
 	}
 

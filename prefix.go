@@ -44,9 +44,8 @@ type Prefix struct {
 	// a valid path (see fs.ValidPath) plus
 	// a trailing forward slash to indicate
 	// that this is a pseudo-directory prefix.
-	Path   string          `xml:"Prefix"`
-	Client *http.Client    `xml:"-"`
-	Ctx    context.Context `xml:"-"`
+	Path   string       `xml:"Prefix"`
+	Client *http.Client `xml:"-"`
 
 	// listing token;
 	// "" means start from the beginning
@@ -64,22 +63,12 @@ func (p *Prefix) join(extra string) string {
 }
 
 func (p *Prefix) sub(name string) *Prefix {
-	return p.subctx(p.Ctx, name)
-}
-
-func (p *Prefix) subctx(ctx context.Context, name string) *Prefix {
 	return &Prefix{
 		Key:    p.Key,
 		Client: p.Client,
 		Bucket: p.Bucket,
 		Path:   p.join(name),
-		Ctx:    ctx,
 	}
-}
-
-// WithContext implements db.ContextFS
-func (p *Prefix) WithContext(ctx context.Context) fs.FS {
-	return p.subctx(ctx, ".")
 }
 
 // Open opens the object or pseudo-directory
@@ -125,7 +114,6 @@ func (p *Prefix) openDir() (fs.File, error) {
 		Bucket: p.Bucket,
 		Client: p.Client,
 		Path:   path,
-		Ctx:    p.Ctx,
 	}, nil
 }
 
@@ -260,7 +248,7 @@ func (p *Prefix) list(n int, token, seek, prefix string) (*listResponse, error) 
 	}
 	sort.Strings(parts)
 	query := "?" + strings.Join(parts, "&")
-	req, err := http.NewRequestWithContext(p.Ctx, http.MethodGet, rawURI(p.Key, p.Bucket, query), nil)
+	req, err := http.NewRequestWithContext(context.TODO(), http.MethodGet, rawURI(p.Key, p.Bucket, query), nil)
 	if err != nil {
 		return nil, fmt.Errorf("creating http request: %w", err)
 	}
@@ -368,7 +356,6 @@ func (p *Prefix) readDirAt(n int, token, seek, pattern string) (d []fs.DirEntry,
 		ret.CommonPrefixes[i].Key = p.Key
 		ret.CommonPrefixes[i].Bucket = p.Bucket
 		ret.CommonPrefixes[i].Client = p.Client
-		ret.CommonPrefixes[i].Ctx = p.Ctx
 		out = append(out, &ret.CommonPrefixes[i])
 	}
 	slices.SortFunc(out, func(a, b fs.DirEntry) int {
