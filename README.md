@@ -59,10 +59,10 @@ func main() {
     }
 
     // Create Bucket instance
-    bucket := s3.NewBucket(context.Background(), key, "my-bucket")
+    bucket := s3.NewBucket(key, "my-bucket")
     
     // Upload a file
-    etag, err := bucket.Put("hello.txt", []byte("Hello, World!"))
+    etag, err := bucket.Write(context.Background(), "hello.txt", []byte("Hello, World!"))
     if err != nil {
         panic(err)
     }
@@ -114,7 +114,7 @@ key := aws.DeriveKey(
 You can customize the behavior of the bucket by setting options:
 
 ```go
-bucket := s3.NewBucket(ctx, key, "my-bucket")
+bucket := s3.NewBucket(key, "my-bucket")
 bucket.Client = httpClient   // Optional: Custom HTTP client
 bucket.Lazy = true           // Optional: Use HEAD instead of GET for Open()
 ```
@@ -125,7 +125,7 @@ If you need to work with files, the library provides standard `fs.FS` operations
 
 ```go
 // Upload a file
-etag, err := bucket.Put("path/to/file.txt", []byte("content"))
+etag, err := bucket.Write(context.Background(), "path/to/file.txt", []byte("content"))
 
 // Read a file
 file, err := bucket.Open("path/to/file.txt")
@@ -200,29 +200,34 @@ data, err := io.ReadAll(reader)
 
 ### Multi-part Upload
 
-If you need to upload a large file, you can use the `Uploader` type. The following example uploads a file in two parts:
+For large files, you can use the `WriteFrom` method which automatically handles multipart uploads. This method is more convenient than manually managing upload parts:
 
 ```go
-uploader := &s3.Uploader{
-    Key:         key,
-    Bucket:      "my-bucket",
-    Object:      "large-file.dat",
-    ContentType: "application/octet-stream",
+// Open a large file
+file, err := os.Open("large-file.dat")
+if err != nil {
+    panic(err)
 }
+defer file.Close()
 
-// Start upload
-err := uploader.Start()
+// Get file size
+stat, err := file.Stat()
 if err != nil {
     panic(err)
 }
 
-// Upload parts (minimum 5MB each, except last)
-err = uploader.Upload(1, part1Data) // []byte with len >= 5MB
-err = uploader.Upload(2, part2Data)
-
-// Complete upload
-err = uploader.Close(nil)
+// Upload using multipart upload (automatically used for files > 5MB)
+err = bucket.WriteFrom(context.Background(), "large-file.dat", file, stat.Size())
+if err != nil {
+    panic(err)
+}
 ```
+
+The `WriteFrom` method automatically:
+- Determines optimal part size based on file size
+- Uploads parts in parallel for better performance
+- Handles multipart upload initialization and completion
+- Respects context cancellation for upload control
 
 
 ### Working with Subdirectories
