@@ -30,13 +30,10 @@ import (
 
 // File implements fs.File
 type File struct {
-	// Reader is a reader that points to
-	// the associated s3 object.
-	Reader
-
-	ctx  context.Context // from parent bucket
-	body io.ReadCloser   // actual body; populated lazily
-	pos  int64           // current read offset
+	Reader                 // Reader is a reader that points to the associated s3 object.
+	ctx    context.Context // from parent bucket
+	body   io.ReadCloser   // actual body; populated lazily
+	pos    int64           // current read offset
 }
 
 // Name implements fs.FileInfo.Name
