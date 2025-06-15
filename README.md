@@ -59,7 +59,7 @@ func main() {
     }
 
     // Create Bucket instance
-    bucket := s3.NewBucket(context.Background(), key, "my-bucket")
+    bucket := s3.NewBucket(key, "my-bucket")
     
     // Upload a file
     etag, err := bucket.Write(context.Background(), "hello.txt", []byte("Hello, World!"))
@@ -114,7 +114,7 @@ key := aws.DeriveKey(
 You can customize the behavior of the bucket by setting options:
 
 ```go
-bucket := s3.NewBucket(ctx, key, "my-bucket")
+bucket := s3.NewBucket(key, "my-bucket")
 bucket.Client = httpClient   // Optional: Custom HTTP client
 bucket.Lazy = true           // Optional: Use HEAD instead of GET for Open()
 ```
@@ -125,7 +125,7 @@ If you need to work with files, the library provides standard `fs.FS` operations
 
 ```go
 // Upload a file
-etag, err := bucket.Writ(context.Background(), "path/to/file.txt", []byte("content"))
+etag, err := bucket.Write(context.Background(), "path/to/file.txt", []byte("content"))
 
 // Read a file
 file, err := bucket.Open("path/to/file.txt")
