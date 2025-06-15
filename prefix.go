@@ -32,31 +32,18 @@ import (
 	"github.com/kelindar/s3/aws"
 )
 
-// Prefix implements fs.File, fs.ReadDirFile,
-// and fs.DirEntry, and fs.FS.
+// Prefix implements fs.File, fs.ReadDirFile, and fs.DirEntry, and fs.FS.
 type Prefix struct {
-	// Key is the signing key used to sign requests.
-	Key *aws.SigningKey `xml:"-"`
-	// Bucket is the bucket at the root of the "filesystem"
-	Bucket string `xml:"-"`
-	// Path is the path of this prefix.
-	// The value of Path should always be
-	// a valid path (see fs.ValidPath) plus
-	// a trailing forward slash to indicate
-	// that this is a pseudo-directory prefix.
-	Path   string       `xml:"Prefix"`
-	Client *http.Client `xml:"-"`
-
-	// listing token;
-	// "" means start from the beginning
-	token string
-	// if true, ReadDir returns io.EOF
-	dirEOF bool
+	Key    *aws.SigningKey `xml:"-"`      // Key is the signing key used to sign requests.
+	Client *http.Client    `xml:"-"`      // Client is the HTTP client used to make requests. If it is nil, then DefaultClient will be used.
+	Bucket string          `xml:"-"`      // Bucket is the bucket at the root of the "filesystem"
+	Path   string          `xml:"Prefix"` // Path is the path of this prefix, should always be a valid path  (see fs.ValidPath) plus a trailing forward slash to indicate that this is a pseudo-directory prefix.
+	token  string          `xml:"-"`      // listing token; "" means start from the beginning
+	dirEOF bool            `xml:"-"`      // if true, ReadDir returns io.EOF
 }
 
 func (p *Prefix) join(extra string) string {
-	if p.Path == "." {
-		// root of bucket
+	if p.Path == "." { // root of bucket
 		return extra
 	}
 	return path.Join(p.Path, extra)
@@ -270,12 +257,12 @@ func (p *Prefix) list(n int, token, seek, prefix string) (*listResponse, error) 
 		}
 		return nil, fmt.Errorf("s3 list objects s3://%s/%s: %s", p.Bucket, p.Path, res.Status)
 	}
-	ret := &listResponse{}
-	err = xml.NewDecoder(res.Body).Decode(ret)
-	if err != nil {
+
+	var ret listResponse
+	if err := xml.NewDecoder(res.Body).Decode(&ret); err != nil {
 		return nil, fmt.Errorf("xml decoding response: %w", err)
 	}
-	return ret, nil
+	return &ret, nil
 }
 
 func patmatch(pattern, name string) (bool, error) {

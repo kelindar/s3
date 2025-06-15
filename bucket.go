@@ -31,17 +31,10 @@ import (
 
 // Bucket implements fs.FS, fs.ReadDirFS, and fs.SubFS.
 type Bucket struct {
-	key *aws.SigningKey
-	bkt string
-
-	// Client is the HTTP client used to make requests. If it is nil, then
-	// DefaultClient will be used.
-	Client *http.Client
-
-	// Lazy, if true, causes the initial Open call to use a HEAD operation
-	// rather than a GET operation. The first call to fs.File.Read will
-	// cause the full GET to be performed.
-	Lazy bool
+	key    *aws.SigningKey // signing key
+	bkt    string          // bucket name
+	Client *http.Client    // HTTP client used for requests, if nil then DefaultClient is used
+	Lazy   bool            // If true, causes the initial Open call to use a HEAD operation rather than a GET operation.
 }
 
 // NewBucket creates a new Bucket instance.
@@ -50,6 +43,13 @@ func NewBucket(key *aws.SigningKey, bucket string) *Bucket {
 		key: key,
 		bkt: bucket,
 	}
+}
+
+func (b *Bucket) client() *http.Client {
+	if b.Client == nil {
+		return &DefaultClient
+	}
+	return b.Client
 }
 
 func (b *Bucket) sub(name string) *Prefix {
@@ -86,11 +86,7 @@ func (b *Bucket) Write(ctx context.Context, key string, contents []byte) (string
 	}
 
 	b.key.SignV4(req, contents)
-	client := b.Client
-	if client == nil {
-		client = &DefaultClient
-	}
-	res, err := flakyDo(client, req)
+	res, err := flakyDo(b.client(), req)
 	if err != nil {
 		return "", err
 	}
@@ -215,11 +211,7 @@ func (b *Bucket) Delete(ctx context.Context, fullpath string) error {
 		return err
 	}
 	b.key.SignV4(req, nil)
-	client := b.Client
-	if client == nil {
-		client = &DefaultClient
-	}
-	res, err := flakyDo(client, req)
+	res, err := flakyDo(b.client(), req)
 	if err != nil {
 		return err
 	}
