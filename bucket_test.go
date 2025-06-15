@@ -16,6 +16,7 @@
 package s3
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -70,7 +71,7 @@ func TestBucket(t *testing.T) {
 }
 
 func testIntegration(t *testing.T, bucket, prefix string, key *aws.SigningKey) {
-	b := NewBucket(context.Background(), key, bucket)
+	b := NewBucket(key, bucket)
 	b.Lazy = true
 
 	tests := []struct {
@@ -112,7 +113,7 @@ func testIntegration(t *testing.T, bucket, prefix string, key *aws.SigningKey) {
 			return nil // cannot rm
 		}
 		t.Logf("remove %s", p)
-		return b.Remove(p)
+		return b.Delete(context.Background(), p)
 	}
 	// remove everything left under the prefix
 	assert.NoError(t, fs.WalkDir(b, prefix, rm))
@@ -130,7 +131,7 @@ func testBasicCrud(t *testing.T, b *Bucket, prefix string) {
 	contents := []byte("here are some object contents")
 	fullp := path.Join(prefix, "foo/bar/filename-with:chars= space")
 
-	etag, err := b.Put(fullp, contents)
+	etag, err := b.Write(context.Background(), fullp, contents)
 	assert.NoError(t, err)
 
 	f, err := b.Open(fullp)
@@ -147,7 +148,7 @@ func testBasicCrud(t *testing.T, b *Bucket, prefix string) {
 	assert.Equal(t, contents, mem)
 
 	assert.NoError(t, f.Close(), "Close")
-	assert.NoError(t, b.Remove(s3f.Path()))
+	assert.NoError(t, b.Delete(context.Background(), s3f.Path()))
 
 	// should get fs.ErrNotExist on another get;
 	// this path exercises the list-for-get path:
@@ -197,7 +198,7 @@ func testWalkGlob(t *testing.T, b *Bucket, prefix string) {
 		} else {
 			full = prefix + full
 		}
-		_, err := b.put(full, []byte(fmt.Sprintf("contents of %q", full)))
+		_, err := b.Write(context.Background(), full, []byte(fmt.Sprintf("contents of %q", full)))
 		assert.NoError(t, err)
 	}
 
@@ -227,11 +228,11 @@ func testWalkGlob(t *testing.T, b *Bucket, prefix string) {
 
 func testWalkGlobRoot(t *testing.T, b *Bucket, prefix string) {
 	name := prefix + ".txt"
-	_, err := b.put(name, nil)
+	_, err := b.Write(context.Background(), name, nil)
 	assert.NoError(t, err, "creating test file")
 	t.Cleanup(func() {
 		t.Log("remove", name)
-		b.Remove(name)
+		b.Delete(context.Background(), name)
 	})
 
 	root, err := b.Open(".")
@@ -264,7 +265,7 @@ func TestBucket_OpenRange(t *testing.T) {
 	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
 	key.BaseURI = mockServer.URL()
 
-	b := NewBucket(context.Background(), key, bucket)
+	b := NewBucket(key, bucket)
 
 	// Create test content
 	content := []byte("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")
@@ -297,7 +298,7 @@ func TestBucket_Remove(t *testing.T) {
 	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
 	key.BaseURI = mockServer.URL()
 
-	b := NewBucket(context.Background(), key, bucket)
+	b := NewBucket(key, bucket)
 
 	// Create test object
 	content := []byte("content to be removed")
@@ -309,7 +310,7 @@ func TestBucket_Remove(t *testing.T) {
 	assert.True(t, exists)
 
 	// Remove object
-	err := b.Remove(objectKey)
+	err := b.Delete(context.Background(), objectKey)
 	assert.NoError(t, err)
 
 	// Verify object is removed
@@ -317,12 +318,12 @@ func TestBucket_Remove(t *testing.T) {
 	assert.False(t, exists)
 
 	// Test removing non-existent object (might error with 404)
-	err = b.Remove("nonexistent.txt")
+	err = b.Delete(context.Background(), "nonexistent.txt")
 	// This might return an error depending on implementation
 	// assert.NoError(t, err)
 
 	// Test removing with invalid path
-	err = b.Remove("../invalid")
+	err = b.Delete(context.Background(), "../invalid")
 	assert.Error(t, err)
 }
 
@@ -334,7 +335,7 @@ func TestBucket_Sub(t *testing.T) {
 	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
 	key.BaseURI = mockServer.URL()
 
-	b := NewBucket(context.Background(), key, bucket)
+	b := NewBucket(key, bucket)
 
 	// Test Sub with valid directory
 	subFS, err := b.Sub("test/subdir")
@@ -351,24 +352,6 @@ func TestBucket_Sub(t *testing.T) {
 	assert.Error(t, err)
 }
 
-func TestBucket_WithContext(t *testing.T) {
-	bucket := "test-bucket"
-	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
-
-	originalCtx := context.Background()
-	b := NewBucket(originalCtx, key, bucket)
-
-	// Test WithContext
-	newCtx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	newFS := b.WithContext(newCtx)
-	newPrefix, ok := newFS.(*Prefix)
-	assert.True(t, ok)
-	assert.Equal(t, newCtx, newPrefix.Ctx)
-	assert.Equal(t, ".", newPrefix.Path)
-}
-
 func TestBucket_DelayGet(t *testing.T) {
 	bucket := "test-bucket"
 	mockServer := mock.New(bucket, "us-east-1")
@@ -377,7 +360,7 @@ func TestBucket_DelayGet(t *testing.T) {
 	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
 	key.BaseURI = mockServer.URL()
 
-	b := NewBucket(context.Background(), key, bucket)
+	b := NewBucket(key, bucket)
 	b.Lazy = true
 
 	// Create test content
@@ -410,7 +393,7 @@ func TestBucket_VisitDir(t *testing.T) {
 	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
 	key.BaseURI = mockServer.URL()
 
-	b := NewBucket(context.Background(), key, bucket)
+	b := NewBucket(key, bucket)
 
 	// Create test structure
 	mockServer.PutObject("visit/a.txt", []byte("a"))
@@ -454,14 +437,14 @@ func TestBucket_ErrorHandling(t *testing.T) {
 	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
 	key.BaseURI = mockServer.URL()
 
-	b := NewBucket(context.Background(), key, bucket)
+	b := NewBucket(key, bucket)
 
 	// Test Put with invalid path
-	_, err := b.Put("../invalid", []byte("content"))
+	_, err := b.Write(context.Background(), "../invalid", []byte("content"))
 	assert.Error(t, err)
 
 	// Test Put with directory path (might be allowed)
-	_, err = b.Put("dir/", []byte("content"))
+	_, err = b.Write(context.Background(), "dir/", []byte("content"))
 	// This might not error depending on implementation
 	// assert.Error(t, err)
 
@@ -472,4 +455,110 @@ func TestBucket_ErrorHandling(t *testing.T) {
 	// Test ReadDir with invalid path
 	_, err = b.ReadDir("../invalid")
 	assert.Error(t, err)
+}
+
+func TestBucket_WriteFrom(t *testing.T) {
+	bucket := "test-bucket"
+	mockServer := mock.New(bucket, "us-east-1")
+	defer mockServer.Close()
+
+	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
+	key.BaseURI = mockServer.URL()
+
+	b := NewBucket(key, bucket)
+
+	// Create test data larger than MinPartSize to trigger multipart upload
+	testData := make([]byte, MinPartSize*2+1000) // ~10MB + 1000 bytes
+	for i := range testData {
+		testData[i] = byte(i % 256)
+	}
+
+	// Test WriteFrom with context
+	ctx := context.Background()
+	objectKey := "test/large-file.bin"
+
+	err := b.WriteFrom(ctx, objectKey, bytes.NewReader(testData), int64(len(testData)))
+	assert.NoError(t, err)
+
+	// Verify the object was created
+	assert.True(t, mockServer.ObjectExists(objectKey))
+
+	// Verify the content is correct
+	content, found := mockServer.ObjectContent(objectKey)
+	assert.True(t, found)
+	assert.Equal(t, testData, content)
+}
+
+func TestBucket_WriteFrom_ContextCancellation(t *testing.T) {
+	bucket := "test-bucket"
+	mockServer := mock.New(bucket, "us-east-1")
+	defer mockServer.Close()
+
+	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
+	key.BaseURI = mockServer.URL()
+
+	b := NewBucket(key, bucket)
+
+	// Create test data larger than MinPartSize to trigger multipart upload
+	testData := make([]byte, MinPartSize*3) // ~15MB
+	for i := range testData {
+		testData[i] = byte(i % 256)
+	}
+
+	// Test WriteFrom with cancelled context
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // Cancel immediately
+
+	objectKey := "test/cancelled-upload.bin"
+
+	err := b.WriteFrom(ctx, objectKey, bytes.NewReader(testData), int64(len(testData)))
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "context canceled")
+}
+
+func TestBucket_Write_ContextCancellation(t *testing.T) {
+	bucket := "test-bucket"
+	mockServer := mock.New(bucket, "us-east-1")
+	defer mockServer.Close()
+
+	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
+	key.BaseURI = mockServer.URL()
+
+	b := NewBucket(key, bucket)
+
+	// Test Write with cancelled context
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // Cancel immediately
+
+	objectKey := "test/cancelled-write.txt"
+	testData := []byte("test content")
+
+	_, err := b.Write(ctx, objectKey, testData)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "context canceled")
+}
+
+func TestBucket_Delete_ContextCancellation(t *testing.T) {
+	bucket := "test-bucket"
+	mockServer := mock.New(bucket, "us-east-1")
+	defer mockServer.Close()
+
+	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
+	key.BaseURI = mockServer.URL()
+
+	b := NewBucket(key, bucket)
+
+	// Create an object first
+	objectKey := "test/delete-test.txt"
+	testData := []byte("test content")
+	_, err := b.Write(context.Background(), objectKey, testData)
+	assert.NoError(t, err)
+
+	// Test Delete with cancelled context
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // Cancel immediately
+
+	err = b.Delete(ctx, objectKey)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "context canceled")
 }
