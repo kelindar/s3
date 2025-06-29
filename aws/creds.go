@@ -30,22 +30,15 @@ import (
 	"time"
 )
 
-// DeriveFn is a function that can
-// be used to derive a signing key
-// from an endpoint, key ID, secret,
-// region, and service.
-//
-// The simplest implementation of DeriveFn
-// is just a call to DeriveKey, but more complex
-// DeriveFn implementations can tweak the scope
-// (region and service).
-//
-// See, for example, s3.DeriveForBucket.
+// DeriveFn is a function that can be used to derive a signing key
+// from an endpoint, key ID, secret, region, and service. The simplest
+// implementation of DeriveFn is just a call to DeriveKey, but more complex
+// DeriveFn implementations can tweak the scope (region and service). See, for
+// example, s3.DeriveForBucket.
 type DeriveFn func(baseURI, id, secret, token, region, service string) (*SigningKey, error)
 
-// DefaultDerive is the DeriveFn that
-// simply calls DeriveKey and populates
-// the session token if it is present.
+// DefaultDerive is the DeriveFn that simply calls DeriveKey and populates the
+// session token if it is present.
 func DefaultDerive(baseURI, id, secret, token, region, service string) (*SigningKey, error) {
 	k := DeriveKey(baseURI, id, secret, region, service)
 	k.Token = token
@@ -101,11 +94,13 @@ func AmbientCreds() (id, secret, region, token string, err error) {
 
 	// Locations of the config/credentials file is document in
 	// https://docs.aws.amazon.com/sdkref/latest/guide/file-location.html
-	configfile := envdefault(filepath.Join(home, ".aws", "config"), "AWS_CONFIG_FILE")
-	credentialsfile := envdefault(filepath.Join(home, ".aws", "credentials"), "AWS_SHARED_CREDENTIALS_FILE")
+	homeConfig := envdefault(filepath.Join(home, ".aws", "config"), "AWS_CONFIG_FILE")
+	homeCreds := envdefault(filepath.Join(home, ".aws", "credentials"), "AWS_SHARED_CREDENTIALS_FILE")
+	localCreds := envdefault(filepath.Join(".aws", "credentials"))
 
+	// if the region is not set, try to load it from the config file
 	if region == "" {
-		f, err := os.Open(configfile)
+		f, err := os.Open(homeConfig)
 		if err != nil {
 			return "", "", "", "", err
 		}
@@ -124,33 +119,25 @@ func AmbientCreds() (id, secret, region, token string, err error) {
 		}
 	}
 
+	// if the credentials file exists, try to load the credentials from it
 	if id == "" || secret == "" {
-
-		f, err := os.Open(credentialsfile)
-		if err != nil {
-			return "", "", "", "", err
-		}
-		defer f.Close()
-		info, err := f.Stat()
-		if err != nil {
-			return "", "", "", "", fmt.Errorf("examining credentials: %w", err)
-		}
-		err = check(info)
-		if err != nil {
-			return "", "", "", "", err
-		}
-		err = scan(f, profile, []scanspec{
-			{"aws_access_key_id", &id},
-			{"aws_secret_access_key", &secret},
-		})
+		id, secret, err = loadCredentials(homeCreds, profile)
 		if err != nil {
 			return "", "", "", "", err
 		}
 
-		// credentials file never contain a session token,
-		// so it should be reset
+		// credentials file never contain a session token, so it should be reset
 		token = ""
 	}
+
+	// if the credentials file exists, try to load the credentials from it
+	if id == "" || secret == "" {
+		id, secret, err = loadCredentials(localCreds, profile)
+		if err != nil {
+			return "", "", "", "", err
+		}
+	}
+
 	if id == "" || secret == "" {
 		return "", "", "", "", fmt.Errorf("unable to determine id or secret")
 	}
@@ -337,13 +324,14 @@ func scan(in io.Reader, section string, into []scanspec) error {
 // from world-writeable locations
 func check(info fs.FileInfo) error {
 	mode := info.Mode()
-	if mode&2 != 0 {
+	switch {
+	case mode&2 != 0:
 		return fmt.Errorf("%s is world-writeable %o", info.Name(), mode)
-	}
-	if kind := mode & fs.ModeType; kind != fs.ModeDir && kind != 0 {
+	case mode&fs.ModeType != 0:
 		return fmt.Errorf("%s is a special file", info.Name())
+	default:
+		return nil
 	}
-	return nil
 }
 
 // EC2Role derives a signing key
@@ -381,4 +369,32 @@ func EC2Role(role, service string, derive DeriveFn) (*SigningKey, error) {
 	}
 	sk.Token = k.Token
 	return sk, nil
+}
+
+// loadCredentials loads the credentials from the credentials file
+// and returns the id and secret.
+func loadCredentials(credentialsfile, profile string) (id, secret string, err error) {
+	f, err := os.Open(credentialsfile)
+	if err != nil {
+		return "", "", err
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return "", "", fmt.Errorf("examining credentials: %w", err)
+	}
+
+	if err := check(info); err != nil {
+		return "", "", err
+	}
+
+	if err := scan(f, profile, []scanspec{
+		{"aws_access_key_id", &id},
+		{"aws_secret_access_key", &secret},
+	}); err != nil {
+		return "", "", err
+	}
+
+	return
 }

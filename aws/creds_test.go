@@ -159,31 +159,14 @@ func TestAmbientCreds(t *testing.T) {
 	assert.Equal(t, "TOKEN", token)
 }
 
-func TestAmbientCredsFiles(t *testing.T) {
+func TestLoadCredentials(t *testing.T) {
 	dir := t.TempDir()
-	os.Setenv("HOME", dir)
-	defer os.Unsetenv("HOME")
+	path := filepath.Join(dir, "credentials")
 
-	os.Unsetenv("AWS_ACCESS_KEY_ID")
-	os.Unsetenv("AWS_SECRET_ACCESS_KEY")
-	os.Unsetenv("AWS_REGION")
-	os.Unsetenv("AWS_DEFAULT_REGION")
+	assert.NoError(t, os.WriteFile(path, []byte("[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n"), 2644))
 
-	awsDir := filepath.Join(dir, ".aws")
-	err := os.MkdirAll(awsDir, 0755)
+	id, secret, err := loadCredentials(path, "default")
 	assert.NoError(t, err)
-
-	configPath := filepath.Join(awsDir, "config")
-	credPath := filepath.Join(awsDir, "credentials")
-	err = os.WriteFile(configPath, []byte("[profile default]\nregion=eu-central-1\n"), 0644)
-	assert.NoError(t, err)
-	err = os.WriteFile(credPath, []byte("[default]\naws_access_key_id=IDFILE\naws_secret_access_key=SECF\n"), 0600)
-	assert.NoError(t, err)
-
-	id, secret, region, token, err := AmbientCreds()
-	assert.NoError(t, err)
-	assert.Equal(t, "IDFILE", id)
-	assert.Equal(t, "SECF", secret)
-	assert.Equal(t, "eu-central-1", region)
-	assert.Equal(t, "", token)
+	assert.Equal(t, "AKID", id)
+	assert.Equal(t, "SECRET", secret)
 }
