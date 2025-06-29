@@ -151,7 +151,7 @@ func TestAmbientCreds(t *testing.T) {
 	os.Setenv("HOME", t.TempDir())
 	defer os.Unsetenv("HOME")
 
-	id, secret, region, token, err := AmbientCreds()
+	id, secret, region, token, err := AmbientCreds("")
 	assert.NoError(t, err)
 	assert.Equal(t, "AKID", id)
 	assert.Equal(t, "SECRET", secret)
@@ -169,4 +169,20 @@ func TestLoadCredentials(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, "AKID", id)
 	assert.Equal(t, "SECRET", secret)
+}
+
+func TestAmbientCreds_Local(t *testing.T) {
+	wd, _ := os.Getwd()
+	path := filepath.Join(wd, ".aws", "credentials")
+	defer os.RemoveAll(filepath.Dir(path))
+
+	assert.NoError(t, os.MkdirAll(filepath.Dir(path), os.ModePerm))
+	assert.NoError(t, os.WriteFile(path, []byte("[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n"), 2644))
+
+	id, secret, region, token, err := AmbientCreds("eu-central-1")
+	assert.NoError(t, err)
+	assert.Equal(t, "AKID", id)
+	assert.Equal(t, "SECRET", secret)
+	assert.Equal(t, "eu-central-1", region)
+	assert.Equal(t, "", token)
 }

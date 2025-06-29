@@ -45,7 +45,7 @@ func TestAWS(t *testing.T) {
 
 	r := rand.New(rand.NewSource(time.Now().Unix()))
 	prefix := fmt.Sprintf("go-test-%d", r.Int())
-	key, err := aws.AmbientKey("b2", DeriveForBucket(bucket))
+	key, err := aws.AmbientKey("b2", "", DeriveForBucket(bucket))
 	if err != nil {
 		t.Skipf("skipping; couldn't derive key: %s", err)
 	}

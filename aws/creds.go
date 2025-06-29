@@ -70,7 +70,7 @@ func DefaultDerive(baseURI, id, secret, token, region, service string) (*Signing
 // is safer than the aws SDK's "NewSession" function
 // but less safe than explicitly picking up secrets
 // from where you expect to find them. Caveat emptor.
-func AmbientCreds() (id, secret, region, token string, err error) {
+func AmbientCreds(regionName string) (id, secret, region, token string, err error) {
 	envdefault := func(base string, env ...string) string {
 		for _, e := range env {
 			if x := os.Getenv(e); x != "" {
@@ -80,10 +80,15 @@ func AmbientCreds() (id, secret, region, token string, err error) {
 		return base
 	}
 
+	wd, _ := os.Getwd()
 	id = envdefault("", "AWS_ACCESS_KEY_ID")
 	secret = envdefault("", "AWS_SECRET_ACCESS_KEY")
-	region = envdefault("", "AWS_REGION", "AWS_DEFAULT_REGION")
 	token = envdefault("", "AWS_SESSION_TOKEN")
+
+	// Resolve region if not provided
+	if region = regionName; regionName == "" {
+		region = envdefault(regionName, "AWS_REGION", "AWS_DEFAULT_REGION")
+	}
 
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -94,13 +99,13 @@ func AmbientCreds() (id, secret, region, token string, err error) {
 
 	// Locations of the config/credentials file is document in
 	// https://docs.aws.amazon.com/sdkref/latest/guide/file-location.html
-	homeConfig := envdefault(filepath.Join(home, ".aws", "config"), "AWS_CONFIG_FILE")
-	homeCreds := envdefault(filepath.Join(home, ".aws", "credentials"), "AWS_SHARED_CREDENTIALS_FILE")
-	localCreds := envdefault(filepath.Join(".aws", "credentials"))
+	homeConf := envdefault(filepath.Join(home, ".aws", "config"), "AWS_CONFIG_FILE")
+	homeCred := envdefault(filepath.Join(home, ".aws", "credentials"), "AWS_SHARED_CREDENTIALS_FILE")
+	hereCred := envdefault(filepath.Join(wd, ".aws", "credentials"))
 
 	// if the region is not set, try to load it from the config file
 	if region == "" {
-		f, err := os.Open(homeConfig)
+		f, err := os.Open(homeConf)
 		if err != nil {
 			return "", "", "", "", err
 		}
@@ -119,40 +124,32 @@ func AmbientCreds() (id, secret, region, token string, err error) {
 		}
 	}
 
-	// if the credentials file exists, try to load the credentials from it
+	// if the credentials are not set, try to load them from the home or local credentials file
 	if id == "" || secret == "" {
-		id, secret, err = loadCredentials(homeCreds, profile)
-		if err != nil {
-			return "", "", "", "", err
+		switch {
+		case fileExists(homeCred):
+			id, secret, err = loadCredentials(homeCred, profile)
+		case fileExists(hereCred):
+			id, secret, err = loadCredentials(hereCred, profile)
 		}
 
 		// credentials file never contain a session token, so it should be reset
 		token = ""
 	}
 
-	// if the credentials file exists, try to load the credentials from it
-	if id == "" || secret == "" {
-		id, secret, err = loadCredentials(localCreds, profile)
-		if err != nil {
-			return "", "", "", "", err
-		}
-	}
-
-	if id == "" || secret == "" {
+	switch {
+	case id == "" || secret == "":
 		return "", "", "", "", fmt.Errorf("unable to determine id or secret")
-	}
-	if region == "" {
+	case region == "":
 		return "", "", "", "", fmt.Errorf("unable to determine region")
+	default:
+		return
 	}
-	return
 }
 
-// WebIdentityCreds tries to load the credentials
-// from a web-identity. The web-identity token should
-// be stored in a file whose path is exposed in the
-// AWS_WEB_IDENTITY_TOKEN_FILE environment variable.
-// It will assume the role as specified in the
-// AWS_ROLE_ARN environment variable.
+// WebIdentityCreds tries to load the credentials from a web-identity. The web-identity token should
+// be stored in a file whose path is exposed in the AWS_WEB_IDENTITY_TOKEN_FILE environment variable.
+// It will assume the role as specified in the AWS_ROLE_ARN environment variable.
 func WebIdentityCreds(client *http.Client) (id, secret, region, token string, expiration time.Time, err error) {
 	region = os.Getenv("AWS_REGION")
 	if region == "" {
@@ -234,14 +231,14 @@ func WebIdentityCreds(client *http.Client) (id, secret, region, token string, ex
 // from the ambient filesystem, environment, etc.
 // The key is derived using derive, unless it is nil,
 // in which case DefaultDerive is used instead.
-func AmbientKey(service string, derive DeriveFn) (*SigningKey, error) {
+func AmbientKey(service, region string, derive DeriveFn) (*SigningKey, error) {
 	if derive == nil {
 		derive = DefaultDerive
 	}
 
 	id, secret, region, token, _, err := WebIdentityCreds(nil)
 	if err != nil {
-		id, secret, region, token, err = AmbientCreds()
+		id, secret, region, token, err = AmbientCreds(region)
 		if err != nil {
 			return nil, err
 		}
@@ -397,4 +394,10 @@ func loadCredentials(credentialsfile, profile string) (id, secret string, err er
 	}
 
 	return
+}
+
+// fileExists checks if a file exists
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
 }
