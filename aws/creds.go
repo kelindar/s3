@@ -231,14 +231,14 @@ func WebIdentityCreds(client *http.Client) (id, secret, region, token string, ex
 // from the ambient filesystem, environment, etc.
 // The key is derived using derive, unless it is nil,
 // in which case DefaultDerive is used instead.
-func AmbientKey(service, region string, derive DeriveFn) (*SigningKey, error) {
+func AmbientKey(service, regionName string, derive DeriveFn) (*SigningKey, error) {
 	if derive == nil {
 		derive = DefaultDerive
 	}
 
 	id, secret, region, token, _, err := WebIdentityCreds(nil)
 	if err != nil {
-		id, secret, region, token, err = AmbientCreds(region)
+		id, secret, region, token, err = AmbientCreds(regionName)
 		if err != nil {
 			return nil, err
 		}

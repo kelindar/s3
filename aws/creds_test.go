@@ -179,10 +179,20 @@ func TestAmbientCreds_Local(t *testing.T) {
 	assert.NoError(t, os.MkdirAll(filepath.Dir(path), os.ModePerm))
 	assert.NoError(t, os.WriteFile(path, []byte("[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n"), 2644))
 
+	// Verify that the credentials are loaded from the local file
 	id, secret, region, token, err := AmbientCreds("eu-central-1")
 	assert.NoError(t, err)
 	assert.Equal(t, "AKID", id)
 	assert.Equal(t, "SECRET", secret)
 	assert.Equal(t, "eu-central-1", region)
 	assert.Equal(t, "", token)
+
+	// Verify that the credentials are loaded from the local file
+	key, err := AmbientKey("s3", "eu-central-1", DefaultDerive)
+	assert.NoError(t, err)
+	assert.NotNil(t, key)
+	assert.Equal(t, "AKID", key.AccessKey)
+	assert.Equal(t, "SECRET", key.Secret)
+	assert.Equal(t, "eu-central-1", key.Region)
+	assert.Equal(t, "", key.Token)
 }
