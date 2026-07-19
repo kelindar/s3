@@ -163,10 +163,14 @@ func (p *Prefix) Close() error {
 // Every returned fs.DirEntry will be either
 // a Prefix or a File struct.
 func (p *Prefix) ReadDir(n int) ([]fs.DirEntry, error) {
+	return p.readDirContext(context.Background(), n)
+}
+
+func (p *Prefix) readDirContext(ctx context.Context, n int) ([]fs.DirEntry, error) {
 	if p.dirEOF {
 		return nil, io.EOF
 	}
-	d, next, err := p.readDirAt(n, p.token, "", "")
+	d, next, err := p.readDirAtContext(ctx, n, p.token, "", "")
 	if err == io.EOF {
 		p.dirEOF = true
 		if len(d) > 0 || n < 0 {
@@ -191,6 +195,10 @@ type listResponse struct {
 }
 
 func (p *Prefix) list(n int, token, seek, prefix string) (*listResponse, error) {
+	return p.listContext(context.Background(), n, token, seek, prefix)
+}
+
+func (p *Prefix) listContext(ctx context.Context, n int, token, seek, prefix string) (*listResponse, error) {
 	if !ValidBucket(p.Bucket) {
 		return nil, badBucket(p.Bucket)
 	}
@@ -235,7 +243,7 @@ func (p *Prefix) list(n int, token, seek, prefix string) (*listResponse, error) 
 	}
 	sort.Strings(parts)
 	query := "?" + strings.Join(parts, "&")
-	req, err := http.NewRequestWithContext(context.TODO(), http.MethodGet, rawURI(p.Key, p.Bucket, query), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURI(p.Key, p.Bucket, query), nil)
 	if err != nil {
 		return nil, fmt.Errorf("creating http request: %w", err)
 	}
@@ -301,8 +309,12 @@ func ignoreKey(key string, dirOK bool) bool {
 // io.EOF. Note that this behavior differs from
 // fs.ReadDirFile.ReadDir.
 func (p *Prefix) readDirAt(n int, token, seek, pattern string) (d []fs.DirEntry, next string, err error) {
+	return p.readDirAtContext(context.Background(), n, token, seek, pattern)
+}
+
+func (p *Prefix) readDirAtContext(ctx context.Context, n int, token, seek, pattern string) (d []fs.DirEntry, next string, err error) {
 	prefix, _ := splitMeta(pattern)
-	ret, err := p.list(n, token, seek, prefix)
+	ret, err := p.listContext(ctx, n, token, seek, prefix)
 	if err != nil {
 		return nil, "", err
 	}

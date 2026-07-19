@@ -489,6 +489,40 @@ func TestBucket_WriteFrom(t *testing.T) {
 	assert.Equal(t, testData, content)
 }
 
+func TestBucketListContext(t *testing.T) {
+	mockServer := mock.New("test-bucket", "us-east-1")
+	defer mockServer.Close()
+	key := aws.DeriveKey("", "test", "test", "us-east-1", "s3")
+	key.BaseURI = mockServer.URL()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	var count int
+	for entry, err := range NewBucket(key, "test-bucket").List(ctx, ".") {
+		assert.Nil(t, entry)
+		assert.ErrorIs(t, err, context.Canceled)
+		count++
+	}
+	assert.Equal(t, 1, count)
+}
+
+func TestBucketListPagination(t *testing.T) {
+	mockServer := mock.New("test-bucket", "us-east-1")
+	defer mockServer.Close()
+	key := aws.DeriveKey("", "test", "test", "us-east-1", "s3")
+	key.BaseURI = mockServer.URL()
+	for i := range 1001 {
+		mockServer.PutObject(fmt.Sprintf("logs/%04d", i), nil)
+	}
+
+	var count int
+	for _, err := range NewBucket(key, "test-bucket").List(context.Background(), "logs") {
+		assert.NoError(t, err)
+		count++
+	}
+	assert.Equal(t, 1001, count)
+}
+
 func TestBucket_WriteFrom_ContextCancellation(t *testing.T) {
 	bucket := "test-bucket"
 	mockServer := mock.New(bucket, "us-east-1")
