@@ -140,16 +140,11 @@ func TestWebIdentityCreds(t *testing.T) {
 }
 
 func TestAmbientCreds(t *testing.T) {
-	os.Setenv("AWS_ACCESS_KEY_ID", "AKID")
-	defer os.Unsetenv("AWS_ACCESS_KEY_ID")
-	os.Setenv("AWS_SECRET_ACCESS_KEY", "SECRET")
-	defer os.Unsetenv("AWS_SECRET_ACCESS_KEY")
-	os.Setenv("AWS_REGION", "us-east-2")
-	defer os.Unsetenv("AWS_REGION")
-	os.Setenv("AWS_SESSION_TOKEN", "TOKEN")
-	defer os.Unsetenv("AWS_SESSION_TOKEN")
-	os.Setenv("HOME", t.TempDir())
-	defer os.Unsetenv("HOME")
+	t.Setenv("AWS_ACCESS_KEY_ID", "AKID")
+	t.Setenv("AWS_SECRET_ACCESS_KEY", "SECRET")
+	t.Setenv("AWS_REGION", "us-east-2")
+	t.Setenv("AWS_SESSION_TOKEN", "TOKEN")
+	t.Setenv("HOME", t.TempDir())
 
 	id, secret, region, token, err := AmbientCreds("")
 	assert.NoError(t, err)
@@ -163,7 +158,7 @@ func TestLoadCredentials(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "credentials")
 
-	assert.NoError(t, os.WriteFile(path, []byte("[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n"), 2644))
+	assert.NoError(t, os.WriteFile(path, []byte("[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n"), 0644))
 
 	id, secret, err := loadCredentials(path, "default")
 	assert.NoError(t, err)
@@ -177,7 +172,7 @@ func TestAmbientCreds_Local(t *testing.T) {
 	defer os.RemoveAll(filepath.Dir(path))
 
 	assert.NoError(t, os.MkdirAll(filepath.Dir(path), os.ModePerm))
-	assert.NoError(t, os.WriteFile(path, []byte("[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n"), 2644))
+	assert.NoError(t, os.WriteFile(path, []byte("[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n"), 0644))
 
 	// Verify that the credentials are loaded from the local file
 	id, secret, region, token, err := AmbientCreds("eu-central-1")

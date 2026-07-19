@@ -106,29 +106,7 @@ type tagpart struct {
 	size int64  `xml:"-"`
 }
 
-func (u *uploader) req(method, uri, query string) *http.Request {
-	obj := url.URL{
-		Scheme:   u.Scheme,
-		RawQuery: query,
-	}
-	if u.Key.BaseURI == "" {
-		obj.Path = "/" + uri                      // fully decoded path
-		obj.RawPath = "/" + almostPathEscape(uri) // escaped path
-		obj.Host = u.Bucket + "." + u.Host
-	} else {
-		obj.Path = "/" + u.Bucket + "/" + uri                      // fully decoded path
-		obj.RawPath = "/" + u.Bucket + "/" + almostPathEscape(uri) // escaped path
-		obj.Host = u.Host
-
-	}
-	return &http.Request{
-		Method: method,
-		URL:    &obj,
-		Header: make(http.Header),
-	}
-}
-
-func (u *uploader) reqWithContext(ctx context.Context, method, uri, query string) *http.Request {
+func (u *uploader) req(ctx context.Context, method, uri, query string) *http.Request {
 	obj := url.URL{
 		Scheme:   u.Scheme,
 		RawQuery: query,
@@ -150,7 +128,7 @@ func (u *uploader) reqWithContext(ctx context.Context, method, uri, query string
 // Start begins a multipart upload.
 // Start must be called exactly once,
 // before any calls to WritePart are made.
-func (u *uploader) Start() error {
+func (u *uploader) Start(ctx context.Context) error {
 	if u.started {
 		panic("multiple calls to uploader.Start()")
 	}
@@ -168,7 +146,7 @@ func (u *uploader) Start() error {
 	if u.Bucket == "" || u.Object == "" {
 		return fmt.Errorf("s3.Uploader.Bucket and s3.Uploader.Object must be present")
 	}
-	req := u.req("POST", u.Object, "uploads=")
+	req := u.req(ctx, "POST", u.Object, "uploads=")
 	if u.ContentType != "" {
 		req.Header.Set("Content-Type", u.ContentType)
 	}
@@ -270,7 +248,7 @@ func (u *uploader) Upload(num int64, contents []byte) error {
 }
 
 func (u *uploader) upload(ctx context.Context, num int64, contents []byte) error {
-	req := u.reqWithContext(ctx, "PUT", u.Object, fmt.Sprintf("partNumber=%d&uploadId=%s", num, u.id))
+	req := u.req(ctx, "PUT", u.Object, fmt.Sprintf("partNumber=%d&uploadId=%s", num, u.id))
 	u.Key.SignV4(req, contents)
 	res, err := flakyDo(u.Client, req)
 	if err != nil {
@@ -320,7 +298,7 @@ func (u *uploader) uploadWithContext(ctx context.Context, num int64, contents []
 // performed asynchronously. Callers must call Close and
 // check its return value in order to correctly handle
 // errors from CopyFrom.
-func (u *uploader) CopyFrom(num int64, source *Reader, start int64, end int64) error {
+func (u *uploader) CopyFrom(ctx context.Context, num int64, source *Reader, start int64, end int64) error {
 	if !u.started {
 		panic("s3.uploader.CopyFrom before Start()")
 	}
@@ -348,7 +326,7 @@ func (u *uploader) CopyFrom(num int64, source *Reader, start int64, end int64) e
 	u.lock.Unlock()
 
 	u.bg.Add(1)
-	go u.copy(num, source, start, end)
+	go u.copy(ctx, num, source, start, end)
 	return nil
 }
 
@@ -360,9 +338,9 @@ func (u *uploader) noteErr(err error) {
 	}
 }
 
-func (u *uploader) copy(num int64, source *Reader, start int64, end int64) {
+func (u *uploader) copy(ctx context.Context, num int64, source *Reader, start int64, end int64) {
 	defer u.bg.Done()
-	req := u.req("PUT", u.Object, fmt.Sprintf("partNumber=%d&uploadId=%s", num, u.id))
+	req := u.req(ctx, "PUT", u.Object, fmt.Sprintf("partNumber=%d&uploadId=%s", num, u.id))
 	req.Header.Add("x-amz-copy-source", fmt.Sprintf("/%s/%s", source.Bucket, source.Path))
 	req.Header.Add("x-amz-copy-source-if-match", source.ETag)
 	size := source.Size
@@ -443,7 +421,7 @@ func (u *uploader) Size() int64 {
 //
 // Close will panic if Start has never been called
 // or if Close has already been called and returned successfully.
-func (u *uploader) Close(final []byte) error {
+func (u *uploader) Close(ctx context.Context, final []byte) error {
 	if !u.started {
 		panic("s3.uploader.Close before Start()")
 	}
@@ -455,7 +433,7 @@ func (u *uploader) Close(final []byte) error {
 		// maxpart is updated in calls to CopyFrom and Upload,
 		// and we've specified that it is not safe for the caller
 		// to let those race with Close
-		err := u.upload(context.Background(), u.maxpart+1, final)
+		err := u.upload(ctx, u.maxpart+1, final)
 		if err != nil {
 			return err
 		}
@@ -472,7 +450,7 @@ func (u *uploader) Close(final []byte) error {
 		return u.parts[i].Num < u.parts[j].Num
 	})
 
-	req := u.req("POST", u.Object, fmt.Sprintf("uploadId=%s", u.id))
+	req := u.req(ctx, "POST", u.Object, fmt.Sprintf("uploadId=%s", u.id))
 	req.Header.Set("Content-Type", "application/xml")
 	buf, err := xml.Marshal(&struct {
 		XMLName xml.Name  `xml:"CompleteMultipartUpload"`
@@ -566,12 +544,12 @@ func (u *uploader) idealParallel(parts int64) int {
 // and returns without an error, then the state of
 // the Uploader is reset so that Start may be called
 // again to re-try the upload.
-func (u *uploader) Abort() error {
+func (u *uploader) Abort(ctx context.Context) error {
 	if !u.started || u.finished {
 		return nil
 	}
 	u.bg.Wait()
-	req := u.req("DELETE", u.Object, fmt.Sprintf("uploadId=%s", u.id))
+	req := u.req(ctx, "DELETE", u.Object, fmt.Sprintf("uploadId=%s", u.id))
 	u.Key.SignV4(req, nil)
 
 	res, err := u.Client.Do(req)
@@ -607,7 +585,7 @@ func (u *uploader) UploadFrom(ctx context.Context, r io.ReaderAt, size int64) er
 	offset := int64(0)
 	parallel := u.idealParallel(nonfinal)
 
-	g, ctx := errgroup.WithContext(ctx)
+	g, uploadCtx := errgroup.WithContext(ctx)
 	g.SetLimit(parallel)
 
 	for i := 0; i < parallel; i++ {
@@ -621,8 +599,8 @@ func (u *uploader) UploadFrom(ctx context.Context, r io.ReaderAt, size int64) er
 
 				// Check if context was cancelled
 				select {
-				case <-ctx.Done():
-					return ctx.Err()
+				case <-uploadCtx.Done():
+					return uploadCtx.Err()
 				default:
 				}
 
@@ -635,7 +613,7 @@ func (u *uploader) UploadFrom(ctx context.Context, r io.ReaderAt, size int64) er
 					}
 					return err
 				}
-				err = u.uploadWithContext(ctx, part, buf)
+				err = u.uploadWithContext(uploadCtx, part, buf)
 				if err != nil {
 					return fmt.Errorf("s3.UploadReaderAt part %d: %w", part, err)
 				}
@@ -660,5 +638,5 @@ func (u *uploader) UploadFrom(ctx context.Context, r io.ReaderAt, size int64) er
 			return err
 		}
 	}
-	return u.Close(tail)
+	return u.Close(ctx, tail)
 }

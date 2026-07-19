@@ -175,7 +175,7 @@ func TestUploader_StartValidation(t *testing.T) {
 		Key:    key,
 		Object: "test-object",
 	}
-	err := u1.Start()
+	err := u1.Start(context.Background())
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "Bucket and s3.Uploader.Object must be present")
 
@@ -184,7 +184,7 @@ func TestUploader_StartValidation(t *testing.T) {
 		Key:    key,
 		Bucket: bucket,
 	}
-	err = u2.Start()
+	err = u2.Start(context.Background())
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "Bucket and s3.Uploader.Object must be present")
 
@@ -194,10 +194,10 @@ func TestUploader_StartValidation(t *testing.T) {
 		Bucket: bucket,
 		Object: "test-object",
 	}
-	assert.NoError(t, u3.Start())
+	assert.NoError(t, u3.Start(context.Background()))
 
 	assert.Panics(t, func() {
-		u3.Start()
+		u3.Start(context.Background())
 	})
 }
 
@@ -222,7 +222,7 @@ func TestUploader_UploadValidation(t *testing.T) {
 	})
 
 	// Start uploader
-	assert.NoError(t, u.Start())
+	assert.NoError(t, u.Start(context.Background()))
 
 	// Test Upload with data too small
 	smallData := make([]byte, MinPartSize-1)
@@ -250,21 +250,21 @@ func TestUploader_CloseValidation(t *testing.T) {
 
 	// Test Close before Start
 	assert.Panics(t, func() {
-		uploader.Close(nil)
+		uploader.Close(context.Background(), nil)
 	})
 
 	// Start uploader and upload a part
-	assert.NoError(t, uploader.Start())
+	assert.NoError(t, uploader.Start(context.Background()))
 
 	data := make([]byte, MinPartSize)
 	assert.NoError(t, uploader.Upload(1, data))
 
 	// Test valid Close
-	assert.NoError(t, uploader.Close([]byte("final data")))
+	assert.NoError(t, uploader.Close(context.Background(), []byte("final data")))
 
 	// Test double Close
 	assert.Panics(t, func() {
-		uploader.Close(nil)
+		uploader.Close(context.Background(), nil)
 	})
 }
 
@@ -283,10 +283,10 @@ func TestUploader_Abort(t *testing.T) {
 	}
 
 	// Test Abort before Start (should do nothing)
-	assert.NoError(t, u.Abort())
+	assert.NoError(t, u.Abort(context.Background()))
 
 	// Start uploader
-	assert.NoError(t, u.Start())
+	assert.NoError(t, u.Start(context.Background()))
 	uploadID := u.ID()
 
 	// Verify upload exists
@@ -298,7 +298,7 @@ func TestUploader_Abort(t *testing.T) {
 	assert.NoError(t, u.Upload(1, data))
 
 	// Test Abort
-	assert.NoError(t, u.Abort())
+	assert.NoError(t, u.Abort(context.Background()))
 
 	// Verify upload was cleaned up
 	_, exists = mockServer.GetMultipartUpload(uploadID)
@@ -310,12 +310,12 @@ func TestUploader_Abort(t *testing.T) {
 		Bucket: bucket,
 		Object: "test/abort-test2.bin",
 	}
-	assert.NoError(t, u2.Start())
+	assert.NoError(t, u2.Start(context.Background()))
 	assert.NoError(t, u2.Upload(1, data))
-	assert.NoError(t, u2.Close(nil))
+	assert.NoError(t, u2.Close(context.Background(), nil))
 
 	// Abort should do nothing after successful close
-	assert.NoError(t, u2.Abort())
+	assert.NoError(t, u2.Abort(context.Background()))
 }
 
 func TestUploader_CopyFrom(t *testing.T) {
@@ -351,34 +351,34 @@ func TestUploader_CopyFrom(t *testing.T) {
 
 	// Test CopyFrom before Start
 	assert.Panics(t, func() {
-		uploader.CopyFrom(1, sourceReader, 0, 0)
+		uploader.CopyFrom(context.Background(), 1, sourceReader, 0, 0)
 	})
 
 	// Start uploader
-	assert.NoError(t, uploader.Start())
+	assert.NoError(t, uploader.Start(context.Background()))
 
 	// Test CopyFrom with invalid range
-	err := uploader.CopyFrom(1, sourceReader, -1, 0)
+	err := uploader.CopyFrom(context.Background(), 1, sourceReader, -1, 0)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "start and end values must be positive")
 
-	err = uploader.CopyFrom(1, sourceReader, 0, int64(len(sourceData)+1000))
+	err = uploader.CopyFrom(context.Background(), 1, sourceReader, 0, int64(len(sourceData)+1000))
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "end value")
 
 	// Test CopyFrom with size too small
-	err = uploader.CopyFrom(1, sourceReader, 0, MinPartSize-1)
+	err = uploader.CopyFrom(context.Background(), 1, sourceReader, 0, MinPartSize-1)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "below min part size")
 
 	// Test valid CopyFrom (copy entire source)
-	assert.NoError(t, uploader.CopyFrom(1, sourceReader, 0, 0))
+	assert.NoError(t, uploader.CopyFrom(context.Background(), 1, sourceReader, 0, 0))
 
 	// Test CopyFrom with range
-	assert.NoError(t, uploader.CopyFrom(2, sourceReader, 0, MinPartSize))
+	assert.NoError(t, uploader.CopyFrom(context.Background(), 2, sourceReader, 0, MinPartSize))
 
 	// Close uploader
-	assert.NoError(t, uploader.Close(nil))
+	assert.NoError(t, uploader.Close(context.Background(), nil))
 
 	// Verify object was created
 	assert.True(t, mockServer.ObjectExists("dest/copied-file.bin"))
@@ -399,7 +399,7 @@ func TestUploader_UploadFrom(t *testing.T) {
 	}
 
 	// Start uploader
-	assert.NoError(t, uploader.Start())
+	assert.NoError(t, uploader.Start(context.Background()))
 
 	// Create test data larger than MinPartSize to trigger multipart
 	testData := make([]byte, MinPartSize*2+1000)
@@ -436,7 +436,7 @@ func TestUploader_UploadFromContextCancellation(t *testing.T) {
 	}
 
 	// Start uploader
-	assert.NoError(t, uploader.Start())
+	assert.NoError(t, uploader.Start(context.Background()))
 
 	// Create test data
 	testData := make([]byte, MinPartSize*3)
@@ -470,14 +470,14 @@ func TestUploader_ContentType(t *testing.T) {
 	}
 
 	// Start uploader
-	assert.NoError(t, uploader.Start())
+	assert.NoError(t, uploader.Start(context.Background()))
 
 	// Upload a part
 	data := make([]byte, MinPartSize)
 	assert.NoError(t, uploader.Upload(1, data))
 
 	// Close uploader
-	assert.NoError(t, uploader.Close(nil))
+	assert.NoError(t, uploader.Close(context.Background(), nil))
 
 	// Verify object was created
 	assert.True(t, mockServer.ObjectExists("test/content-type.bin"))
@@ -503,7 +503,7 @@ func TestUploader_PartOrdering(t *testing.T) {
 	}
 
 	// Start uploader
-	assert.NoError(t, uploader.Start())
+	assert.NoError(t, uploader.Start(context.Background()))
 
 	// Upload parts out of order
 	data1 := make([]byte, MinPartSize)
@@ -525,7 +525,7 @@ func TestUploader_PartOrdering(t *testing.T) {
 	assert.NoError(t, uploader.Upload(2, data2))
 
 	// Close uploader
-	assert.NoError(t, uploader.Close(nil))
+	assert.NoError(t, uploader.Close(context.Background(), nil))
 
 	// Verify object was created
 	assert.True(t, mockServer.ObjectExists("test/part-ordering.bin"))
@@ -559,13 +559,13 @@ func TestUploader_EdgeCases(t *testing.T) {
 		Object: "test/empty-final.bin",
 	}
 
-	assert.NoError(t, u.Start())
+	assert.NoError(t, u.Start(context.Background()))
 
 	data := make([]byte, MinPartSize)
 	assert.NoError(t, u.Upload(1, data))
 
 	// Close with empty final part
-	assert.NoError(t, u.Close(nil))
+	assert.NoError(t, u.Close(context.Background(), nil))
 	assert.True(t, mockServer.ObjectExists("test/empty-final.bin"))
 
 	// Test Size() before Close
@@ -575,7 +575,7 @@ func TestUploader_EdgeCases(t *testing.T) {
 		Object: "test/size-before-close.bin",
 	}
 
-	assert.NoError(t, u2.Start())
+	assert.NoError(t, u2.Start(context.Background()))
 
 	// Size should be 0 before Close
 	assert.Equal(t, int64(0), u2.Size())
@@ -584,6 +584,6 @@ func TestUploader_EdgeCases(t *testing.T) {
 
 	// Size should still be 0 before Close
 	assert.Equal(t, int64(0), u2.Size())
-	assert.NoError(t, u2.Close(nil))
+	assert.NoError(t, u2.Close(context.Background(), nil))
 	assert.Equal(t, int64(len(data)), u2.Size())
 }

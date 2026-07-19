@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"iter"
 	"net/http"
 	"path"
 	"strings"
@@ -177,27 +178,61 @@ func (b *Bucket) VisitDir(name, seek, pattern string, walk fsutil.VisitDirFn) er
 
 // ReadDir implements fs.ReadDirFS
 func (b *Bucket) ReadDir(name string) ([]fs.DirEntry, error) {
+	var entries []fs.DirEntry
+	for entry, err := range b.List(context.Background(), name) {
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, entry)
+	}
+
 	name = path.Clean(name)
-	if !fs.ValidPath(name) {
-		return nil, badpath("readdir", name)
-	}
-	if name == "." {
-		return b.sub(".").ReadDir(-1)
-	}
-	ret, err := b.sub(name + "/").ReadDir(-1)
-	if err != nil {
-		return ret, err
-	}
-	if len(ret) == 0 {
-		// *almost always* because name doesn't actually exist;
-		// we should double-check
+	if len(entries) == 0 && name != "." {
+		// An empty listing usually means the directory does not exist.
 		f, err := b.sub(name + "/").openDir()
 		if err != nil {
 			return nil, err
 		}
 		f.Close()
 	}
-	return ret, nil
+	return entries, nil
+}
+
+// List lazily lists a prefix. It yields the first error and stops.
+func (b *Bucket) List(ctx context.Context, name string) iter.Seq2[fs.DirEntry, error] {
+	return func(yield func(fs.DirEntry, error) bool) {
+		name = path.Clean(name)
+		if !fs.ValidPath(name) {
+			yield(nil, badpath("readdir", name))
+			return
+		}
+
+		prefix := b.sub(".")
+		if name != "." {
+			prefix = b.sub(name + "/")
+		}
+
+		var token string
+		for {
+			entries, next, err := prefix.readDirAtContext(ctx, -1, token, "", "")
+			for _, entry := range entries {
+				if !yield(entry, nil) {
+					return
+				}
+			}
+			if errors.Is(err, io.EOF) {
+				return
+			}
+			if err != nil {
+				yield(nil, &fs.PathError{Op: "readdir", Path: prefix.Path, Err: err})
+				return
+			}
+			if next == "" {
+				return
+			}
+			token = next
+		}
+	}
 }
 
 // Delete removes the object at fullpath.
@@ -244,7 +279,7 @@ func (b *Bucket) WriteFrom(ctx context.Context, key string, r io.ReaderAt, size 
 	}
 
 	// Start multipart upload
-	if err := uploader.Start(); err != nil {
+	if err := uploader.Start(ctx); err != nil {
 		return fmt.Errorf("starting multipart upload: %w", err)
 	}
 
