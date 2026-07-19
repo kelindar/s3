@@ -443,13 +443,14 @@ func patherr(op, name string, err error) *fs.PathError {
 // that sorts before '/'.
 func pathcmp(a, b string) int {
 	// handle "" and "." first
-	if a == "" || a == "." {
-		if b == "" || b == "." {
-			return 0
-		}
+	aDot := a == "" || a == "."
+	bDot := b == "" || b == "."
+	switch {
+	case aDot && bDot:
+		return 0
+	case aDot:
 		return -1
-	}
-	if b == "" || b == "." {
+	case bDot:
 		return 1
 	}
 	for {
@@ -491,10 +492,10 @@ func pathcmp(a, b string) int {
 // valid paths. In particular, neither root nor
 // p may be "".
 func treecmp(root, p string) int {
-	if root == "." {
+	switch {
+	case root == ".":
 		return 0 // everything is in "."
-	}
-	if p == "." {
+	case p == ".":
 		return -1 // "." comes before any path
 	}
 	for {
@@ -529,10 +530,10 @@ func treecmp(root, p string) int {
 // NOTE: "." is considered to have no segments
 // so it is treated the same as ""
 func segments(name string) (int, bool) {
-	if name == "" || name == "." {
+	switch {
+	case name == "" || name == ".":
 		return 0, true
-	}
-	if !utf8.ValidString(name) {
+	case !utf8.ValidString(name):
 		return 0, false
 	}
 	n := 1

@@ -30,43 +30,6 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-func TestScan(t *testing.T) {
-	var foo, bar, baz, quux string
-	basespec := []scanspec{
-		{prefix: "foo", dst: &foo},
-		{prefix: "bar", dst: &bar},
-		{prefix: "baz", dst: &baz},
-		{prefix: "quux", dst: &quux},
-	}
-	text := strings.Join([]string{
-		"[default]",
-		"foo=foo_result",
-		"ignore this line",
-		"bar = bar_result",
-		"baz= baz_result",
-		"quux  =quux_result",
-		"ignoreme=",
-		"=invalid line",
-		"x=y=z",
-		"[section2]",
-		"foo=section2_result",
-		"bar=section2_bar_result",
-	}, "\n")
-	spec := make([]scanspec, len(basespec))
-	copy(spec, basespec)
-	err := scan(strings.NewReader(text), "default", spec)
-	assert.NoError(t, err)
-	assert.Equal(t, "foo_result", foo)
-	assert.Equal(t, "bar_result", bar)
-	assert.Equal(t, "baz_result", baz)
-	assert.Equal(t, "quux_result", quux)
-	copy(spec, basespec)
-	err = scan(strings.NewReader(text), "section2", spec)
-	assert.NoError(t, err)
-	assert.Equal(t, "section2_result", foo)
-	assert.Equal(t, "section2_bar_result", bar)
-}
-
 // helper to run STS-based tests with a mocked STS service
 func withSTSServer(t *testing.T, handler http.HandlerFunc, fn func(client *http.Client)) {
 	srv := httptest.NewTLSServer(handler)
@@ -89,32 +52,70 @@ func withSTSServer(t *testing.T, handler http.HandlerFunc, fn func(client *http.
 	fn(client)
 }
 
-func TestWebIdentityCreds(t *testing.T) {
-	dir := t.TempDir()
-	tokenFile := filepath.Join(dir, "token")
-	err := os.WriteFile(tokenFile, []byte("tok"), 0600)
-	assert.NoError(t, err)
+func TestCreds(t *testing.T) {
+	t.Run("scan", func(t *testing.T) {
+		var foo, bar, baz, quux string
+		basespec := []scanspec{
+			{prefix: "foo", dst: &foo},
+			{prefix: "bar", dst: &bar},
+			{prefix: "baz", dst: &baz},
+			{prefix: "quux", dst: &quux},
+		}
+		text := strings.Join([]string{
+			"[default]",
+			"foo=foo_result",
+			"ignore this line",
+			"bar = bar_result",
+			"baz= baz_result",
+			"quux  =quux_result",
+			"ignoreme=",
+			"=invalid line",
+			"x=y=z",
+			"[section2]",
+			"foo=section2_result",
+			"bar=section2_bar_result",
+		}, "\n")
+		spec := make([]scanspec, len(basespec))
+		copy(spec, basespec)
+		err := scan(strings.NewReader(text), "default", spec)
+		assert.NoError(t, err)
+		assert.Equal(t, "foo_result", foo)
+		assert.Equal(t, "bar_result", bar)
+		assert.Equal(t, "baz_result", baz)
+		assert.Equal(t, "quux_result", quux)
+		copy(spec, basespec)
+		err = scan(strings.NewReader(text), "section2", spec)
+		assert.NoError(t, err)
+		assert.Equal(t, "section2_result", foo)
+		assert.Equal(t, "section2_bar_result", bar)
+	})
 
-	os.Setenv("AWS_REGION", "us-west-1")
-	defer os.Unsetenv("AWS_REGION")
-	os.Setenv("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/test")
-	defer os.Unsetenv("AWS_ROLE_ARN")
-	os.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", tokenFile)
-	defer os.Unsetenv("AWS_WEB_IDENTITY_TOKEN_FILE")
-	os.Setenv("AWS_ROLE_SESSION_NAME", "mysession")
-	defer os.Unsetenv("AWS_ROLE_SESSION_NAME")
+	t.Run("web identity", func(t *testing.T) {
+		dir := t.TempDir()
+		tokenFile := filepath.Join(dir, "token")
+		err := os.WriteFile(tokenFile, []byte("tok"), 0600)
+		assert.NoError(t, err)
 
-	handler := func(w http.ResponseWriter, r *http.Request) {
-		assert.Equal(t, "application/xml", r.Header.Get("Accept"))
-		q := r.URL.Query()
-		assert.Equal(t, "AssumeRoleWithWebIdentity", q.Get("Action"))
-		assert.Equal(t, "2011-06-15", q.Get("Version"))
-		assert.Equal(t, "arn:aws:iam::123456789012:role/test", q.Get("RoleArn"))
-		assert.Equal(t, "mysession", q.Get("RoleSessionName"))
-		assert.Equal(t, "tok", q.Get("WebIdentityToken"))
+		os.Setenv("AWS_REGION", "us-west-1")
+		defer os.Unsetenv("AWS_REGION")
+		os.Setenv("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/test")
+		defer os.Unsetenv("AWS_ROLE_ARN")
+		os.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", tokenFile)
+		defer os.Unsetenv("AWS_WEB_IDENTITY_TOKEN_FILE")
+		os.Setenv("AWS_ROLE_SESSION_NAME", "mysession")
+		defer os.Unsetenv("AWS_ROLE_SESSION_NAME")
 
-		w.Header().Set("Content-Type", "application/xml")
-		w.Write([]byte(`
+		handler := func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "application/xml", r.Header.Get("Accept"))
+			q := r.URL.Query()
+			assert.Equal(t, "AssumeRoleWithWebIdentity", q.Get("Action"))
+			assert.Equal(t, "2011-06-15", q.Get("Version"))
+			assert.Equal(t, "arn:aws:iam::123456789012:role/test", q.Get("RoleArn"))
+			assert.Equal(t, "mysession", q.Get("RoleSessionName"))
+			assert.Equal(t, "tok", q.Get("WebIdentityToken"))
+
+			w.Header().Set("Content-Type", "application/xml")
+			w.Write([]byte(`
 <AssumeRoleWithWebIdentityResponse>
   <AssumeRoleWithWebIdentityResult>
     <Credentials>
@@ -125,69 +126,70 @@ func TestWebIdentityCreds(t *testing.T) {
     </Credentials>
   </AssumeRoleWithWebIdentityResult>
 </AssumeRoleWithWebIdentityResponse>`))
-	}
+		}
 
-	withSTSServer(t, handler, func(client *http.Client) {
-		id, secret, region, token, expiration, err := WebIdentityCreds(client)
+		withSTSServer(t, handler, func(client *http.Client) {
+			id, secret, region, token, expiration, err := WebIdentityCreds(client)
+			assert.NoError(t, err)
+			assert.Equal(t, "AKID", id)
+			assert.Equal(t, "SECRET", secret)
+			assert.Equal(t, "us-west-1", region)
+			assert.Equal(t, "SESSION", token)
+			wantTime, _ := time.Parse(time.RFC3339, "2025-01-02T03:04:05Z")
+			assert.True(t, expiration.Equal(wantTime))
+		})
+	})
+
+	t.Run("ambient", func(t *testing.T) {
+		t.Setenv("AWS_ACCESS_KEY_ID", "AKID")
+		t.Setenv("AWS_SECRET_ACCESS_KEY", "SECRET")
+		t.Setenv("AWS_REGION", "us-east-2")
+		t.Setenv("AWS_SESSION_TOKEN", "TOKEN")
+		t.Setenv("HOME", t.TempDir())
+
+		id, secret, region, token, err := AmbientCreds("")
 		assert.NoError(t, err)
 		assert.Equal(t, "AKID", id)
 		assert.Equal(t, "SECRET", secret)
-		assert.Equal(t, "us-west-1", region)
-		assert.Equal(t, "SESSION", token)
-		wantTime, _ := time.Parse(time.RFC3339, "2025-01-02T03:04:05Z")
-		assert.True(t, expiration.Equal(wantTime))
+		assert.Equal(t, "us-east-2", region)
+		assert.Equal(t, "TOKEN", token)
 	})
-}
 
-func TestAmbientCreds(t *testing.T) {
-	t.Setenv("AWS_ACCESS_KEY_ID", "AKID")
-	t.Setenv("AWS_SECRET_ACCESS_KEY", "SECRET")
-	t.Setenv("AWS_REGION", "us-east-2")
-	t.Setenv("AWS_SESSION_TOKEN", "TOKEN")
-	t.Setenv("HOME", t.TempDir())
+	t.Run("load credentials", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "credentials")
 
-	id, secret, region, token, err := AmbientCreds("")
-	assert.NoError(t, err)
-	assert.Equal(t, "AKID", id)
-	assert.Equal(t, "SECRET", secret)
-	assert.Equal(t, "us-east-2", region)
-	assert.Equal(t, "TOKEN", token)
-}
+		assert.NoError(t, os.WriteFile(path, []byte("[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n"), 0644))
 
-func TestLoadCredentials(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "credentials")
+		id, secret, err := loadCredentials(path, "default")
+		assert.NoError(t, err)
+		assert.Equal(t, "AKID", id)
+		assert.Equal(t, "SECRET", secret)
+	})
 
-	assert.NoError(t, os.WriteFile(path, []byte("[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n"), 0644))
+	t.Run("ambient local", func(t *testing.T) {
+		wd, _ := os.Getwd()
+		path := filepath.Join(wd, ".aws", "credentials")
+		defer os.RemoveAll(filepath.Dir(path))
 
-	id, secret, err := loadCredentials(path, "default")
-	assert.NoError(t, err)
-	assert.Equal(t, "AKID", id)
-	assert.Equal(t, "SECRET", secret)
-}
+		assert.NoError(t, os.MkdirAll(filepath.Dir(path), os.ModePerm))
+		assert.NoError(t, os.WriteFile(path, []byte("[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n"), 0644))
 
-func TestAmbientCreds_Local(t *testing.T) {
-	wd, _ := os.Getwd()
-	path := filepath.Join(wd, ".aws", "credentials")
-	defer os.RemoveAll(filepath.Dir(path))
+		// Verify that the credentials are loaded from the local file
+		id, secret, region, token, err := AmbientCreds("eu-central-1")
+		assert.NoError(t, err)
+		assert.Equal(t, "AKID", id)
+		assert.Equal(t, "SECRET", secret)
+		assert.Equal(t, "eu-central-1", region)
+		assert.Equal(t, "", token)
 
-	assert.NoError(t, os.MkdirAll(filepath.Dir(path), os.ModePerm))
-	assert.NoError(t, os.WriteFile(path, []byte("[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n"), 0644))
-
-	// Verify that the credentials are loaded from the local file
-	id, secret, region, token, err := AmbientCreds("eu-central-1")
-	assert.NoError(t, err)
-	assert.Equal(t, "AKID", id)
-	assert.Equal(t, "SECRET", secret)
-	assert.Equal(t, "eu-central-1", region)
-	assert.Equal(t, "", token)
-
-	// Verify that the credentials are loaded from the local file
-	key, err := AmbientKey("s3", "eu-central-1", DefaultDerive)
-	assert.NoError(t, err)
-	assert.NotNil(t, key)
-	assert.Equal(t, "AKID", key.AccessKey)
-	assert.Equal(t, "SECRET", key.Secret)
-	assert.Equal(t, "eu-central-1", key.Region)
-	assert.Equal(t, "", key.Token)
+		// Verify that the credentials are loaded from the local file
+		key, err := AmbientKey("s3", "eu-central-1", DefaultDerive)
+		assert.NoError(t, err)
+		assert.NotNil(t, key)
+		assert.Equal(t, "AKID", key.AccessKey)
+		assert.Equal(t, "SECRET", key.Secret)
+		assert.Equal(t, "eu-central-1", key.Region)
+		assert.Equal(t, "", key.Token)
+	})
 }

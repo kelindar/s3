@@ -253,16 +253,17 @@ func (p *Prefix) listContext(ctx context.Context, n int, token, seek, prefix str
 		return nil, fmt.Errorf("executing request: %w", err)
 	}
 	defer res.Body.Close()
-	if res.StatusCode != 200 {
-		if res.StatusCode == 403 {
-			return nil, fs.ErrPermission
-		}
-		if res.StatusCode == 404 {
-			// this can actually mean the bucket doesn't exist,
-			// but for practical purposes we can treat it
-			// as an empty filesystem
-			return nil, fs.ErrNotExist
-		}
+	switch res.StatusCode {
+	case 200:
+		// ok
+	case 403:
+		return nil, fs.ErrPermission
+	case 404:
+		// this can actually mean the bucket doesn't exist,
+		// but for practical purposes we can treat it
+		// as an empty filesystem
+		return nil, fs.ErrNotExist
+	default:
 		return nil, fmt.Errorf("s3 list objects s3://%s/%s: %s", p.Bucket, p.Path, res.Status)
 	}
 

@@ -1,3 +1,4 @@
 .aws
+.cursor
 coverage.out
 coverage.html
