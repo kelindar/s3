@@ -21,12 +21,34 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/kelindar/s3"
 	"github.com/kelindar/s3/aws"
 	"github.com/stretchr/testify/assert"
 )
+
+func TestUploadIDConcurrent(t *testing.T) {
+	const count = 100
+	ids := make(chan string, count)
+	var group sync.WaitGroup
+	for range count {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			ids <- generateUploadID()
+		}()
+	}
+	group.Wait()
+	close(ids)
+
+	seen := make(map[string]struct{}, count)
+	for id := range ids {
+		assert.NotContains(t, seen, id)
+		seen[id] = struct{}{}
+	}
+}
 
 func TestServer(t *testing.T) {
 	t.Run("basic operations", func(t *testing.T) {

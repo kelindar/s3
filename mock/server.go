@@ -31,11 +31,15 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-// Use a separate random source to avoid affecting global rand state
-var mockRand = rand.New(rand.NewSource(time.Now().UnixNano()))
+var (
+	mockRand       = rand.New(rand.NewSource(time.Now().UnixNano()))
+	mockRandMu     sync.Mutex
+	uploadSequence atomic.Uint64
+)
 
 // Server provides a comprehensive mock implementation of the AWS S3 API
 // for testing purposes. It implements all S3 operations used by the client library
@@ -338,8 +342,13 @@ func (m *Server) shouldSimulateError() bool {
 	m.mutex.RLock()
 	defer m.mutex.RUnlock()
 
-	if m.errors.ErrorRate > 0 && mockRand.Float64() < m.errors.ErrorRate {
-		return true
+	if m.errors.ErrorRate > 0 {
+		mockRandMu.Lock()
+		simulate := mockRand.Float64() < m.errors.ErrorRate
+		mockRandMu.Unlock()
+		if simulate {
+			return true
+		}
 	}
 
 	return m.errors.NetworkErrors || m.errors.InternalErrors
@@ -449,7 +458,7 @@ func parseRange(rangeHeader string, contentLength int64) (start, end int64, err 
 
 // generateUploadID generates a unique upload ID for multipart uploads
 func generateUploadID() string {
-	return fmt.Sprintf("upload-%d-%d", time.Now().UnixNano(), mockRand.Int63())
+	return fmt.Sprintf("upload-%d-%d", time.Now().UnixNano(), uploadSequence.Add(1))
 }
 
 // handleGetObject handles GET requests for objects
