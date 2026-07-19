@@ -72,12 +72,13 @@ func badpath(op, name string) error {
 
 // Write performs a PutObject operation at the object key 'key' and returns the ETag of the newly-created object.
 func (b *Bucket) Write(ctx context.Context, key string, contents []byte) (string, error) {
-	if key = path.Clean(key); !fs.ValidPath(key) {
+	key = path.Clean(key)
+	_, base := path.Split(key)
+	switch {
+	case !fs.ValidPath(key):
 		return "", badpath("s3 PUT", key)
-	}
-
-	// Don't allow a path that is nominally a directory
-	if _, base := path.Split(key); base == "." {
+	case base == ".":
+		// Don't allow a path that is nominally a directory
 		return "", badpath("s3 PUT", key)
 	}
 
@@ -259,15 +260,14 @@ func (b *Bucket) Delete(ctx context.Context, fullpath string) error {
 
 // WriteFrom performs a multipart upload of data from an io.ReaderAt to the specified key.
 func (b *Bucket) WriteFrom(ctx context.Context, key string, r io.ReaderAt, size int64) error {
-	if key = path.Clean(key); !fs.ValidPath(key) {
+	key = path.Clean(key)
+	_, base := path.Split(key)
+	switch {
+	case !fs.ValidPath(key):
 		return badpath("s3 Upload", key)
-	}
-
-	if _, base := path.Split(key); base == "." {
+	case base == ".":
 		return badpath("s3 Upload", key)
-	}
-
-	if size < 0 {
+	case size < 0:
 		return fmt.Errorf("size must be non-negative, got %d", size)
 	}
 

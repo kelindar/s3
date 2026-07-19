@@ -25,93 +25,95 @@ import (
 )
 
 // Test the public API through Bucket.WriteFrom
-func TestBucket_WriteFromLarge(t *testing.T) {
-	bucket := "test-bucket"
-	mockServer := mock.New(bucket, "us-east-1")
-	defer mockServer.Close()
+func TestWriteFrom(t *testing.T) {
+	t.Run("large", func(t *testing.T) {
+		bucket := "test-bucket"
+		mockServer := mock.New(bucket, "us-east-1")
+		defer mockServer.Close()
 
-	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
-	key.BaseURI = mockServer.URL()
+		key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
+		key.BaseURI = mockServer.URL()
 
-	b := NewBucket(key, bucket)
+		b := NewBucket(key, bucket)
 
-	// Create test data larger than MinPartSize to trigger multipart upload
-	testData := make([]byte, MinPartSize*3+1000) // ~15MB + 1000 bytes
-	for i := range testData {
-		testData[i] = byte(i % 256)
-	}
+		// Create test data larger than MinPartSize to trigger multipart upload
+		testData := make([]byte, MinPartSize*3+1000) // ~15MB + 1000 bytes
+		for i := range testData {
+			testData[i] = byte(i % 256)
+		}
 
-	// Test WriteFrom with context
-	ctx := context.Background()
-	objectKey := "test/large-multipart-file.bin"
+		// Test WriteFrom with context
+		ctx := context.Background()
+		objectKey := "test/large-multipart-file.bin"
 
-	assert.NoError(t, b.WriteFrom(ctx, objectKey, bytes.NewReader(testData), int64(len(testData))))
+		assert.NoError(t, b.WriteFrom(ctx, objectKey, bytes.NewReader(testData), int64(len(testData))))
 
-	// Verify the object was created
-	assert.True(t, mockServer.ObjectExists(objectKey))
+		// Verify the object was created
+		assert.True(t, mockServer.ObjectExists(objectKey))
 
-	// Verify the content is correct
-	content, found := mockServer.ObjectContent(objectKey)
-	assert.True(t, found)
-	assert.Equal(t, testData, content)
-}
+		// Verify the content is correct
+		content, found := mockServer.ObjectContent(objectKey)
+		assert.True(t, found)
+		assert.Equal(t, testData, content)
+	})
 
-func TestBucket_WriteFromSmall(t *testing.T) {
-	bucket := "test-bucket"
-	mockServer := mock.New(bucket, "us-east-1")
-	defer mockServer.Close()
+	t.Run("small", func(t *testing.T) {
+		bucket := "test-bucket"
+		mockServer := mock.New(bucket, "us-east-1")
+		defer mockServer.Close()
 
-	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
-	key.BaseURI = mockServer.URL()
+		key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
+		key.BaseURI = mockServer.URL()
 
-	b := NewBucket(key, bucket)
+		b := NewBucket(key, bucket)
 
-	// Create test data smaller than MinPartSize (should use single part)
-	testData := make([]byte, 1024) // 1KB
-	for i := range testData {
-		testData[i] = byte(i % 256)
-	}
+		// Create test data smaller than MinPartSize (should use single part)
+		testData := make([]byte, 1024) // 1KB
+		for i := range testData {
+			testData[i] = byte(i % 256)
+		}
 
-	// Test WriteFrom with context
-	ctx := context.Background()
-	objectKey := "test/small-file.bin"
+		// Test WriteFrom with context
+		ctx := context.Background()
+		objectKey := "test/small-file.bin"
 
-	assert.NoError(t, b.WriteFrom(ctx, objectKey, bytes.NewReader(testData), int64(len(testData))))
+		assert.NoError(t, b.WriteFrom(ctx, objectKey, bytes.NewReader(testData), int64(len(testData))))
 
-	// Verify the object was created
-	assert.True(t, mockServer.ObjectExists(objectKey))
+		// Verify the object was created
+		assert.True(t, mockServer.ObjectExists(objectKey))
 
-	// Verify the content is correct
-	content, found := mockServer.ObjectContent(objectKey)
-	assert.True(t, found)
-	assert.Equal(t, testData, content)
-}
+		// Verify the content is correct
+		content, found := mockServer.ObjectContent(objectKey)
+		assert.True(t, found)
+		assert.Equal(t, testData, content)
+	})
 
-func TestBucket_WriteFromValidation(t *testing.T) {
-	bucket := "test-bucket"
-	mockServer := mock.New(bucket, "us-east-1")
-	defer mockServer.Close()
+	t.Run("validation", func(t *testing.T) {
+		bucket := "test-bucket"
+		mockServer := mock.New(bucket, "us-east-1")
+		defer mockServer.Close()
 
-	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
-	key.BaseURI = mockServer.URL()
+		key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
+		key.BaseURI = mockServer.URL()
 
-	b := NewBucket(key, bucket)
+		b := NewBucket(key, bucket)
 
-	testData := make([]byte, 1024)
-	ctx := context.Background()
+		testData := make([]byte, 1024)
+		ctx := context.Background()
 
-	// Test with invalid path
-	err := b.WriteFrom(ctx, "../invalid", bytes.NewReader(testData), int64(len(testData)))
-	assert.Error(t, err)
+		// Test with invalid path
+		err := b.WriteFrom(ctx, "../invalid", bytes.NewReader(testData), int64(len(testData)))
+		assert.Error(t, err)
 
-	// Test with negative size
-	err = b.WriteFrom(ctx, "valid-path", bytes.NewReader(testData), -1)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "size must be non-negative")
+		// Test with negative size
+		err = b.WriteFrom(ctx, "valid-path", bytes.NewReader(testData), -1)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "size must be non-negative")
+	})
 }
 
 // Test calculatePartSize function
-func TestCalculatePartSize(t *testing.T) {
+func TestPartSize(t *testing.T) {
 	// Test small size
 	partSize := calculatePartSize(MinPartSize)
 	assert.Equal(t, int64(MinPartSize), partSize)
@@ -124,7 +126,7 @@ func TestCalculatePartSize(t *testing.T) {
 }
 
 // Test multipart upload through mock server directly
-func TestMultipartUpload_MockServer(t *testing.T) {
+func TestMultipart(t *testing.T) {
 	bucket := "test-bucket"
 	mockServer := mock.New(bucket, "us-east-1")
 	defer mockServer.Close()
@@ -156,434 +158,435 @@ func TestMultipartUpload_MockServer(t *testing.T) {
 	assert.Equal(t, allData, content)
 }
 
-// Test constants and helper functions
-func TestUploaderConstants(t *testing.T) {
-	assert.Equal(t, 5*1024*1024, MinPartSize)
-	assert.Equal(t, 10000, MaxParts)
-}
-
-func TestUploader_StartValidation(t *testing.T) {
-	bucket := "test-bucket"
-	mockServer := mock.New(bucket, "us-east-1")
-	defer mockServer.Close()
-
-	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
-	key.BaseURI = mockServer.URL()
-
-	// Test missing bucket
-	u1 := &uploader{
-		Key:    key,
-		Object: "test-object",
-	}
-	err := u1.Start(context.Background())
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "Bucket and s3.Uploader.Object must be present")
-
-	// Test missing object
-	u2 := &uploader{
-		Key:    key,
-		Bucket: bucket,
-	}
-	err = u2.Start(context.Background())
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "Bucket and s3.Uploader.Object must be present")
-
-	// Test double start
-	u3 := &uploader{
-		Key:    key,
-		Bucket: bucket,
-		Object: "test-object",
-	}
-	assert.NoError(t, u3.Start(context.Background()))
-
-	assert.Panics(t, func() {
-		u3.Start(context.Background())
-	})
-}
-
-func TestUploader_UploadValidation(t *testing.T) {
-	bucket := "test-bucket"
-	mockServer := mock.New(bucket, "us-east-1")
-	defer mockServer.Close()
-
-	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
-	key.BaseURI = mockServer.URL()
-
-	u := &uploader{
-		Key:    key,
-		Bucket: bucket,
-		Object: "test-object",
-	}
-
-	// Test Upload before Start
-	data := make([]byte, MinPartSize)
-	assert.Panics(t, func() {
-		u.Upload(1, data)
+func TestUploader(t *testing.T) {
+	t.Run("constants", func(t *testing.T) {
+		assert.Equal(t, 5*1024*1024, MinPartSize)
+		assert.Equal(t, 10000, MaxParts)
 	})
 
-	// Start uploader
-	assert.NoError(t, u.Start(context.Background()))
+	t.Run("start validation", func(t *testing.T) {
+		bucket := "test-bucket"
+		mockServer := mock.New(bucket, "us-east-1")
+		defer mockServer.Close()
 
-	// Test Upload with data too small
-	smallData := make([]byte, MinPartSize-1)
-	err := u.Upload(1, smallData)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "below min part size")
+		key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
+		key.BaseURI = mockServer.URL()
 
-	// Test valid Upload
-	assert.NoError(t, u.Upload(1, data))
-}
+		// Test missing bucket
+		u1 := &uploader{
+			Key:    key,
+			Object: "test-object",
+		}
+		err := u1.Start(context.Background())
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "Bucket and s3.Uploader.Object must be present")
 
-func TestUploader_CloseValidation(t *testing.T) {
-	bucket := "test-bucket"
-	mockServer := mock.New(bucket, "us-east-1")
-	defer mockServer.Close()
+		// Test missing object
+		u2 := &uploader{
+			Key:    key,
+			Bucket: bucket,
+		}
+		err = u2.Start(context.Background())
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "Bucket and s3.Uploader.Object must be present")
 
-	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
-	key.BaseURI = mockServer.URL()
+		// Test double start
+		u3 := &uploader{
+			Key:    key,
+			Bucket: bucket,
+			Object: "test-object",
+		}
+		assert.NoError(t, u3.Start(context.Background()))
 
-	uploader := &uploader{
-		Key:    key,
-		Bucket: bucket,
-		Object: "test-object",
-	}
-
-	// Test Close before Start
-	assert.Panics(t, func() {
-		uploader.Close(context.Background(), nil)
+		assert.Panics(t, func() {
+			u3.Start(context.Background())
+		})
 	})
 
-	// Start uploader and upload a part
-	assert.NoError(t, uploader.Start(context.Background()))
+	t.Run("upload validation", func(t *testing.T) {
+		bucket := "test-bucket"
+		mockServer := mock.New(bucket, "us-east-1")
+		defer mockServer.Close()
 
-	data := make([]byte, MinPartSize)
-	assert.NoError(t, uploader.Upload(1, data))
+		key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
+		key.BaseURI = mockServer.URL()
 
-	// Test valid Close
-	assert.NoError(t, uploader.Close(context.Background(), []byte("final data")))
+		u := &uploader{
+			Key:    key,
+			Bucket: bucket,
+			Object: "test-object",
+		}
 
-	// Test double Close
-	assert.Panics(t, func() {
-		uploader.Close(context.Background(), nil)
-	})
-}
+		// Test Upload before Start
+		data := make([]byte, MinPartSize)
+		assert.Panics(t, func() {
+			u.Upload(1, data)
+		})
 
-func TestUploader_Abort(t *testing.T) {
-	bucket := "test-bucket"
-	mockServer := mock.New(bucket, "us-east-1")
-	defer mockServer.Close()
+		// Start uploader
+		assert.NoError(t, u.Start(context.Background()))
 
-	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
-	key.BaseURI = mockServer.URL()
+		// Test Upload with data too small
+		smallData := make([]byte, MinPartSize-1)
+		err := u.Upload(1, smallData)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "below min part size")
 
-	u := &uploader{
-		Key:    key,
-		Bucket: bucket,
-		Object: "test/abort-test.bin",
-	}
-
-	// Test Abort before Start (should do nothing)
-	assert.NoError(t, u.Abort(context.Background()))
-
-	// Start uploader
-	assert.NoError(t, u.Start(context.Background()))
-	uploadID := u.ID()
-
-	// Verify upload exists
-	_, exists := mockServer.GetMultipartUpload(uploadID)
-	assert.True(t, exists)
-
-	// Upload a part
-	data := make([]byte, MinPartSize)
-	assert.NoError(t, u.Upload(1, data))
-
-	// Test Abort
-	assert.NoError(t, u.Abort(context.Background()))
-
-	// Verify upload was cleaned up
-	_, exists = mockServer.GetMultipartUpload(uploadID)
-	assert.False(t, exists)
-
-	// Test Abort after Close
-	u2 := &uploader{
-		Key:    key,
-		Bucket: bucket,
-		Object: "test/abort-test2.bin",
-	}
-	assert.NoError(t, u2.Start(context.Background()))
-	assert.NoError(t, u2.Upload(1, data))
-	assert.NoError(t, u2.Close(context.Background(), nil))
-
-	// Abort should do nothing after successful close
-	assert.NoError(t, u2.Abort(context.Background()))
-}
-
-func TestUploader_CopyFrom(t *testing.T) {
-	bucket := "test-bucket"
-	mockServer := mock.New(bucket, "us-east-1")
-	defer mockServer.Close()
-
-	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
-	key.BaseURI = mockServer.URL()
-
-	// Create source object
-	sourceData := make([]byte, MinPartSize*2)
-	for i := range sourceData {
-		sourceData[i] = byte(i % 256)
-	}
-	sourceKey := "source/large-file.bin"
-	etag := mockServer.PutObject(sourceKey, sourceData)
-
-	// Create source Reader
-	sourceReader := &Reader{
-		Key:    key,
-		Bucket: bucket,
-		Path:   sourceKey,
-		ETag:   etag,
-		Size:   int64(len(sourceData)),
-	}
-
-	uploader := &uploader{
-		Key:    key,
-		Bucket: bucket,
-		Object: "dest/copied-file.bin",
-	}
-
-	// Test CopyFrom before Start
-	assert.Panics(t, func() {
-		uploader.CopyFrom(context.Background(), 1, sourceReader, 0, 0)
+		// Test valid Upload
+		assert.NoError(t, u.Upload(1, data))
 	})
 
-	// Start uploader
-	assert.NoError(t, uploader.Start(context.Background()))
+	t.Run("close validation", func(t *testing.T) {
+		bucket := "test-bucket"
+		mockServer := mock.New(bucket, "us-east-1")
+		defer mockServer.Close()
 
-	// Test CopyFrom with invalid range
-	err := uploader.CopyFrom(context.Background(), 1, sourceReader, -1, 0)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "start and end values must be positive")
+		key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
+		key.BaseURI = mockServer.URL()
 
-	err = uploader.CopyFrom(context.Background(), 1, sourceReader, 0, int64(len(sourceData)+1000))
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "end value")
+		uploader := &uploader{
+			Key:    key,
+			Bucket: bucket,
+			Object: "test-object",
+		}
 
-	// Test CopyFrom with size too small
-	err = uploader.CopyFrom(context.Background(), 1, sourceReader, 0, MinPartSize-1)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "below min part size")
+		// Test Close before Start
+		assert.Panics(t, func() {
+			uploader.Close(context.Background(), nil)
+		})
 
-	// Test valid CopyFrom (copy entire source)
-	assert.NoError(t, uploader.CopyFrom(context.Background(), 1, sourceReader, 0, 0))
+		// Start uploader and upload a part
+		assert.NoError(t, uploader.Start(context.Background()))
 
-	// Test CopyFrom with range
-	assert.NoError(t, uploader.CopyFrom(context.Background(), 2, sourceReader, 0, MinPartSize))
+		data := make([]byte, MinPartSize)
+		assert.NoError(t, uploader.Upload(1, data))
 
-	// Close uploader
-	assert.NoError(t, uploader.Close(context.Background(), nil))
+		// Test valid Close
+		assert.NoError(t, uploader.Close(context.Background(), []byte("final data")))
 
-	// Verify object was created
-	assert.True(t, mockServer.ObjectExists("dest/copied-file.bin"))
-}
+		// Test double Close
+		assert.Panics(t, func() {
+			uploader.Close(context.Background(), nil)
+		})
+	})
 
-func TestUploader_UploadFrom(t *testing.T) {
-	bucket := "test-bucket"
-	mockServer := mock.New(bucket, "us-east-1")
-	defer mockServer.Close()
+	t.Run("abort", func(t *testing.T) {
+		bucket := "test-bucket"
+		mockServer := mock.New(bucket, "us-east-1")
+		defer mockServer.Close()
 
-	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
-	key.BaseURI = mockServer.URL()
+		key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
+		key.BaseURI = mockServer.URL()
 
-	uploader := &uploader{
-		Key:    key,
-		Bucket: bucket,
-		Object: "test/upload-from.bin",
-	}
+		u := &uploader{
+			Key:    key,
+			Bucket: bucket,
+			Object: "test/abort-test.bin",
+		}
 
-	// Start uploader
-	assert.NoError(t, uploader.Start(context.Background()))
+		// Test Abort before Start (should do nothing)
+		assert.NoError(t, u.Abort(context.Background()))
 
-	// Create test data larger than MinPartSize to trigger multipart
-	testData := make([]byte, MinPartSize*2+1000)
-	for i := range testData {
-		testData[i] = byte(i % 256)
-	}
+		// Start uploader
+		assert.NoError(t, u.Start(context.Background()))
+		uploadID := u.ID()
 
-	// Test UploadFrom
-	ctx := context.Background()
-	reader := bytes.NewReader(testData)
-	assert.NoError(t, uploader.UploadFrom(ctx, reader, int64(len(testData))))
+		// Verify upload exists
+		_, exists := mockServer.GetMultipartUpload(uploadID)
+		assert.True(t, exists)
 
-	// Verify object was created
-	assert.True(t, mockServer.ObjectExists("test/upload-from.bin"))
+		// Upload a part
+		data := make([]byte, MinPartSize)
+		assert.NoError(t, u.Upload(1, data))
 
-	// Verify content is correct
-	content, found := mockServer.ObjectContent("test/upload-from.bin")
-	assert.True(t, found)
-	assert.Equal(t, testData, content)
-}
+		// Test Abort
+		assert.NoError(t, u.Abort(context.Background()))
 
-func TestUploader_UploadFromContextCancellation(t *testing.T) {
-	bucket := "test-bucket"
-	mockServer := mock.New(bucket, "us-east-1")
-	defer mockServer.Close()
+		// Verify upload was cleaned up
+		_, exists = mockServer.GetMultipartUpload(uploadID)
+		assert.False(t, exists)
 
-	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
-	key.BaseURI = mockServer.URL()
+		// Test Abort after Close
+		u2 := &uploader{
+			Key:    key,
+			Bucket: bucket,
+			Object: "test/abort-test2.bin",
+		}
+		assert.NoError(t, u2.Start(context.Background()))
+		assert.NoError(t, u2.Upload(1, data))
+		assert.NoError(t, u2.Close(context.Background(), nil))
 
-	uploader := &uploader{
-		Key:    key,
-		Bucket: bucket,
-		Object: "test/cancelled-upload.bin",
-	}
+		// Abort should do nothing after successful close
+		assert.NoError(t, u2.Abort(context.Background()))
+	})
 
-	// Start uploader
-	assert.NoError(t, uploader.Start(context.Background()))
+	t.Run("copy from", func(t *testing.T) {
+		bucket := "test-bucket"
+		mockServer := mock.New(bucket, "us-east-1")
+		defer mockServer.Close()
 
-	// Create test data
-	testData := make([]byte, MinPartSize*3)
-	for i := range testData {
-		testData[i] = byte(i % 256)
-	}
+		key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
+		key.BaseURI = mockServer.URL()
 
-	// Test UploadFrom with cancelled context
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // Cancel immediately
+		// Create source object
+		sourceData := make([]byte, MinPartSize*2)
+		for i := range sourceData {
+			sourceData[i] = byte(i % 256)
+		}
+		sourceKey := "source/large-file.bin"
+		etag := mockServer.PutObject(sourceKey, sourceData)
 
-	reader := bytes.NewReader(testData)
-	err := uploader.UploadFrom(ctx, reader, int64(len(testData)))
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "context canceled")
-}
+		// Create source Reader
+		sourceReader := &Reader{
+			Key:    key,
+			Bucket: bucket,
+			Path:   sourceKey,
+			ETag:   etag,
+			Size:   int64(len(sourceData)),
+		}
 
-func TestUploader_ContentType(t *testing.T) {
-	bucket := "test-bucket"
-	mockServer := mock.New(bucket, "us-east-1")
-	defer mockServer.Close()
+		uploader := &uploader{
+			Key:    key,
+			Bucket: bucket,
+			Object: "dest/copied-file.bin",
+		}
 
-	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
-	key.BaseURI = mockServer.URL()
+		// Test CopyFrom before Start
+		assert.Panics(t, func() {
+			uploader.CopyFrom(context.Background(), 1, sourceReader, 0, 0)
+		})
 
-	uploader := &uploader{
-		Key:         key,
-		Bucket:      bucket,
-		Object:      "test/content-type.bin",
-		ContentType: "application/octet-stream",
-	}
+		// Start uploader
+		assert.NoError(t, uploader.Start(context.Background()))
 
-	// Start uploader
-	assert.NoError(t, uploader.Start(context.Background()))
+		// Test CopyFrom with invalid range
+		err := uploader.CopyFrom(context.Background(), 1, sourceReader, -1, 0)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "start and end values must be positive")
 
-	// Upload a part
-	data := make([]byte, MinPartSize)
-	assert.NoError(t, uploader.Upload(1, data))
+		err = uploader.CopyFrom(context.Background(), 1, sourceReader, 0, int64(len(sourceData)+1000))
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "end value")
 
-	// Close uploader
-	assert.NoError(t, uploader.Close(context.Background(), nil))
+		// Test CopyFrom with size too small
+		err = uploader.CopyFrom(context.Background(), 1, sourceReader, 0, MinPartSize-1)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "below min part size")
 
-	// Verify object was created
-	assert.True(t, mockServer.ObjectExists("test/content-type.bin"))
+		// Test valid CopyFrom (copy entire source)
+		assert.NoError(t, uploader.CopyFrom(context.Background(), 1, sourceReader, 0, 0))
 
-	// Verify content type was set (this would need to be checked in the mock server)
-	obj, found := mockServer.GetObject("test/content-type.bin")
-	assert.True(t, found)
-	assert.Equal(t, "application/octet-stream", obj.ContentType)
-}
+		// Test CopyFrom with range
+		assert.NoError(t, uploader.CopyFrom(context.Background(), 2, sourceReader, 0, MinPartSize))
 
-func TestUploader_PartOrdering(t *testing.T) {
-	bucket := "test-bucket"
-	mockServer := mock.New(bucket, "us-east-1")
-	defer mockServer.Close()
+		// Close uploader
+		assert.NoError(t, uploader.Close(context.Background(), nil))
 
-	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
-	key.BaseURI = mockServer.URL()
+		// Verify object was created
+		assert.True(t, mockServer.ObjectExists("dest/copied-file.bin"))
+	})
 
-	uploader := &uploader{
-		Key:    key,
-		Bucket: bucket,
-		Object: "test/part-ordering.bin",
-	}
+	t.Run("upload from", func(t *testing.T) {
+		bucket := "test-bucket"
+		mockServer := mock.New(bucket, "us-east-1")
+		defer mockServer.Close()
 
-	// Start uploader
-	assert.NoError(t, uploader.Start(context.Background()))
+		key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
+		key.BaseURI = mockServer.URL()
 
-	// Upload parts out of order
-	data1 := make([]byte, MinPartSize)
-	for i := range data1 {
-		data1[i] = 1
-	}
-	data2 := make([]byte, MinPartSize)
-	for i := range data2 {
-		data2[i] = 2
-	}
-	data3 := make([]byte, MinPartSize)
-	for i := range data3 {
-		data3[i] = 3
-	}
+		uploader := &uploader{
+			Key:    key,
+			Bucket: bucket,
+			Object: "test/upload-from.bin",
+		}
 
-	// Upload in order: 3, 1, 2
-	assert.NoError(t, uploader.Upload(3, data3))
-	assert.NoError(t, uploader.Upload(1, data1))
-	assert.NoError(t, uploader.Upload(2, data2))
+		// Start uploader
+		assert.NoError(t, uploader.Start(context.Background()))
 
-	// Close uploader
-	assert.NoError(t, uploader.Close(context.Background(), nil))
+		// Create test data larger than MinPartSize to trigger multipart
+		testData := make([]byte, MinPartSize*2+1000)
+		for i := range testData {
+			testData[i] = byte(i % 256)
+		}
 
-	// Verify object was created
-	assert.True(t, mockServer.ObjectExists("test/part-ordering.bin"))
+		// Test UploadFrom
+		ctx := context.Background()
+		reader := bytes.NewReader(testData)
+		assert.NoError(t, uploader.UploadFrom(ctx, reader, int64(len(testData))))
 
-	// Verify content is in correct order (1, 2, 3)
-	content, found := mockServer.ObjectContent("test/part-ordering.bin")
-	assert.True(t, found)
+		// Verify object was created
+		assert.True(t, mockServer.ObjectExists("test/upload-from.bin"))
 
-	// Check that the parts are in the correct order
-	expectedSize := len(data1) + len(data2) + len(data3)
-	assert.Equal(t, expectedSize, len(content))
+		// Verify content is correct
+		content, found := mockServer.ObjectContent("test/upload-from.bin")
+		assert.True(t, found)
+		assert.Equal(t, testData, content)
+	})
 
-	// Verify each part's content
-	assert.Equal(t, byte(1), content[0])             // First part
-	assert.Equal(t, byte(2), content[MinPartSize])   // Second part
-	assert.Equal(t, byte(3), content[MinPartSize*2]) // Third part
-}
+	t.Run("upload from cancel", func(t *testing.T) {
+		bucket := "test-bucket"
+		mockServer := mock.New(bucket, "us-east-1")
+		defer mockServer.Close()
 
-func TestUploader_EdgeCases(t *testing.T) {
-	bucket := "test-bucket"
-	mockServer := mock.New(bucket, "us-east-1")
-	defer mockServer.Close()
+		key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
+		key.BaseURI = mockServer.URL()
 
-	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
-	key.BaseURI = mockServer.URL()
+		uploader := &uploader{
+			Key:    key,
+			Bucket: bucket,
+			Object: "test/cancelled-upload.bin",
+		}
 
-	// Test with empty final part
-	u := &uploader{
-		Key:    key,
-		Bucket: bucket,
-		Object: "test/empty-final.bin",
-	}
+		// Start uploader
+		assert.NoError(t, uploader.Start(context.Background()))
 
-	assert.NoError(t, u.Start(context.Background()))
+		// Create test data
+		testData := make([]byte, MinPartSize*3)
+		for i := range testData {
+			testData[i] = byte(i % 256)
+		}
 
-	data := make([]byte, MinPartSize)
-	assert.NoError(t, u.Upload(1, data))
+		// Test UploadFrom with cancelled context
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // Cancel immediately
 
-	// Close with empty final part
-	assert.NoError(t, u.Close(context.Background(), nil))
-	assert.True(t, mockServer.ObjectExists("test/empty-final.bin"))
+		reader := bytes.NewReader(testData)
+		err := uploader.UploadFrom(ctx, reader, int64(len(testData)))
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "context canceled")
+	})
 
-	// Test Size() before Close
-	u2 := &uploader{
-		Key:    key,
-		Bucket: bucket,
-		Object: "test/size-before-close.bin",
-	}
+	t.Run("content type", func(t *testing.T) {
+		bucket := "test-bucket"
+		mockServer := mock.New(bucket, "us-east-1")
+		defer mockServer.Close()
 
-	assert.NoError(t, u2.Start(context.Background()))
+		key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
+		key.BaseURI = mockServer.URL()
 
-	// Size should be 0 before Close
-	assert.Equal(t, int64(0), u2.Size())
+		uploader := &uploader{
+			Key:         key,
+			Bucket:      bucket,
+			Object:      "test/content-type.bin",
+			ContentType: "application/octet-stream",
+		}
 
-	assert.NoError(t, u2.Upload(1, data))
+		// Start uploader
+		assert.NoError(t, uploader.Start(context.Background()))
 
-	// Size should still be 0 before Close
-	assert.Equal(t, int64(0), u2.Size())
-	assert.NoError(t, u2.Close(context.Background(), nil))
-	assert.Equal(t, int64(len(data)), u2.Size())
+		// Upload a part
+		data := make([]byte, MinPartSize)
+		assert.NoError(t, uploader.Upload(1, data))
+
+		// Close uploader
+		assert.NoError(t, uploader.Close(context.Background(), nil))
+
+		// Verify object was created
+		assert.True(t, mockServer.ObjectExists("test/content-type.bin"))
+
+		// Verify content type was set (this would need to be checked in the mock server)
+		obj, found := mockServer.GetObject("test/content-type.bin")
+		assert.True(t, found)
+		assert.Equal(t, "application/octet-stream", obj.ContentType)
+	})
+
+	t.Run("part ordering", func(t *testing.T) {
+		bucket := "test-bucket"
+		mockServer := mock.New(bucket, "us-east-1")
+		defer mockServer.Close()
+
+		key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
+		key.BaseURI = mockServer.URL()
+
+		uploader := &uploader{
+			Key:    key,
+			Bucket: bucket,
+			Object: "test/part-ordering.bin",
+		}
+
+		// Start uploader
+		assert.NoError(t, uploader.Start(context.Background()))
+
+		// Upload parts out of order
+		data1 := make([]byte, MinPartSize)
+		for i := range data1 {
+			data1[i] = 1
+		}
+		data2 := make([]byte, MinPartSize)
+		for i := range data2 {
+			data2[i] = 2
+		}
+		data3 := make([]byte, MinPartSize)
+		for i := range data3 {
+			data3[i] = 3
+		}
+
+		// Upload in order: 3, 1, 2
+		assert.NoError(t, uploader.Upload(3, data3))
+		assert.NoError(t, uploader.Upload(1, data1))
+		assert.NoError(t, uploader.Upload(2, data2))
+
+		// Close uploader
+		assert.NoError(t, uploader.Close(context.Background(), nil))
+
+		// Verify object was created
+		assert.True(t, mockServer.ObjectExists("test/part-ordering.bin"))
+
+		// Verify content is in correct order (1, 2, 3)
+		content, found := mockServer.ObjectContent("test/part-ordering.bin")
+		assert.True(t, found)
+
+		// Check that the parts are in the correct order
+		expectedSize := len(data1) + len(data2) + len(data3)
+		assert.Equal(t, expectedSize, len(content))
+
+		// Verify each part's content
+		assert.Equal(t, byte(1), content[0])             // First part
+		assert.Equal(t, byte(2), content[MinPartSize])   // Second part
+		assert.Equal(t, byte(3), content[MinPartSize*2]) // Third part
+	})
+
+	t.Run("edge cases", func(t *testing.T) {
+		bucket := "test-bucket"
+		mockServer := mock.New(bucket, "us-east-1")
+		defer mockServer.Close()
+
+		key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
+		key.BaseURI = mockServer.URL()
+
+		// Test with empty final part
+		u := &uploader{
+			Key:    key,
+			Bucket: bucket,
+			Object: "test/empty-final.bin",
+		}
+
+		assert.NoError(t, u.Start(context.Background()))
+
+		data := make([]byte, MinPartSize)
+		assert.NoError(t, u.Upload(1, data))
+
+		// Close with empty final part
+		assert.NoError(t, u.Close(context.Background(), nil))
+		assert.True(t, mockServer.ObjectExists("test/empty-final.bin"))
+
+		// Test Size() before Close
+		u2 := &uploader{
+			Key:    key,
+			Bucket: bucket,
+			Object: "test/size-before-close.bin",
+		}
+
+		assert.NoError(t, u2.Start(context.Background()))
+
+		// Size should be 0 before Close
+		assert.Equal(t, int64(0), u2.Size())
+
+		assert.NoError(t, u2.Upload(1, data))
+
+		// Size should still be 0 before Close
+		assert.Equal(t, int64(0), u2.Size())
+		assert.NoError(t, u2.Close(context.Background(), nil))
+		assert.Equal(t, int64(len(data)), u2.Size())
+	})
 }

@@ -17,10 +17,11 @@ type CopyPart struct {
 
 // Compose concatenates immutable source ranges using multipart server-side copy.
 func (b *Bucket) Compose(ctx context.Context, key string, parts []CopyPart) (string, error) {
-	if key = path.Clean(key); !fs.ValidPath(key) || key == "." {
+	key = path.Clean(key)
+	switch {
+	case !fs.ValidPath(key) || key == ".":
 		return "", badpath("s3 Compose", key)
-	}
-	if len(parts) == 0 || len(parts) > MaxParts {
+	case len(parts) == 0 || len(parts) > MaxParts:
 		return "", fmt.Errorf("s3 Compose: invalid part count %d", len(parts))
 	}
 

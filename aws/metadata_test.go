@@ -37,78 +37,80 @@ func withMetadataServer(t *testing.T, handler http.HandlerFunc, fn func()) {
 	fn()
 }
 
-func TestMetadataString(t *testing.T) {
-	handler := func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/latest/api/token":
-			w.Write([]byte("tok"))
-		case "/latest/meta-data/test":
-			if r.Header.Get("X-Aws-Ec2-Metadata-Token") != "tok" {
-				http.Error(w, "bad token", http.StatusForbidden)
-				return
+func TestMetadata(t *testing.T) {
+	t.Run("string", func(t *testing.T) {
+		handler := func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/latest/api/token":
+				w.Write([]byte("tok"))
+			case "/latest/meta-data/test":
+				if r.Header.Get("X-Aws-Ec2-Metadata-Token") != "tok" {
+					http.Error(w, "bad token", http.StatusForbidden)
+					return
+				}
+				w.Write([]byte("value"))
+			default:
+				http.NotFound(w, r)
 			}
-			w.Write([]byte("value"))
-		default:
-			http.NotFound(w, r)
 		}
-	}
 
-	withMetadataServer(t, handler, func() {
-		val, err := MetadataString("test")
-		assert.NoError(t, err)
-		assert.Equal(t, "value", val)
+		withMetadataServer(t, handler, func() {
+			val, err := MetadataString("test")
+			assert.NoError(t, err)
+			assert.Equal(t, "value", val)
+		})
 	})
-}
 
-func TestMetadataJSON(t *testing.T) {
-	handler := func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/latest/api/token":
-			w.Write([]byte("tok"))
-		case "/latest/meta-data/info":
-			w.Header().Set("Content-Type", "application/json")
-			w.Write([]byte(`{"foo":"bar"}`))
-		default:
-			http.NotFound(w, r)
+	t.Run("json", func(t *testing.T) {
+		handler := func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/latest/api/token":
+				w.Write([]byte("tok"))
+			case "/latest/meta-data/info":
+				w.Header().Set("Content-Type", "application/json")
+				w.Write([]byte(`{"foo":"bar"}`))
+			default:
+				http.NotFound(w, r)
+			}
 		}
-	}
 
-	withMetadataServer(t, handler, func() {
-		var out struct{ Foo string }
-		err := MetadataJSON("info", &out)
-		assert.NoError(t, err)
-		assert.Equal(t, "bar", out.Foo)
+		withMetadataServer(t, handler, func() {
+			var out struct{ Foo string }
+			err := MetadataJSON("info", &out)
+			assert.NoError(t, err)
+			assert.Equal(t, "bar", out.Foo)
+		})
 	})
-}
 
-func TestEC2Region(t *testing.T) {
-	handler := func(w http.ResponseWriter, r *http.Request) {
-		switch r.URL.Path {
-		case "/latest/api/token":
-			w.Write([]byte("tok"))
-		case "/latest/meta-data/placement/availability-zone":
-			w.Write([]byte("us-east-2a"))
-		default:
-			http.NotFound(w, r)
+	t.Run("ec2 region", func(t *testing.T) {
+		handler := func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/latest/api/token":
+				w.Write([]byte("tok"))
+			case "/latest/meta-data/placement/availability-zone":
+				w.Write([]byte("us-east-2a"))
+			default:
+				http.NotFound(w, r)
+			}
 		}
-	}
 
-	withMetadataServer(t, handler, func() {
-		region, err := ec2Region()
-		assert.NoError(t, err)
-		assert.Equal(t, "us-east-2", region)
+		withMetadataServer(t, handler, func() {
+			region, err := ec2Region()
+			assert.NoError(t, err)
+			assert.Equal(t, "us-east-2", region)
+		})
 	})
-}
 
-func TestS3EndPoint(t *testing.T) {
-	os.Unsetenv("S3_ENDPOINT")
-	assert.Equal(t, "https://s3.us-west-1.amazonaws.com", S3EndPoint("us-west-1"))
+	t.Run("s3 endpoint", func(t *testing.T) {
+		os.Unsetenv("S3_ENDPOINT")
+		assert.Equal(t, "https://s3.us-west-1.amazonaws.com", S3EndPoint("us-west-1"))
 
-	os.Setenv("S3_ENDPOINT", "http://localhost:9000/")
-	defer os.Unsetenv("S3_ENDPOINT")
-	assert.Equal(t, "http://localhost:9000", S3EndPoint("ignored"))
-}
+		os.Setenv("S3_ENDPOINT", "http://localhost:9000/")
+		defer os.Unsetenv("S3_ENDPOINT")
+		assert.Equal(t, "http://localhost:9000", S3EndPoint("ignored"))
+	})
 
-func TestB2EndPoint(t *testing.T) {
-	assert.Equal(t, "https://s3.eu-west-2.backblazeb2.com", B2EndPoint("eu-west-2"))
+	t.Run("b2 endpoint", func(t *testing.T) {
+		assert.Equal(t, "https://s3.eu-west-2.backblazeb2.com", B2EndPoint("eu-west-2"))
+	})
 }

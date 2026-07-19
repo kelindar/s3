@@ -523,76 +523,78 @@ func TestBucketListPagination(t *testing.T) {
 	assert.Equal(t, 1001, count)
 }
 
-func TestBucket_WriteFrom_ContextCancellation(t *testing.T) {
-	bucket := "test-bucket"
-	mockServer := mock.New(bucket, "us-east-1")
-	defer mockServer.Close()
+func TestCancel(t *testing.T) {
+	t.Run("write from", func(t *testing.T) {
+		bucket := "test-bucket"
+		mockServer := mock.New(bucket, "us-east-1")
+		defer mockServer.Close()
 
-	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
-	key.BaseURI = mockServer.URL()
+		key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
+		key.BaseURI = mockServer.URL()
 
-	b := NewBucket(key, bucket)
+		b := NewBucket(key, bucket)
 
-	// Create test data larger than MinPartSize to trigger multipart upload
-	testData := make([]byte, MinPartSize*3) // ~15MB
-	for i := range testData {
-		testData[i] = byte(i % 256)
-	}
+		// Create test data larger than MinPartSize to trigger multipart upload
+		testData := make([]byte, MinPartSize*3) // ~15MB
+		for i := range testData {
+			testData[i] = byte(i % 256)
+		}
 
-	// Test WriteFrom with cancelled context
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // Cancel immediately
+		// Test WriteFrom with cancelled context
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // Cancel immediately
 
-	objectKey := "test/cancelled-upload.bin"
+		objectKey := "test/cancelled-upload.bin"
 
-	err := b.WriteFrom(ctx, objectKey, bytes.NewReader(testData), int64(len(testData)))
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "context canceled")
-}
+		err := b.WriteFrom(ctx, objectKey, bytes.NewReader(testData), int64(len(testData)))
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "context canceled")
+	})
 
-func TestBucket_Write_ContextCancellation(t *testing.T) {
-	bucket := "test-bucket"
-	mockServer := mock.New(bucket, "us-east-1")
-	defer mockServer.Close()
+	t.Run("write", func(t *testing.T) {
+		bucket := "test-bucket"
+		mockServer := mock.New(bucket, "us-east-1")
+		defer mockServer.Close()
 
-	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
-	key.BaseURI = mockServer.URL()
+		key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
+		key.BaseURI = mockServer.URL()
 
-	b := NewBucket(key, bucket)
+		b := NewBucket(key, bucket)
 
-	// Test Write with cancelled context
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // Cancel immediately
+		// Test Write with cancelled context
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // Cancel immediately
 
-	objectKey := "test/cancelled-write.txt"
-	testData := []byte("test content")
+		objectKey := "test/cancelled-write.txt"
+		testData := []byte("test content")
 
-	_, err := b.Write(ctx, objectKey, testData)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "context canceled")
-}
+		_, err := b.Write(ctx, objectKey, testData)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "context canceled")
+	})
 
-func TestBucket_Delete_ContextCancellation(t *testing.T) {
-	bucket := "test-bucket"
-	mockServer := mock.New(bucket, "us-east-1")
-	defer mockServer.Close()
+	t.Run("delete", func(t *testing.T) {
+		bucket := "test-bucket"
+		mockServer := mock.New(bucket, "us-east-1")
+		defer mockServer.Close()
 
-	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
-	key.BaseURI = mockServer.URL()
+		key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
+		key.BaseURI = mockServer.URL()
 
-	b := NewBucket(key, bucket)
+		b := NewBucket(key, bucket)
 
-	// Create an object first
-	objectKey := "test/delete-test.txt"
-	testData := []byte("test content")
-	_, err := b.Write(context.Background(), objectKey, testData)
-	assert.NoError(t, err)
+		// Create an object first
+		objectKey := "test/delete-test.txt"
+		testData := []byte("test content")
+		_, err := b.Write(context.Background(), objectKey, testData)
+		assert.NoError(t, err)
 
-	// Test Delete with cancelled context
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel() // Cancel immediately
+		// Test Delete with cancelled context
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel() // Cancel immediately
 
-	err = b.Delete(ctx, objectKey)
-	assert.Error(t, err)
-	assert.Contains(t, err.Error(), "context canceled")
+		err = b.Delete(ctx, objectKey)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "context canceled")
+	})
 }

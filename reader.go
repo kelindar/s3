@@ -85,29 +85,24 @@ func badBucket(name string) error {
 // since bucket names containing dots are not accessible
 // over HTTPS. (AWS docs say "not recommended for uses other than static website hosting.")
 func ValidBucket(bucket string) bool {
-	if len(bucket) < 3 || len(bucket) > 63 {
+	switch {
+	case len(bucket) < 3 || len(bucket) > 63:
 		return false
-	}
-	if strings.HasPrefix(bucket, "xn--") {
+	case strings.HasPrefix(bucket, "xn--"):
 		return false
-	}
-	if strings.HasSuffix(bucket, "-s3alias") {
+	case strings.HasSuffix(bucket, "-s3alias"):
 		return false
 	}
 	for i := 0; i < len(bucket); i++ {
-		if bucket[i] >= 'a' && bucket[i] <= 'z' {
+		switch {
+		case bucket[i] >= 'a' && bucket[i] <= 'z':
 			continue
-		}
-		if bucket[i] >= '0' && bucket[i] <= '9' {
+		case bucket[i] >= '0' && bucket[i] <= '9':
 			continue
-		}
-		if i > 0 && i < len(bucket)-1 {
-			if bucket[i] == '-' {
-				continue
-			}
-			if bucket[i] == '.' && bucket[i-1] != '.' {
-				continue
-			}
+		case i > 0 && i < len(bucket)-1 && bucket[i] == '-':
+			continue
+		case i > 0 && i < len(bucket)-1 && bucket[i] == '.' && bucket[i-1] != '.':
+			continue
 		}
 		return false
 	}
@@ -410,10 +405,12 @@ func BucketRegion(k *aws.SigningKey, bucket string) (string, error) {
 		return "", err
 	}
 	defer res.Body.Close()
-	if res.StatusCode == 403 {
+	switch res.StatusCode {
+	case 403:
 		return k.Region, nil
-	}
-	if res.StatusCode != 200 && res.StatusCode != 301 {
+	case 200, 301:
+		// ok
+	default:
 		return "", fmt.Errorf("s3.BucketRegion: %s %q", res.Status, extractMessage(res.Body))
 	}
 	region := res.Header.Get("x-amz-bucket-region")
@@ -429,11 +426,10 @@ func BucketRegion(k *aws.SigningKey, bucket string) (string, error) {
 // given bucket lives.
 func DeriveForBucket(bucket string) aws.DeriveFn {
 	return func(baseURI, id, secret, token, region, service string) (*aws.SigningKey, error) {
-		if !ValidBucket(bucket) {
+		switch {
+		case !ValidBucket(bucket):
 			return nil, badBucket(bucket)
-		}
-
-		if service != "s3" && service != "b2" {
+		case service != "s3" && service != "b2":
 			return nil, fmt.Errorf("s3.DeriveForBucket: expected service \"s3\"; got %q", service)
 		}
 

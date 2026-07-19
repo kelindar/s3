@@ -284,116 +284,118 @@ func TestBucketRegion_Comprehensive(t *testing.T) {
 	assert.ErrorIs(t, err, ErrInvalidBucket)
 }
 
-func TestReader_RangeReader_ErrorCases(t *testing.T) {
-	bucket := "test-bucket"
-	mockServer := mock.New(bucket, "us-east-1")
-	defer mockServer.Close()
+func TestReaderErrors(t *testing.T) {
+	t.Run("range reader", func(t *testing.T) {
+		bucket := "test-bucket"
+		mockServer := mock.New(bucket, "us-east-1")
+		defer mockServer.Close()
 
-	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
-	key.BaseURI = mockServer.URL()
+		key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
+		key.BaseURI = mockServer.URL()
 
-	// Create test content
-	content := []byte("Range reader error test content")
-	objectKey := "test/range-error.txt"
-	etag := mockServer.PutObject(objectKey, content)
+		// Create test content
+		content := []byte("Range reader error test content")
+		objectKey := "test/range-error.txt"
+		etag := mockServer.PutObject(objectKey, content)
 
-	reader := &Reader{
-		Key:    key,
-		Client: &DefaultClient,
-		ETag:   etag,
-		Size:   int64(len(content)),
-		Bucket: bucket,
-		Path:   objectKey,
-	}
+		reader := &Reader{
+			Key:    key,
+			Client: &DefaultClient,
+			ETag:   etag,
+			Size:   int64(len(content)),
+			Bucket: bucket,
+			Path:   objectKey,
+		}
 
-	// Test range beyond file size
-	_, err := reader.RangeReader(int64(len(content)+10), 10)
-	assert.Error(t, err)
+		// Test range beyond file size
+		_, err := reader.RangeReader(int64(len(content)+10), 10)
+		assert.Error(t, err)
 
-	// Test with invalid bucket in reader
-	invalidReader := &Reader{
-		Key:    key,
-		Client: &DefaultClient,
-		ETag:   etag,
-		Size:   int64(len(content)),
-		Bucket: "invalid_bucket",
-		Path:   objectKey,
-	}
+		// Test with invalid bucket in reader
+		invalidReader := &Reader{
+			Key:    key,
+			Client: &DefaultClient,
+			ETag:   etag,
+			Size:   int64(len(content)),
+			Bucket: "invalid_bucket",
+			Path:   objectKey,
+		}
 
-	_, err = invalidReader.RangeReader(0, 10)
-	assert.Error(t, err)
-	// The error might not be ErrInvalidBucket depending on implementation
-	// assert.ErrorIs(t, err, ErrInvalidBucket)
+		_, err = invalidReader.RangeReader(0, 10)
+		assert.Error(t, err)
+		// The error might not be ErrInvalidBucket depending on implementation
+		// assert.ErrorIs(t, err, ErrInvalidBucket)
 
-	// Test with non-existent object
-	nonExistentReader := &Reader{
-		Key:    key,
-		Client: &DefaultClient,
-		ETag:   "fake-etag",
-		Size:   100,
-		Bucket: bucket,
-		Path:   "nonexistent.txt",
-	}
+		// Test with non-existent object
+		nonExistentReader := &Reader{
+			Key:    key,
+			Client: &DefaultClient,
+			ETag:   "fake-etag",
+			Size:   100,
+			Bucket: bucket,
+			Path:   "nonexistent.txt",
+		}
 
-	_, err = nonExistentReader.RangeReader(0, 10)
-	assert.Error(t, err)
-}
+		_, err = nonExistentReader.RangeReader(0, 10)
+		assert.Error(t, err)
+	})
 
-func TestReader_WriteTo_ErrorCases(t *testing.T) {
-	bucket := "test-bucket"
-	mockServer := mock.New(bucket, "us-east-1")
-	defer mockServer.Close()
+	t.Run("write to", func(t *testing.T) {
+		bucket := "test-bucket"
+		mockServer := mock.New(bucket, "us-east-1")
+		defer mockServer.Close()
 
-	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
-	key.BaseURI = mockServer.URL()
+		key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
+		key.BaseURI = mockServer.URL()
 
-	// Test with non-existent object
-	reader := &Reader{
-		Key:    key,
-		Client: &DefaultClient,
-		ETag:   "fake-etag",
-		Size:   100,
-		Bucket: bucket,
-		Path:   "nonexistent.txt",
-	}
+		// Test with non-existent object
+		reader := &Reader{
+			Key:    key,
+			Client: &DefaultClient,
+			ETag:   "fake-etag",
+			Size:   100,
+			Bucket: bucket,
+			Path:   "nonexistent.txt",
+		}
 
-	var buf bytes.Buffer
-	_, err := reader.WriteTo(&buf)
-	assert.Error(t, err)
+		var buf bytes.Buffer
+		_, err := reader.WriteTo(&buf)
+		assert.Error(t, err)
 
-	// Test with invalid bucket
-	invalidReader := &Reader{
-		Key:    key,
-		Client: &DefaultClient,
-		ETag:   "fake-etag",
-		Size:   100,
-		Bucket: "invalid_bucket",
-		Path:   "test.txt",
-	}
+		// Test with invalid bucket
+		invalidReader := &Reader{
+			Key:    key,
+			Client: &DefaultClient,
+			ETag:   "fake-etag",
+			Size:   100,
+			Bucket: "invalid_bucket",
+			Path:   "test.txt",
+		}
 
-	_, err = invalidReader.WriteTo(&buf)
-	assert.Error(t, err)
-}
+		_, err = invalidReader.WriteTo(&buf)
+		assert.Error(t, err)
+	})
 
-func TestReader_ReadAt_ErrorCases(t *testing.T) {
-	bucket := "test-bucket"
-	mockServer := mock.New(bucket, "us-east-1")
-	defer mockServer.Close()
+	t.Run("read at", func(t *testing.T) {
+		bucket := "test-bucket"
+		mockServer := mock.New(bucket, "us-east-1")
+		defer mockServer.Close()
 
-	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
-	key.BaseURI = mockServer.URL()
+		key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
+		key.BaseURI = mockServer.URL()
 
-	// Test with non-existent object
-	reader := &Reader{
-		Key:    key,
-		Client: &DefaultClient,
-		ETag:   "fake-etag",
-		Size:   100,
-		Bucket: bucket,
-		Path:   "nonexistent.txt",
-	}
+		// Test with non-existent object
+		reader := &Reader{
+			Key:    key,
+			Client: &DefaultClient,
+			ETag:   "fake-etag",
+			Size:   100,
+			Bucket: bucket,
+			Path:   "nonexistent.txt",
+		}
 
-	buf := make([]byte, 10)
-	_, err := reader.ReadAt(buf, 0)
-	assert.Error(t, err)
+		buf := make([]byte, 10)
+		_, err := reader.ReadAt(buf, 0)
+		assert.Error(t, err)
+	})
 }

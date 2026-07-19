@@ -152,23 +152,19 @@ func AmbientCreds(regionName string) (id, secret, region, token string, err erro
 // It will assume the role as specified in the AWS_ROLE_ARN environment variable.
 func WebIdentityCreds(client *http.Client) (id, secret, region, token string, expiration time.Time, err error) {
 	region = os.Getenv("AWS_REGION")
-	if region == "" {
-		return "", "", "", "", time.Time{}, fmt.Errorf("AWS_REGION not set")
-	}
-
+	roleARN := os.Getenv("AWS_ROLE_ARN")
+	webIdentityTokenFile := os.Getenv("AWS_WEB_IDENTITY_TOKEN_FILE")
 	roleSessionName := os.Getenv("AWS_ROLE_SESSION_NAME")
+	switch {
+	case region == "":
+		return "", "", "", "", time.Time{}, fmt.Errorf("AWS_REGION not set")
+	case roleARN == "":
+		return "", "", "", "", time.Time{}, fmt.Errorf("AWS_ROLE_ARN not set")
+	case webIdentityTokenFile == "":
+		return "", "", "", "", time.Time{}, fmt.Errorf("AWS_WEB_IDENTITY_TOKEN_FILE not set")
+	}
 	if roleSessionName == "" {
 		roleSessionName = "default"
-	}
-
-	roleARN := os.Getenv("AWS_ROLE_ARN")
-	if roleARN == "" {
-		return "", "", "", "", time.Time{}, fmt.Errorf("AWS_ROLE_ARN not set")
-	}
-
-	webIdentityTokenFile := os.Getenv("AWS_WEB_IDENTITY_TOKEN_FILE")
-	if webIdentityTokenFile == "" {
-		return "", "", "", "", time.Time{}, fmt.Errorf("AWS_WEB_IDENTITY_TOKEN_FILE not set")
 	}
 
 	webIdentityToken, err := os.ReadFile(webIdentityTokenFile)

@@ -242,22 +242,19 @@ func (m *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Parse the request path
 	pathParts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
-	if len(pathParts) < 1 {
+	switch {
+	case len(pathParts) < 1:
 		m.writeErrorResponse(w, "InvalidRequest", "Invalid request path", http.StatusBadRequest)
+		return
+	case pathParts[0] != m.bucket:
+		m.writeErrorResponse(w, "NoSuchBucket", "The specified bucket does not exist", http.StatusNotFound)
 		return
 	}
 
-	// Extract bucket and key
-	bucket := pathParts[0]
+	// Extract key
 	var key string
 	if len(pathParts) > 1 {
 		key = strings.Join(pathParts[1:], "/")
-	}
-
-	// Validate bucket
-	if bucket != m.bucket {
-		m.writeErrorResponse(w, "NoSuchBucket", "The specified bucket does not exist", http.StatusNotFound)
-		return
 	}
 
 	// Route based on method and query parameters
@@ -761,35 +758,30 @@ func (m *Server) handleCopyPart(w http.ResponseWriter, r *http.Request, upload *
 		return
 	}
 
-	copySource = copySource[1:] // Remove leading slash
-	parts := strings.SplitN(copySource, "/", 2)
-	if len(parts) != 2 {
+	parts := strings.SplitN(copySource[1:], "/", 2)
+	switch {
+	case len(parts) != 2:
 		m.writeErrorResponse(w, "InvalidRequest", "Invalid copy source format", http.StatusBadRequest)
 		return
-	}
-
-	sourceBucket := parts[0]
-	sourceKey := parts[1]
-
-	// For simplicity, we only support copying from the same bucket in the mock
-	if sourceBucket != m.bucket {
+	case parts[0] != m.bucket:
+		// For simplicity, we only support copying from the same bucket in the mock
 		m.writeErrorResponse(w, "NoSuchBucket", "Source bucket not found", http.StatusNotFound)
 		return
 	}
+
+	sourceKey := parts[1]
 
 	// Get the source object
 	m.mutex.RLock()
 	sourceObj, exists := m.objects[sourceKey]
 	m.mutex.RUnlock()
 
-	if !exists {
+	ifMatch := r.Header.Get("x-amz-copy-source-if-match")
+	switch {
+	case !exists:
 		m.writeErrorResponse(w, "NoSuchKey", "Source object not found", http.StatusNotFound)
 		return
-	}
-
-	// Check if-match condition
-	ifMatch := r.Header.Get("x-amz-copy-source-if-match")
-	if ifMatch != "" && ifMatch != sourceObj.ETag {
+	case ifMatch != "" && ifMatch != sourceObj.ETag:
 		m.writeErrorResponse(w, "PreconditionFailed", "Copy source if-match condition failed", http.StatusPreconditionFailed)
 		return
 	}

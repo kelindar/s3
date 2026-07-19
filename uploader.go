@@ -168,10 +168,10 @@ func (u *uploader) Start(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if rt.Bucket != u.Bucket {
+	switch {
+	case rt.Bucket != u.Bucket:
 		return fmt.Errorf("returned bucket %q not input bucket %q?", rt.Bucket, u.Bucket)
-	}
-	if rt.Key != u.Object {
+	case rt.Key != u.Object:
 		return fmt.Errorf("returned key %q not input key %q?", rt.Key, u.Object)
 	}
 	u.started = true
@@ -238,10 +238,10 @@ func extractMessage(r io.Reader) string {
 // synchronized to occur strictly after a call to Start
 // and strictly before a call to Close.
 func (u *uploader) Upload(num int64, contents []byte) error {
-	if !u.started {
+	switch {
+	case !u.started:
 		panic("s3.uploader.UploadPart before Start()")
-	}
-	if len(contents) < MinPartSize {
+	case len(contents) < MinPartSize:
 		return fmt.Errorf("UploadPart size %d below min part size %d", len(contents), MinPartSize)
 	}
 	return u.upload(context.Background(), num, contents)
@@ -276,10 +276,10 @@ func (u *uploader) upload(ctx context.Context, num int64, contents []byte) error
 }
 
 func (u *uploader) uploadWithContext(ctx context.Context, num int64, contents []byte) error {
-	if !u.started {
+	switch {
+	case !u.started:
 		panic("s3.uploader.UploadPart before Start()")
-	}
-	if len(contents) < MinPartSize {
+	case len(contents) < MinPartSize:
 		return fmt.Errorf("UploadPart size %d below min part size %d", len(contents), MinPartSize)
 	}
 	return u.upload(ctx, num, contents)
@@ -304,10 +304,10 @@ func (u *uploader) CopyFrom(ctx context.Context, num int64, source *Reader, star
 	}
 	size := source.Size
 	if start != 0 || end != 0 {
-		if start < 0 || end < 0 {
+		switch {
+		case start < 0 || end < 0:
 			return errors.New("start and end values must be positive numbers")
-		}
-		if end > size {
+		case end > size:
 			return fmt.Errorf("end value %d greater than source size %d", end, size)
 		}
 		size = end - start
@@ -422,10 +422,10 @@ func (u *uploader) Size() int64 {
 // Close will panic if Start has never been called
 // or if Close has already been called and returned successfully.
 func (u *uploader) Close(ctx context.Context, final []byte) error {
-	if !u.started {
+	switch {
+	case !u.started:
 		panic("s3.uploader.Close before Start()")
-	}
-	if u.finished {
+	case u.finished:
 		panic("multiple calls to s3.uploader.Close")
 	}
 	if len(final) > 0 {
