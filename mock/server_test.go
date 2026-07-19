@@ -252,7 +252,7 @@ func TestServer(t *testing.T) {
 		for i := range testContent {
 			testContent[i] = byte(i % 256)
 		}
-		mockServer.PutObject("range-test.bin", testContent)
+		etag := mockServer.PutObject("range-test.bin", testContent)
 
 		// Create S3 client
 		key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
@@ -272,7 +272,7 @@ func TestServer(t *testing.T) {
 		}
 
 		for _, tc := range testCases {
-			reader, err := bucket.OpenRange("range-test.bin", "", tc.start, tc.width)
+			reader, err := bucket.OpenRange("range-test.bin", etag, tc.start, tc.width)
 			assert.NoError(t, err)
 			defer reader.Close()
 
@@ -280,6 +280,9 @@ func TestServer(t *testing.T) {
 			assert.NoError(t, err)
 			assert.Equal(t, tc.expected, content)
 		}
+
+		_, err := bucket.OpenRange("range-test.bin", "stale-etag", 0, 100)
+		assert.ErrorIs(t, err, s3.ErrETagChanged)
 	})
 
 	t.Run("multipart upload", func(t *testing.T) {

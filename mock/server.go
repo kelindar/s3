@@ -462,6 +462,10 @@ func (m *Server) handleGetObject(w http.ResponseWriter, r *http.Request, key str
 		m.writeErrorResponse(w, "NoSuchKey", "The specified key does not exist", http.StatusNotFound)
 		return
 	}
+	if match := r.Header.Get("If-Match"); match != "" && match != obj.ETag {
+		w.WriteHeader(http.StatusPreconditionFailed)
+		return
+	}
 
 	// Handle range requests
 	rangeHeader := r.Header.Get("Range")
