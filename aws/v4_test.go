@@ -115,6 +115,25 @@ f536975d06c0309214f805bb90ccff089219ecd68b2577efef23edd43b7e1a59`
 	assert.Equal(t, wantsig, string(dst[:]))
 }
 
+func TestSigningKeyRollover(t *testing.T) {
+	const (
+		accessKey = "AKIAIOSFODNN7EXAMPLE"
+		secretKey = "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY"
+	)
+	setnow(t, time.Date(2015, time.August, 30, 12, 36, 0, 0, time.UTC))
+	longLived := DeriveKey("", accessKey, secretKey, "us-east-1", "s3")
+
+	setnow(t, time.Date(2015, time.September, 1, 12, 36, 0, 0, time.UTC))
+	fresh := DeriveKey("", accessKey, secretKey, "us-east-1", "s3")
+	longLivedRequest, err := http.NewRequest(http.MethodGet, "https://examplebucket.s3.amazonaws.com/test.txt", nil)
+	assert.NoError(t, err)
+	freshRequest := longLivedRequest.Clone(t.Context())
+	longLived.SignV4(longLivedRequest, nil)
+	fresh.SignV4(freshRequest, nil)
+
+	assert.Equal(t, freshRequest.Header.Get("Authorization"), longLivedRequest.Header.Get("Authorization"))
+}
+
 // See https://docs.aws.amazon.com/AmazonS3/latest/API/sigv4-query-string-auth.html#query-string-auth-v4-signing-example
 func TestSignURL(t *testing.T) {
 	// derive the key in the preceding day
