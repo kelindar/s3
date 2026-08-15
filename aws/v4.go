@@ -277,9 +277,7 @@ func (s *SigningKey) SignURL(uri string, validfor time.Duration) (string, error)
 // SigningKey is a key that can be used
 // to sign AWS service requests.
 //
-// Keys expire daily, as they use the current
-// time in the derivation, so they must be refreshed
-// regularly.
+// The date-specific signing key is derived for each request.
 type SigningKey struct {
 	BaseURI   string    // S3 base URI (empty is default AWS S3)
 	Region    string    // AWS Region
@@ -288,15 +286,6 @@ type SigningKey struct {
 	Secret    string    // AWS Secret key
 	Token     string    // Token, if key is from STS
 	Derived   time.Time // time token was derived
-
-	// we only store the clamped secret
-	// so that this object can't be repurposed
-	// for other services / regions
-	//
-	// clamped0 is "today's" key when the
-	// key was derived; clamped1 is "tomorrow's" key
-	clamped0 []byte
-	clamped1 []byte
 }
 
 func macinto(key, mem []byte) []byte {
@@ -326,8 +315,6 @@ func DeriveKey(baseURI, accessKey, secret, region, service string) *SigningKey {
 		AccessKey: accessKey,
 		Secret:    secret,
 		Derived:   now,
-		clamped0:  derive(secret, now, region, service),
-		clamped1:  derive(secret, now.Add(24*time.Hour), region, service),
 	}
 }
 
@@ -340,17 +327,11 @@ func (s *SigningKey) InRegion(region string) *SigningKey {
 		Secret:    s.Secret,
 		Token:     s.Token,
 		Derived:   s.Derived,
-		clamped0:  derive(s.Secret, s.Derived, region, s.Service),
-		clamped1:  derive(s.Secret, s.Derived.Add(24*time.Hour), region, s.Service),
 	}
 }
 
 func (s *SigningKey) pickKey(when time.Time) []byte {
-	// if it is "tomorrow" then pick tomorrow's key
-	if when.Sub(s.Derived) >= 24*time.Hour || when.Day() != s.Derived.Day() {
-		return s.clamped1
-	}
-	return s.clamped0
+	return derive(s.Secret, when, s.Region, s.Service)
 }
 
 func (s *SigningKey) sign(src, dst []byte, when time.Time) {
