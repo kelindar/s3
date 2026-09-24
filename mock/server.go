@@ -531,11 +531,27 @@ func (m *Server) handlePutObject(w http.ResponseWriter, r *http.Request, key str
 
 	m.mutex.Lock()
 	current, exists := m.objects[key]
-	if (r.Header.Get("If-None-Match") == "*" && exists) ||
-		(r.Header.Get("If-Match") != "" && (!exists || current.ETag != r.Header.Get("If-Match"))) {
+	if match := r.Header.Get("If-None-Match"); match != "" && match != "*" {
+		m.mutex.Unlock()
+		m.writeErrorResponse(w, "InvalidRequest", "If-None-Match must be *", http.StatusBadRequest)
+		return
+	}
+	if r.Header.Get("If-None-Match") == "*" && exists {
 		m.mutex.Unlock()
 		w.WriteHeader(http.StatusPreconditionFailed)
 		return
+	}
+	if match := r.Header.Get("If-Match"); match != "" {
+		switch {
+		case !exists:
+			m.mutex.Unlock()
+			m.writeErrorResponse(w, "NoSuchKey", "The specified key does not exist", http.StatusNotFound)
+			return
+		case current.ETag != match:
+			m.mutex.Unlock()
+			m.writeErrorResponse(w, "PreconditionFailed", "If-Match condition failed", http.StatusPreconditionFailed)
+			return
+		}
 	}
 	etag := generateETag(content)
 	m.objects[key] = &Object{

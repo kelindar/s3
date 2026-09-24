@@ -348,7 +348,7 @@ func (p *Prefix) readDirAtContext(ctx context.Context, n int, token, seek, patte
 		ret.Contents[i].Key = p.Key
 		ret.Contents[i].Client = p.client()
 		ret.Contents[i].Bucket = p.Bucket
-		ret.Contents[i].Reader.ctx = p.requestContext()
+		ret.Contents[i].Reader.ctx = ctx
 		out = append(out, &ret.Contents[i])
 	}
 	for i := range ret.CommonPrefixes {
@@ -365,7 +365,7 @@ func (p *Prefix) readDirAtContext(ctx context.Context, n int, token, seek, patte
 		ret.CommonPrefixes[i].Key = p.Key
 		ret.CommonPrefixes[i].Bucket = p.Bucket
 		ret.CommonPrefixes[i].Client = p.Client
-		ret.CommonPrefixes[i].ctx = p.ctx
+		ret.CommonPrefixes[i].ctx = ctx
 		out = append(out, &ret.CommonPrefixes[i])
 	}
 	slices.SortFunc(out, func(a, b fs.DirEntry) int {

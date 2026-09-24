@@ -86,6 +86,27 @@ func (b *Bucket) Write(ctx context.Context, key string, contents []byte) (string
 // Implementations must set one or more If-* headers.
 type Condition func(http.Header) error
 
+func validateCondition(header http.Header) error {
+	if len(header) == 0 {
+		return errors.New("s3 PUT: condition set no headers")
+	}
+	for name, values := range header {
+		switch {
+		case http.CanonicalHeaderKey(name) != name:
+			return fmt.Errorf("s3 PUT: condition set non-canonical header %q", name)
+		case !strings.HasPrefix(name, "If-"):
+			return fmt.Errorf("s3 PUT: condition set non-conditional header %q", name)
+		case len(values) != 1:
+			return fmt.Errorf("s3 PUT: condition set multiple values for header %q", name)
+		case values[0] == "":
+			return fmt.Errorf("s3 PUT: condition set empty header %q", name)
+		case name == "If-None-Match" && values[0] != "*":
+			return errors.New(`s3 PUT: If-None-Match must be "*"`)
+		}
+	}
+	return nil
+}
+
 // IfMatch writes only while the object's ETag matches etag.
 func IfMatch(etag string) Condition {
 	return func(header http.Header) error {
@@ -97,8 +118,8 @@ func IfMatch(etag string) Condition {
 	}
 }
 
-// IfNoneMatch writes only while the object's ETag does not match etag.
-// Use "*" to write only when the object does not exist.
+// IfNoneMatch writes only when the object does not exist. S3 PutObject requires
+// etag to be "*".
 func IfNoneMatch(etag string) Condition {
 	return func(header http.Header) error {
 		if etag == "" {
@@ -137,22 +158,8 @@ func (b *Bucket) write(ctx context.Context, key string, contents []byte, conditi
 		if err := condition(req.Header); err != nil {
 			return "", false, fmt.Errorf("s3 PUT condition: %w", err)
 		}
-		if len(req.Header) == 0 {
-			return "", false, errors.New("s3 PUT: condition set no headers")
-		}
-		for name, values := range req.Header {
-			if http.CanonicalHeaderKey(name) != name {
-				return "", false, fmt.Errorf("s3 PUT: condition set non-canonical header %q", name)
-			}
-			if !strings.HasPrefix(strings.ToLower(name), "if-") {
-				return "", false, fmt.Errorf("s3 PUT: condition set non-conditional header %q", name)
-			}
-			if len(values) != 1 {
-				return "", false, fmt.Errorf("s3 PUT: condition set multiple values for header %q", name)
-			}
-			if values[0] == "" {
-				return "", false, fmt.Errorf("s3 PUT: condition set empty header %q", name)
-			}
+		if err := validateCondition(req.Header); err != nil {
+			return "", false, err
 		}
 	}
 
@@ -166,7 +173,11 @@ func (b *Bucket) write(ctx context.Context, key string, contents []byte, conditi
 	case res.StatusCode == http.StatusPreconditionFailed && condition != nil:
 		return "", false, nil
 	case res.StatusCode != http.StatusOK:
-		return "", false, fmt.Errorf("s3 PUT: %s %s", res.Status, extractMessage(res.Body))
+		code, message := extractS3Error(res.Body)
+		if res.StatusCode == http.StatusNotFound && req.Header.Get("If-Match") != "" && code == "NoSuchKey" {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("s3 PUT: %s %s", res.Status, message)
 	default:
 		return res.Header.Get("ETag"), true, nil
 	}

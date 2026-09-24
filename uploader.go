@@ -216,16 +216,21 @@ func calculatePartSize(totalSize int64) int64 {
 	return partSize
 }
 
-// extractMessage tries to extract the <Message/>
-// field of an XML response to improve error messages
-func extractMessage(r io.Reader) string {
+func extractS3Error(r io.Reader) (code, message string) {
 	rt := struct {
+		Code    string `xml:"Code"`
 		Message string `xml:"Message"`
 	}{}
 	if xml.NewDecoder(r).Decode(&rt) == nil {
-		return rt.Message
+		return rt.Code, rt.Message
 	}
-	return "(no message)"
+	return "", "(no message)"
+}
+
+// extractMessage tries to extract the <Message/> field of an XML response.
+func extractMessage(r io.Reader) string {
+	_, message := extractS3Error(r)
+	return message
 }
 
 // Upload uploads the part number num from
