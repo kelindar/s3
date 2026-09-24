@@ -16,7 +16,6 @@
 package s3
 
 import (
-	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -30,10 +29,9 @@ import (
 
 // File implements fs.File
 type File struct {
-	Reader                 // Reader is a reader that points to the associated s3 object.
-	ctx    context.Context // from parent bucket
-	body   io.ReadCloser   // actual body; populated lazily
-	pos    int64           // current read offset
+	Reader               // Reader is a reader that points to the associated s3 object.
+	body   io.ReadCloser // actual body; populated lazily
+	pos    int64         // current read offset
 }
 
 // Name implements fs.FileInfo.Name
@@ -81,15 +79,11 @@ func (f *File) Read(p []byte) (int, error) {
 		f.body = nil
 	}
 
-	err := f.ctx.Err()
+	body, err := f.Reader.RangeReader(f.pos, f.Size()-f.pos)
 	if err != nil {
 		return 0, err
 	}
-
-	f.body, err = f.Reader.RangeReader(f.pos, f.Size()-f.pos)
-	if err != nil {
-		return 0, err
-	}
+	f.body = body
 
 	n, err := f.body.Read(p)
 	f.pos += int64(n)

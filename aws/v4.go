@@ -26,6 +26,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"slices"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -51,12 +53,49 @@ const (
 // note: this list needs to be alphabetically sorted
 var sigheaders = []string{
 	"host",
+	"if-match",
+	"if-none-match",
 	"x-amz-content-sha256",
 	"x-amz-copy-source",
 	"x-amz-copy-source-if-match",
 	"x-amz-copy-source-range",
 	"x-amz-date",
 	"x-amz-security-token",
+}
+
+func signedHeaders(req *http.Request) []string {
+	headers := sigheaders
+	var extra []string
+	for header := range req.Header {
+		name := strings.ToLower(header)
+		if !strings.HasPrefix(name, "if-") || req.Header.Get(name) == "" || slices.Contains(sigheaders, name) {
+			continue
+		}
+		extra = append(extra, name)
+	}
+	if len(extra) == 0 {
+		return headers
+	}
+
+	headers = make([]string, 0, len(sigheaders)+len(extra))
+	headers = append(headers, sigheaders...)
+	headers = append(headers, extra...)
+	sort.Strings(headers)
+	return headers
+}
+
+func writeSignedHeaders(dst *bytes.Buffer, req *http.Request, headers []string) {
+	first := true
+	for _, header := range headers {
+		if req.Header.Get(header) == "" {
+			continue
+		}
+		if !first {
+			dst.WriteByte(';')
+		}
+		dst.WriteString(header)
+		first = false
+	}
 }
 
 func (s *SigningKey) toscope(dst *bytes.Buffer, now time.Time) {
@@ -108,8 +147,8 @@ func canonical(dst *bytes.Buffer, req *http.Request) {
 	}
 
 	var bodyhash string
-	for i := range sigheaders {
-		h := sigheaders[i]
+	headers := signedHeaders(req)
+	for _, h := range headers {
 		hdr := req.Header.Get(h)
 		if hdr == "" {
 			continue
@@ -125,15 +164,7 @@ func canonical(dst *bytes.Buffer, req *http.Request) {
 	dst.WriteByte('\n')
 
 	// signed headers string
-	for i := range sigheaders {
-		if req.Header.Get(sigheaders[i]) == "" {
-			continue
-		}
-		if i != 0 {
-			dst.WriteByte(';')
-		}
-		dst.WriteString(sigheaders[i])
-	}
+	writeSignedHeaders(dst, req, headers)
 	dst.WriteByte('\n')
 	// the value to be hashed here
 	// needs to match the header,
@@ -193,15 +224,7 @@ func (s *SigningKey) SignV4(req *http.Request, body []byte) {
 	buf.WriteByte('/')
 	s.toscope(&buf, now)
 	buf.WriteString(", SignedHeaders=")
-	for i := range sigheaders {
-		if req.Header.Get(sigheaders[i]) == "" {
-			continue
-		}
-		if i != 0 {
-			buf.WriteByte(';')
-		}
-		buf.WriteString(sigheaders[i])
-	}
+	writeSignedHeaders(&buf, req, signedHeaders(req))
 	buf.WriteString(", Signature=")
 	buf.Write(hexbuf[:])
 

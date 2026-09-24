@@ -123,6 +123,7 @@ type Reader struct {
 	// it may be set to any reasonable http client
 	// implementation.
 	Client *http.Client `xml:"-"`
+	ctx    context.Context
 
 	// ETag is the ETag of the object in S3
 	// as returned by listing or a HEAD operation.
@@ -208,15 +209,19 @@ func NewFile(k *aws.SigningKey, bucket, object, etag string, size int64) *File {
 			ETag:   etag,
 			Size:   size,
 		},
-		ctx: context.Background(),
 	}
 }
 
 // Open performs a GET on an S3 object
 // and returns the associated File.
 func Open(k *aws.SigningKey, bucket, object string, contents bool) (*File, error) {
+	return openContext(context.Background(), k, bucket, object, contents, &DefaultClient)
+}
+
+// openContext opens an object using ctx and client for S3 requests.
+func openContext(ctx context.Context, k *aws.SigningKey, bucket, object string, contents bool, client *http.Client) (*File, error) {
 	f := new(File)
-	err := f.open(k, bucket, object, contents)
+	err := f.openContext(ctx, client, k, bucket, object, contents)
 	if err != nil {
 		return nil, err
 	}
@@ -249,8 +254,8 @@ func flakyDo(cl *http.Client, req *http.Request) (*http.Response, error) {
 	return cl.Do(req)
 }
 
-func (f *File) open(k *aws.SigningKey, bucket, object string, contents bool) error {
-	body, err := f.Reader.open(k, bucket, object, true)
+func (f *File) openContext(ctx context.Context, client *http.Client, k *aws.SigningKey, bucket, object string, contents bool) error {
+	body, err := f.Reader.openContext(ctx, client, k, bucket, object, contents)
 	if err != nil {
 		if body != nil {
 			body.Close()
@@ -262,11 +267,14 @@ func (f *File) open(k *aws.SigningKey, bucket, object string, contents bool) err
 		body = nil
 	}
 	f.body = body
-	f.ctx = context.Background()
 	return nil
 }
 
 func (r *Reader) open(k *aws.SigningKey, bucket, object string, contents bool) (io.ReadCloser, error) {
+	return r.openContext(context.Background(), &DefaultClient, k, bucket, object, contents)
+}
+
+func (r *Reader) openContext(ctx context.Context, client *http.Client, k *aws.SigningKey, bucket, object string, contents bool) (io.ReadCloser, error) {
 	if !ValidBucket(bucket) {
 		return nil, badBucket(bucket)
 	}
@@ -274,14 +282,13 @@ func (r *Reader) open(k *aws.SigningKey, bucket, object string, contents bool) (
 	if contents {
 		method = http.MethodGet
 	}
-	req, err := http.NewRequest(method, uri(k, bucket, object), nil)
+	req, err := http.NewRequestWithContext(ctx, method, uri(k, bucket, object), nil)
 	if err != nil {
 		return nil, err
 	}
 	k.SignV4(req, nil)
 
-	// FIXME: configurable http.Client here?
-	res, err := flakyDo(&DefaultClient, req)
+	res, err := flakyDo(client, req)
 	if err != nil {
 		return nil, err
 	}
@@ -310,7 +317,8 @@ func (r *Reader) open(k *aws.SigningKey, bucket, object string, contents bool) (
 	lm, _ := time.Parse(time.RFC1123, res.Header.Get("LastModified"))
 	*r = Reader{
 		Key:          k,
-		Client:       &DefaultClient,
+		Client:       client,
+		ctx:          ctx,
 		ETag:         res.Header.Get("ETag"),
 		LastModified: lm,
 		Size:         res.ContentLength,
@@ -322,7 +330,7 @@ func (r *Reader) open(k *aws.SigningKey, bucket, object string, contents bool) (
 
 // WriteTo implements io.WriterTo
 func (r *Reader) WriteTo(w io.Writer) (int64, error) {
-	req, err := http.NewRequest("GET", uri(r.Key, r.Bucket, r.Path), nil)
+	req, err := http.NewRequestWithContext(r.requestContext(), "GET", uri(r.Key, r.Bucket, r.Path), nil)
 	if err != nil {
 		return 0, err
 	}
@@ -345,7 +353,18 @@ func (r *Reader) WriteTo(w io.Writer) (int64, error) {
 // It is the caller's responsibility to call Close()
 // on the returned io.ReadCloser.
 func (r *Reader) RangeReader(off, width int64) (io.ReadCloser, error) {
-	req, err := http.NewRequest("GET", uri(r.Key, r.Bucket, r.Path), nil)
+	return r.rangeReaderContext(r.requestContext(), off, width)
+}
+
+func (r *Reader) requestContext() context.Context {
+	if r.ctx != nil {
+		return r.ctx
+	}
+	return context.Background()
+}
+
+func (r *Reader) rangeReaderContext(ctx context.Context, off, width int64) (io.ReadCloser, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", uri(r.Key, r.Bucket, r.Path), nil)
 	if err != nil {
 		return nil, err
 	}

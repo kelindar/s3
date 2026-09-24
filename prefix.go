@@ -40,6 +40,7 @@ type Prefix struct {
 	Path   string          `xml:"Prefix"` // Path is the path of this prefix, should always be a valid path  (see fs.ValidPath) plus a trailing forward slash to indicate that this is a pseudo-directory prefix.
 	token  string          `xml:"-"`      // listing token; "" means start from the beginning
 	dirEOF bool            `xml:"-"`      // if true, ReadDir returns io.EOF
+	ctx    context.Context
 }
 
 func (p *Prefix) join(extra string) string {
@@ -55,6 +56,7 @@ func (p *Prefix) sub(name string) *Prefix {
 		Client: p.Client,
 		Bucket: p.Bucket,
 		Path:   p.join(name),
+		ctx:    p.ctx,
 	}
 }
 
@@ -80,11 +82,15 @@ func (p *Prefix) Open(file string) (fs.File, error) {
 }
 
 func (p *Prefix) openDir() (fs.File, error) {
+	return p.openDirContext(p.requestContext())
+}
+
+func (p *Prefix) openDirContext(ctx context.Context) (fs.File, error) {
 	if p.Path == "" || p.Path == "." {
 		// the root directory trivially exists
 		return p, nil
 	}
-	ret, err := p.list(1, "", "", "")
+	ret, err := p.listContext(ctx, 1, "", "", "")
 	if err != nil {
 		return nil, err
 	}
@@ -101,7 +107,15 @@ func (p *Prefix) openDir() (fs.File, error) {
 		Bucket: p.Bucket,
 		Client: p.Client,
 		Path:   path,
+		ctx:    ctx,
 	}, nil
+}
+
+func (p *Prefix) requestContext() context.Context {
+	if p.ctx != nil {
+		return p.ctx
+	}
+	return context.Background()
 }
 
 // Name implements fs.DirEntry.Name
@@ -163,7 +177,7 @@ func (p *Prefix) Close() error {
 // Every returned fs.DirEntry will be either
 // a Prefix or a File struct.
 func (p *Prefix) ReadDir(n int) ([]fs.DirEntry, error) {
-	return p.readDirContext(context.Background(), n)
+	return p.readDirContext(p.requestContext(), n)
 }
 
 func (p *Prefix) readDirContext(ctx context.Context, n int) ([]fs.DirEntry, error) {
@@ -195,7 +209,7 @@ type listResponse struct {
 }
 
 func (p *Prefix) list(n int, token, seek, prefix string) (*listResponse, error) {
-	return p.listContext(context.Background(), n, token, seek, prefix)
+	return p.listContext(p.requestContext(), n, token, seek, prefix)
 }
 
 func (p *Prefix) listContext(ctx context.Context, n int, token, seek, prefix string) (*listResponse, error) {
@@ -310,7 +324,7 @@ func ignoreKey(key string, dirOK bool) bool {
 // io.EOF. Note that this behavior differs from
 // fs.ReadDirFile.ReadDir.
 func (p *Prefix) readDirAt(n int, token, seek, pattern string) (d []fs.DirEntry, next string, err error) {
-	return p.readDirAtContext(context.Background(), n, token, seek, pattern)
+	return p.readDirAtContext(p.requestContext(), n, token, seek, pattern)
 }
 
 func (p *Prefix) readDirAtContext(ctx context.Context, n int, token, seek, pattern string) (d []fs.DirEntry, next string, err error) {
@@ -334,12 +348,7 @@ func (p *Prefix) readDirAtContext(ctx context.Context, n int, token, seek, patte
 		ret.Contents[i].Key = p.Key
 		ret.Contents[i].Client = p.client()
 		ret.Contents[i].Bucket = p.Bucket
-		// FIXME: we're using the "wrong" context here
-		// because we really just wanted to use the
-		// embedded context for limiting the time spent
-		// scanning and not the time spent reading the
-		// input file...
-		ret.Contents[i].ctx = context.Background()
+		ret.Contents[i].Reader.ctx = p.requestContext()
 		out = append(out, &ret.Contents[i])
 	}
 	for i := range ret.CommonPrefixes {
@@ -356,6 +365,7 @@ func (p *Prefix) readDirAtContext(ctx context.Context, n int, token, seek, patte
 		ret.CommonPrefixes[i].Key = p.Key
 		ret.CommonPrefixes[i].Bucket = p.Bucket
 		ret.CommonPrefixes[i].Client = p.Client
+		ret.CommonPrefixes[i].ctx = p.ctx
 		out = append(out, &ret.CommonPrefixes[i])
 	}
 	slices.SortFunc(out, func(a, b fs.DirEntry) int {

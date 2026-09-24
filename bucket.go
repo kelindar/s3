@@ -62,6 +62,12 @@ func (b *Bucket) sub(name string) *Prefix {
 	}
 }
 
+func (b *Bucket) subContext(ctx context.Context, name string) *Prefix {
+	p := b.sub(name)
+	p.ctx = ctx
+	return p
+}
+
 func badpath(op, name string) error {
 	return &fs.PathError{
 		Op:   op,
@@ -72,32 +78,98 @@ func badpath(op, name string) error {
 
 // Write performs a PutObject operation at the object key 'key' and returns the ETag of the newly-created object.
 func (b *Bucket) Write(ctx context.Context, key string, contents []byte) (string, error) {
+	etag, _, err := b.write(ctx, key, contents, nil)
+	return etag, err
+}
+
+// Condition adds HTTP conditional request headers to a write.
+// Implementations must set one or more If-* headers.
+type Condition func(http.Header) error
+
+// IfMatch writes only while the object's ETag matches etag.
+func IfMatch(etag string) Condition {
+	return func(header http.Header) error {
+		if etag == "" {
+			return errors.New("empty ETag")
+		}
+		header.Set("If-Match", etag)
+		return nil
+	}
+}
+
+// IfNoneMatch writes only while the object's ETag does not match etag.
+// Use "*" to write only when the object does not exist.
+func IfNoneMatch(etag string) Condition {
+	return func(header http.Header) error {
+		if etag == "" {
+			return errors.New("empty ETag")
+		}
+		header.Set("If-None-Match", etag)
+		return nil
+	}
+}
+
+// WriteIf performs a PutObject only when condition's HTTP preconditions hold.
+// It reports applied=false when S3 rejects the precondition.
+func (b *Bucket) WriteIf(ctx context.Context, key string, contents []byte, condition Condition) (etag string, applied bool, err error) {
+	if condition == nil {
+		return "", false, errors.New("s3 PUT: missing condition")
+	}
+	return b.write(ctx, key, contents, condition)
+}
+
+func (b *Bucket) write(ctx context.Context, key string, contents []byte, condition Condition) (string, bool, error) {
 	key = path.Clean(key)
 	_, base := path.Split(key)
 	switch {
 	case !fs.ValidPath(key):
-		return "", badpath("s3 PUT", key)
+		return "", false, badpath("s3 PUT", key)
 	case base == ".":
 		// Don't allow a path that is nominally a directory
-		return "", badpath("s3 PUT", key)
+		return "", false, badpath("s3 PUT", key)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPut, uri(b.key, b.bkt, key), nil)
 	if err != nil {
-		return "", err
+		return "", false, err
+	}
+	if condition != nil {
+		if err := condition(req.Header); err != nil {
+			return "", false, fmt.Errorf("s3 PUT condition: %w", err)
+		}
+		if len(req.Header) == 0 {
+			return "", false, errors.New("s3 PUT: condition set no headers")
+		}
+		for name, values := range req.Header {
+			if http.CanonicalHeaderKey(name) != name {
+				return "", false, fmt.Errorf("s3 PUT: condition set non-canonical header %q", name)
+			}
+			if !strings.HasPrefix(strings.ToLower(name), "if-") {
+				return "", false, fmt.Errorf("s3 PUT: condition set non-conditional header %q", name)
+			}
+			if len(values) != 1 {
+				return "", false, fmt.Errorf("s3 PUT: condition set multiple values for header %q", name)
+			}
+			if values[0] == "" {
+				return "", false, fmt.Errorf("s3 PUT: condition set empty header %q", name)
+			}
+		}
 	}
 
 	b.key.SignV4(req, contents)
 	res, err := flakyDo(b.client(), req)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	defer res.Body.Close()
-	if res.StatusCode != 200 {
-		return "", fmt.Errorf("s3 PUT: %s %s", res.Status, extractMessage(res.Body))
+	switch {
+	case res.StatusCode == http.StatusPreconditionFailed && condition != nil:
+		return "", false, nil
+	case res.StatusCode != http.StatusOK:
+		return "", false, fmt.Errorf("s3 PUT: %s %s", res.Status, extractMessage(res.Body))
+	default:
+		return res.Header.Get("ETag"), true, nil
 	}
-	etag := res.Header.Get("ETag")
-	return etag, nil
 }
 
 // Sub implements fs.SubFS.Sub.
@@ -121,6 +193,14 @@ func (b *Bucket) Sub(dir string) (fs.FS, error) {
 // If name does not refer to an object or a path prefix,
 // then Open returns an error matching fs.ErrNotExist.
 func (b *Bucket) Open(name string) (fs.File, error) {
+	return b.OpenContext(context.Background(), name)
+}
+
+// OpenContext opens name using ctx for object reads and directory listing.
+func (b *Bucket) OpenContext(ctx context.Context, name string) (fs.File, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	// interpret a trailing / to mean
 	// a directory
 	isDir := strings.HasSuffix(name, "/")
@@ -130,19 +210,19 @@ func (b *Bucket) Open(name string) (fs.File, error) {
 	}
 	// opening the "root directory"
 	if name == "." {
-		return b.sub("."), nil
+		return b.subContext(ctx, "."), nil
 	}
 	if !isDir {
 		// try a HEAD or GET operation; these
 		// are cheaper and faster than
 		// full listing operations
-		f, err := Open(b.key, b.bkt, name, !b.Lazy)
+		f, err := openContext(ctx, b.key, b.bkt, name, !b.Lazy, b.client())
 		if err == nil || !errors.Is(err, fs.ErrNotExist) {
 			return f, err
 		}
 	}
 
-	return b.sub(name).openDir()
+	return b.subContext(ctx, name).openDirContext(ctx)
 }
 
 // OpenRange produces an [io.ReadCloser] that reads data from
@@ -151,6 +231,14 @@ func (b *Bucket) Open(name string) (fs.File, error) {
 // If [etag] does not match the ETag of the object, then
 // [ErrETagChanged] will be returned.
 func (b *Bucket) OpenRange(name, etag string, start, width int64) (io.ReadCloser, error) {
+	return b.OpenRangeContext(context.Background(), name, etag, start, width)
+}
+
+// OpenRangeContext reads a byte range using ctx.
+func (b *Bucket) OpenRangeContext(ctx context.Context, name, etag string, start, width int64) (io.ReadCloser, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	name = path.Clean(name)
 	if !fs.ValidPath(name) || name == "." {
 		return nil, badpath("OpenRange", name)
@@ -161,6 +249,7 @@ func (b *Bucket) OpenRange(name, etag string, start, width int64) (io.ReadCloser
 		Bucket: b.bkt,
 		Path:   name,
 		ETag:   etag,
+		ctx:    ctx,
 	}
 	return r.RangeReader(start, width)
 }
@@ -202,6 +291,10 @@ func (b *Bucket) ReadDir(name string) ([]fs.DirEntry, error) {
 // List lazily lists a prefix. It yields the first error and stops.
 func (b *Bucket) List(ctx context.Context, name string) iter.Seq2[fs.DirEntry, error] {
 	return func(yield func(fs.DirEntry, error) bool) {
+		if err := ctx.Err(); err != nil {
+			yield(nil, err)
+			return
+		}
 		name = path.Clean(name)
 		if !fs.ValidPath(name) {
 			yield(nil, badpath("readdir", name))

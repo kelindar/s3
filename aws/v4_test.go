@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func init() {
@@ -45,10 +46,11 @@ func setnow(t *testing.T, tm time.Time) {
 
 // test against the example in the documentation
 func TestCanonical(t *testing.T) {
+	previous := sigheaders
 	// use these headers
 	sigheaders = []string{"content-type", "host", "x-amz-date"}
 	defer func() {
-		sigheaders = []string{"host"}
+		sigheaders = previous
 	}()
 
 	req, err := http.NewRequest("GET", "https://iam.amazonaws.com/?Action=ListUsers&Version=2010-05-08 HTTP/1.1", nil)
@@ -73,6 +75,20 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`
 	h := sha256.Sum256(out.Bytes())
 	hstr := hex.EncodeToString(h[:])
 	assert.Equal(t, "f536975d06c0309214f805bb90ccff089219ecd68b2577efef23edd43b7e1a59", hstr)
+}
+
+func TestConditionalHeader(t *testing.T) {
+	req, err := http.NewRequest("PUT", "https://examplebucket.s3.amazonaws.com/test.txt", nil)
+	require.NoError(t, err)
+	req.Header.Set("If-Unmodified-Since", "Tue, 15 Nov 1994 08:12:31 GMT")
+
+	key := DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
+	key.SignV4(req, nil)
+
+	assert.Contains(t, req.Header.Get("Authorization"), "SignedHeaders=host;if-unmodified-since;x-amz-content-sha256;x-amz-date")
+	var out bytes.Buffer
+	canonical(&out, req)
+	assert.Contains(t, out.String(), "if-unmodified-since:Tue, 15 Nov 1994 08:12:31 GMT\n")
 }
 
 // test from

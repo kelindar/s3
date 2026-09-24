@@ -529,7 +529,22 @@ func (m *Server) handlePutObject(w http.ResponseWriter, r *http.Request, key str
 		return
 	}
 
-	etag := m.PutObject(key, content)
+	m.mutex.Lock()
+	current, exists := m.objects[key]
+	if (r.Header.Get("If-None-Match") == "*" && exists) ||
+		(r.Header.Get("If-Match") != "" && (!exists || current.ETag != r.Header.Get("If-Match"))) {
+		m.mutex.Unlock()
+		w.WriteHeader(http.StatusPreconditionFailed)
+		return
+	}
+	etag := generateETag(content)
+	m.objects[key] = &Object{
+		Content:      content,
+		ETag:         etag,
+		LastModified: time.Now().UTC(),
+		ContentType:  detectContentType(key, content),
+	}
+	m.mutex.Unlock()
 
 	w.Header().Set("ETag", etag)
 	w.WriteHeader(http.StatusOK)
