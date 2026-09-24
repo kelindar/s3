@@ -23,6 +23,7 @@ import (
 	"io"
 	"io/fs"
 	"math/rand"
+	"net/http"
 	"os"
 	"path"
 	"strings"
@@ -33,6 +34,7 @@ import (
 	"github.com/kelindar/s3/fsutil"
 	"github.com/kelindar/s3/mock"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // If you have AWS credentials available and a test bucket set up, you can run
@@ -257,7 +259,7 @@ func testWalkGlobRoot(t *testing.T, b *Bucket, prefix string) {
 	assert.True(t, found, "could not find %q in the bucket", name)
 }
 
-func TestBucket_OpenRange(t *testing.T) {
+func TestBucketOpenRange(t *testing.T) {
 	bucket := "test-bucket"
 	mockServer := mock.New(bucket, "us-east-1")
 	defer mockServer.Close()
@@ -288,6 +290,130 @@ func TestBucket_OpenRange(t *testing.T) {
 	// Test OpenRange with root path
 	_, err = b.OpenRange(".", etag, 0, 10)
 	assert.Error(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err = b.OpenRangeContext(ctx, objectKey, etag, 0, 10)
+	assert.ErrorIs(t, err, context.Canceled)
+}
+
+func TestBucketWriteIf(t *testing.T) {
+	const bucket = "test-bucket"
+	mockServer := mock.New(bucket, "us-east-1")
+	defer mockServer.Close()
+
+	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
+	key.BaseURI = mockServer.URL()
+	b := NewBucket(key, bucket)
+
+	const objectKey = "test/conditional.txt"
+	etag := mockServer.PutObject(objectKey, []byte("before"))
+	updated, applied, err := b.WriteIf(context.Background(), objectKey, []byte("after"), IfMatch(etag))
+	assert.NoError(t, err)
+	assert.True(t, applied)
+	assert.NotEmpty(t, updated)
+	contents, exists := mockServer.ObjectContent(objectKey)
+	assert.True(t, exists)
+	assert.Equal(t, []byte("after"), contents)
+
+	_, applied, err = b.WriteIf(context.Background(), objectKey, []byte("stale"), IfMatch(etag))
+	assert.NoError(t, err)
+	assert.False(t, applied)
+	contents, _ = mockServer.ObjectContent(objectKey)
+	assert.Equal(t, []byte("after"), contents)
+
+	created, applied, err := b.WriteIf(context.Background(), "test/new.txt", []byte("new"), IfNoneMatch("*"))
+	assert.NoError(t, err)
+	assert.True(t, applied)
+	assert.NotEmpty(t, created)
+
+	_, applied, err = b.WriteIf(context.Background(), "test/new.txt", []byte("overwrite"), IfNoneMatch("*"))
+	assert.NoError(t, err)
+	assert.False(t, applied)
+
+	_, applied, err = b.WriteIf(context.Background(), objectKey, []byte("custom"), func(header http.Header) error {
+		header.Set("If-Match", updated)
+		return nil
+	})
+	assert.NoError(t, err)
+	assert.True(t, applied)
+	contents, _ = mockServer.ObjectContent(objectKey)
+	assert.Equal(t, []byte("custom"), contents)
+
+	results := make(chan struct {
+		applied bool
+		err     error
+	}, 2)
+	start := make(chan struct{})
+	for _, contents := range []string{"first", "second"} {
+		go func(contents string) {
+			<-start
+			_, applied, err := b.WriteIf(context.Background(), "test/concurrent.txt", []byte(contents), IfNoneMatch("*"))
+			results <- struct {
+				applied bool
+				err     error
+			}{applied, err}
+		}(contents)
+	}
+	close(start)
+	var appliedCount int
+	for range 2 {
+		result := <-results
+		assert.NoError(t, result.err)
+		if result.applied {
+			appliedCount++
+		}
+	}
+	assert.Equal(t, 1, appliedCount)
+
+	for name, condition := range map[string]Condition{
+		"nil":             nil,
+		"no headers":      func(http.Header) error { return nil },
+		"invalid header":  func(header http.Header) error { header.Set("Content-Type", "text/plain"); return nil },
+		"empty ETag":      IfMatch(""),
+		"condition error": func(http.Header) error { return errors.New("reject") },
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, _, err := b.WriteIf(context.Background(), objectKey, []byte("ignored"), condition)
+			assert.Error(t, err)
+		})
+	}
+}
+
+func TestBucketOpenContext(t *testing.T) {
+	const bucket = "test-bucket"
+	mockServer := mock.New(bucket, "us-east-1")
+	defer mockServer.Close()
+
+	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
+	key.BaseURI = mockServer.URL()
+	b := NewBucket(key, bucket)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	dir, err := b.OpenContext(ctx, ".")
+	require.NoError(t, err)
+	prefix, ok := dir.(*Prefix)
+	require.True(t, ok)
+	cancel()
+
+	_, err = prefix.ReadDir(-1)
+	assert.ErrorIs(t, err, context.Canceled)
+
+	ctx, cancel = context.WithCancel(context.Background())
+	serverContent := []byte("context-bound read")
+	mockServer.PutObject("context/read.txt", serverContent)
+	dir, err = b.OpenContext(ctx, "context/")
+	require.NoError(t, err)
+	entries, err := dir.(*Prefix).ReadDir(-1)
+	require.NoError(t, err)
+	require.Len(t, entries, 1)
+	file, ok := entries[0].(*File)
+	require.True(t, ok)
+	cancel()
+	_, err = file.Read(make([]byte, 1))
+	assert.ErrorIs(t, err, context.Canceled)
+	_, err = file.WriteTo(io.Discard)
+	assert.ErrorIs(t, err, context.Canceled)
 }
 
 func TestBucket_Remove(t *testing.T) {
@@ -372,6 +498,8 @@ func TestBucket_DelayGet(t *testing.T) {
 	file, err := b.Open(objectKey)
 	assert.NoError(t, err)
 	defer file.Close()
+	assert.True(t, mockServer.HasRequestWithMethod(http.MethodHead))
+	assert.False(t, mockServer.HasRequestWithMethod(http.MethodGet))
 
 	s3File, ok := file.(*File)
 	assert.True(t, ok)
@@ -383,6 +511,7 @@ func TestBucket_DelayGet(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, 10, n)
 	assert.NotNil(t, s3File.body) // Body should now be populated
+	assert.True(t, mockServer.HasRequestWithMethod(http.MethodGet))
 }
 
 func TestBucket_VisitDir(t *testing.T) {
