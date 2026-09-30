@@ -199,7 +199,7 @@ data, err := io.ReadAll(reader)
 
 ### Multi-part Upload
 
-For large files, you can use the `WriteFrom` method which automatically handles multipart uploads. This method is more convenient than manually managing upload parts:
+`WriteFrom` accepts an `io.ReaderAt` and the object size. It uses a single PUT below `s3.MinPartSize` and multipart upload at or above that size:
 
 ```go
 // Open a large file
@@ -215,7 +215,7 @@ if err != nil {
     panic(err)
 }
 
-// Upload using multipart upload (automatically used for files > 5MB)
+// Upload with WriteFrom; this file uses multipart upload.
 err = bucket.WriteFrom(context.Background(), "large-file.dat", file, stat.Size())
 if err != nil {
     panic(err)
@@ -228,6 +228,29 @@ The `WriteFrom` method automatically:
 - Handles multipart upload initialization and completion
 - Respects context cancellation for upload control
 
+### Compose Objects
+
+`Compose` joins byte ranges from existing objects with server-side copy. Each `s3.CopyPart` names the source key, its ETag, the offset, and the size. Every part must be at least `s3.MinPartSize`; `Compose` returns the new object's ETag.
+
+```go
+ctx := context.Background()
+part := make([]byte, s3.MinPartSize)
+sourceETag, err := bucket.Write(ctx, "part-1", part)
+if err != nil {
+    panic(err)
+}
+
+etag, err := bucket.Compose(ctx, "combined", []s3.CopyPart{{
+    SourceKey: "part-1",
+    ETag:      sourceETag,
+    Offset:    0,
+    Size:      int64(len(part)),
+}})
+if err != nil {
+    panic(err)
+}
+fmt.Printf("Composed with ETag: %s\n", etag)
+```
 
 ### Working with Subdirectories
 

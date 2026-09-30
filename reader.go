@@ -33,6 +33,7 @@ import (
 	"time"
 
 	"github.com/kelindar/s3/aws"
+	"github.com/valyala/fasthttp"
 )
 
 var (
@@ -299,17 +300,20 @@ func (r *Reader) requestContext() context.Context {
 }
 
 func (r *Reader) rangeReaderContext(ctx context.Context, off, width int64) (io.ReadCloser, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", uri(r.Key, r.Bucket, r.Path), nil)
-	if err != nil {
-		return nil, err
-	}
+	req := fasthttp.AcquireRequest()
+	defer fasthttp.ReleaseRequest(req)
+	req.SetRequestURI(uri(r.Key, r.Bucket, r.Path))
+	req.Header.SetMethod(fasthttp.MethodGet)
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", off, off+width-1))
+	var headers [1][2]string
+	count := 0
 	if r.ETag != "" {
-		req.Header.Set("If-Match", r.ETag)
+		headers[0] = [2]string{"if-match", r.ETag}
+		count++
 	}
-	r.Key.SignV4(req, nil)
+	signRequest(r.Key, req, nil, headers[:count]...)
 
-	res, err := flakyDo(req, nil)
+	res, err := flakyFast(ctx, req)
 	if err != nil {
 		return nil, err
 	}

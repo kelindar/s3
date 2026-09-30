@@ -172,24 +172,38 @@ func TestSignV4Readers(t *testing.T) {
 }
 
 func TestSignV4Raw(t *testing.T) {
+	many := make([][2]string, 20)
+	for i := range many {
+		many[i] = [2]string{"if-custom-" + strconv.Itoa(i), "value"}
+	}
 	for _, test := range []struct {
 		name, token, uri string
 		body             []byte
+		headers          [][2]string
 	}{
 		{name: "root", uri: "https://bucket.example.com"},
 		{name: "payload", uri: "https://bucket.example.com/a%20b?partNumber=1&uploadId=id", body: []byte("part contents")},
 		{name: "token", uri: "https://bucket.example.com/a%20b?partNumber=1&uploadId=id", token: "session-token", body: []byte("part contents")},
+		{name: "conditions", uri: "https://bucket.example.com/object", headers: [][2]string{{"if-unmodified-since", "Tue, 15 Nov 1994 08:12:31 GMT"}, {"if-match", `"etag"`}, {"if-none-match", "*"}}},
+		{name: "copy", uri: "https://bucket.example.com/object?partNumber=1&uploadId=id", token: "session-token", headers: [][2]string{{"x-amz-copy-source-range", "bytes=0-5242879"}, {"x-amz-copy-source", "/bucket/a%20b%25"}, {"x-amz-copy-source-if-match", `"etag"`}}},
+		{name: "many conditions", uri: "https://bucket.example.com/object", headers: many},
+		{name: "empty condition", uri: "https://bucket.example.com/object", headers: [][2]string{{"if-match", ""}}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			key := DeriveKey("", "access", "secret", "us-east-1", "s3")
 			key.Token = test.token
 			req, err := http.NewRequest(http.MethodPut, test.uri, nil)
 			require.NoError(t, err)
+			for _, header := range test.headers {
+				req.Header.Set(header[0], header[1])
+			}
+			retained := append([][2]string(nil), test.headers...)
 			key.SignV4(req, test.body)
-			date, hash, auth := key.SignV4Raw(req.Method, req.URL.EscapedPath(), req.URL.RawQuery, req.Host, test.body)
+			date, hash, auth := key.SignV4Raw(req.Method, req.URL.EscapedPath(), req.URL.RawQuery, req.Host, test.body, test.headers...)
 			assert.Equal(t, req.Header.Get("X-Amz-Date"), date)
 			assert.Equal(t, req.Header.Get("X-Amz-Content-Sha256"), hash)
 			assert.Equal(t, req.Header.Get("Authorization"), auth)
+			assert.Equal(t, retained, test.headers, "signing must not modify caller-owned header pairs")
 		})
 	}
 }

@@ -297,11 +297,12 @@ func (s *SigningKey) SignV4(req *http.Request, body []byte) {
 	}
 }
 
-// SignV4Raw signs a request whose only signed headers are host, the S3 payload
-// hash, date, and optional security token. path must already be escaped and
-// query must already be in canonical order. The caller sets the returned date,
-// payload hash, and authorization headers, plus X-Amz-Security-Token when set.
-func (s *SigningKey) SignV4Raw(method, path, query, host string, body []byte) (date, payloadHash, authorization string) {
+// SignV4Raw signs host, the S3 payload hash, date, optional security token, and
+// extra header name/value pairs. Extra names must be lowercase and must not
+// repeat those mandatory headers. Pairs may be unordered and are not modified
+// or retained. path must be escaped and query must be in canonical order.
+// The caller sets the returned headers and X-Amz-Security-Token when set.
+func (s *SigningKey) SignV4Raw(method, path, query, host string, body []byte, extra ...[2]string) (date, payloadHash, authorization string) {
 	var storage [512]byte
 	buf := bytes.NewBuffer(storage[:0])
 	now := signtime().UTC()
@@ -312,10 +313,22 @@ func (s *SigningKey) SignV4Raw(method, path, query, host string, body []byte) (d
 	if body == nil {
 		payloadHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 	}
-	const baseHeaders = "host;x-amz-content-sha256;x-amz-date"
-	headers := baseHeaders
+	var headerStorage [16][2]string
+	headers := headerStorage[:3]
+	// Write host and date directly so temporary byte-to-string conversions stay on the stack.
+	headers[0] = [2]string{"host", ""}
+	headers[1] = [2]string{"x-amz-content-sha256", payloadHash}
+	headers[2] = [2]string{"x-amz-date", ""}
 	if s.Token != "" {
-		headers += ";x-amz-security-token"
+		headers = append(headers, [2]string{"x-amz-security-token", s.Token})
+	}
+	for _, header := range extra {
+		if header[1] != "" {
+			headers = append(headers, header)
+		}
+	}
+	if len(extra) > 0 {
+		slices.SortFunc(headers, func(a, b [2]string) int { return strings.Compare(a[0], b[0]) })
 	}
 
 	buf.WriteString(method)
@@ -323,20 +336,27 @@ func (s *SigningKey) SignV4Raw(method, path, query, host string, body []byte) (d
 	buf.WriteString(path)
 	buf.WriteByte('\n')
 	buf.WriteString(query)
-	buf.WriteString("\nhost:")
-	buf.WriteString(host)
-	buf.WriteString("\nx-amz-content-sha256:")
-	buf.WriteString(payloadHash)
-	buf.WriteString("\nx-amz-date:")
-	buf.Write(stamp)
 	buf.WriteByte('\n')
-	if s.Token != "" {
-		buf.WriteString("x-amz-security-token:")
-		buf.WriteString(s.Token)
+	for _, header := range headers {
+		buf.WriteString(header[0])
+		buf.WriteByte(':')
+		switch header[0] {
+		case "host":
+			buf.WriteString(host)
+		case "x-amz-date":
+			buf.Write(stamp)
+		default:
+			buf.WriteString(header[1])
+		}
 		buf.WriteByte('\n')
 	}
 	buf.WriteByte('\n')
-	buf.WriteString(headers)
+	for i, header := range headers {
+		if i > 0 {
+			buf.WriteByte(';')
+		}
+		buf.WriteString(header[0])
+	}
 	buf.WriteByte('\n')
 	buf.WriteString(payloadHash)
 
@@ -355,7 +375,12 @@ func (s *SigningKey) SignV4Raw(method, path, query, host string, body []byte) (d
 	buf.WriteByte('/')
 	s.toscope(buf, stamp[:8])
 	buf.WriteString(", SignedHeaders=")
-	buf.WriteString(headers)
+	for i, header := range headers {
+		if i > 0 {
+			buf.WriteByte(';')
+		}
+		buf.WriteString(header[0])
+	}
 	buf.WriteString(", Signature=")
 	buf.Write(hexbuf[:])
 	result := buf.String()

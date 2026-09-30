@@ -1,12 +1,12 @@
 package s3
 
 import (
-	"bytes"
 	"context"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -18,6 +18,96 @@ import (
 )
 
 func TestClient(t *testing.T) {
+	t.Run("conditional retry", func(t *testing.T) {
+		var attempts atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "match", r.Header.Get("If-Match"))
+			assert.Equal(t, "Tue, 15 Nov 1994 08:12:31 GMT", r.Header.Get("If-Unmodified-Since"))
+			assert.Contains(t, r.Header.Get("Authorization"), "SignedHeaders=host;if-match;if-unmodified-since;x-amz-content-sha256;x-amz-date")
+			body, err := io.ReadAll(r.Body)
+			assert.NoError(t, err)
+			assert.Equal(t, "payload", string(body))
+			if attempts.Add(1) == 1 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+				_, _ = io.WriteString(w, "retry")
+				return
+			}
+			w.Header().Set("ETag", "updated")
+		}))
+		defer server.Close()
+		key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
+		etag, applied, err := NewBucket(key, "bucket").WriteIf(context.Background(), "object", []byte("payload"), func(header http.Header) error {
+			header.Set("If-Match", "match")
+			header.Set("If-Unmodified-Since", "Tue, 15 Nov 1994 08:12:31 GMT")
+			return nil
+		})
+		require.NoError(t, err)
+		assert.True(t, applied)
+		assert.Equal(t, "updated", etag)
+		assert.EqualValues(t, 2, attempts.Load())
+	})
+
+	t.Run("range headers", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "bytes=2-4", r.Header.Get("Range"))
+			assert.Equal(t, "match", r.Header.Get("If-Match"))
+			assert.Contains(t, r.Header.Get("Authorization"), "SignedHeaders=host;if-match;x-amz-content-sha256;x-amz-date")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = io.WriteString(w, "cde")
+		}))
+		defer server.Close()
+		key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
+		reader := &Reader{Key: key, Bucket: "bucket", Path: "object", ETag: "match"}
+		body, err := reader.RangeReader(2, 3)
+		require.NoError(t, err)
+		defer body.Close()
+		contents, err := io.ReadAll(body)
+		require.NoError(t, err)
+		assert.Equal(t, "cde", string(contents))
+	})
+
+	t.Run("copy headers and retry", func(t *testing.T) {
+		var attempts atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "id+/=", r.URL.Query().Get("uploadId"))
+			assert.Equal(t, "/bucket/a%20b%25", r.Header.Get("X-Amz-Copy-Source"))
+			assert.Equal(t, "match", r.Header.Get("X-Amz-Copy-Source-If-Match"))
+			assert.Equal(t, "bytes=1-5242880", r.Header.Get("X-Amz-Copy-Source-Range"))
+			assert.Contains(t, r.Header.Get("Authorization"), "SignedHeaders=host;x-amz-content-sha256;x-amz-copy-source;x-amz-copy-source-if-match;x-amz-copy-source-range;x-amz-date")
+			if attempts.Add(1) == 1 {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = io.WriteString(w, "retry")
+				return
+			}
+			_, _ = io.WriteString(w, `<CopyPartResult><ETag>copied</ETag></CopyPartResult>`)
+		}))
+		defer server.Close()
+		key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
+		u := &uploader{Key: key, Bucket: "bucket", Object: "object", Scheme: "http", Host: strings.TrimPrefix(server.URL, "http://"), id: "id+/=", started: true}
+		require.NoError(t, u.CopyFrom(context.Background(), 1, &Reader{Bucket: "bucket", Path: "a b%", ETag: "match", Size: MinPartSize + 1}, 1, MinPartSize+1))
+		u.bg.Wait()
+		require.NoError(t, u.asyncerr)
+		require.Len(t, u.parts, 1)
+		assert.Equal(t, "copied", u.parts[0].ETag)
+		assert.EqualValues(t, 2, attempts.Load())
+	})
+
+	t.Run("abort does not retry", func(t *testing.T) {
+		var attempts atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			attempts.Add(1)
+			assert.Equal(t, http.MethodDelete, r.Method)
+			assert.Equal(t, "id+/=", r.URL.Query().Get("uploadId"))
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}))
+		defer server.Close()
+		key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
+		u := &uploader{Key: key, Bucket: "bucket", Object: "object", Scheme: "http", Host: strings.TrimPrefix(server.URL, "http://"), id: "id+/=", started: true}
+		assert.Error(t, u.Abort(context.Background()))
+		assert.EqualValues(t, 1, attempts.Load())
+		assert.True(t, u.started)
+	})
+
 	t.Run("connection reuse", func(t *testing.T) {
 		for _, name := range []string{"background", "cancel", "deadline"} {
 			t.Run(name, func(t *testing.T) {
@@ -101,9 +191,10 @@ func TestClient(t *testing.T) {
 		}))
 		defer server.Close()
 		defer close(release)
-		req, err := http.NewRequest(http.MethodGet, server.URL, nil)
-		require.NoError(t, err)
-		res, err := doFast(req, nil)
+		req := fasthttp.AcquireRequest()
+		defer fasthttp.ReleaseRequest(req)
+		req.SetRequestURI(server.URL)
+		res, err := doFastRequest(context.Background(), req)
 		assert.Nil(t, res)
 		assert.ErrorIs(t, err, fasthttp.ErrTimeout)
 	})
@@ -314,10 +405,11 @@ func TestClient(t *testing.T) {
 			_, _ = w.Write([]byte("payload"))
 		}))
 		defer server.Close()
-		req, err := http.NewRequest(http.MethodGet, server.URL+"/a/../b%2Fc", nil)
-		require.NoError(t, err)
+		req := fasthttp.AcquireRequest()
+		defer fasthttp.ReleaseRequest(req)
+		req.SetRequestURI(server.URL + "/a/../b%2Fc")
 		req.Header.Set("If-Match", "match")
-		res, err := doFast(req, nil)
+		res, err := doFastRequest(context.Background(), req)
 		require.NoError(t, err)
 		defer res.Body.Close()
 		assert.Equal(t, http.StatusOK, res.StatusCode)
@@ -332,28 +424,6 @@ func TestClient(t *testing.T) {
 	})
 
 	t.Run("retry body", func(t *testing.T) {
-		var attempts atomic.Int32
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			body, err := io.ReadAll(r.Body)
-			assert.NoError(t, err)
-			assert.Equal(t, []byte("payload"), body)
-			if attempts.Add(1) == 1 {
-				w.WriteHeader(http.StatusServiceUnavailable)
-				return
-			}
-			w.WriteHeader(http.StatusOK)
-		}))
-		defer server.Close()
-		req, err := http.NewRequest(http.MethodPut, server.URL, bytes.NewReader([]byte("payload")))
-		require.NoError(t, err)
-		res, err := flakyDo(req, []byte("payload"))
-		require.NoError(t, err)
-		defer res.Body.Close()
-		assert.Equal(t, http.StatusOK, res.StatusCode)
-		assert.Equal(t, int32(2), attempts.Load())
-	})
-
-	t.Run("native retry body", func(t *testing.T) {
 		var attempts atomic.Int32
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			body, err := io.ReadAll(r.Body)
@@ -380,9 +450,10 @@ func TestClient(t *testing.T) {
 		defer server.Close()
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
 		defer cancel()
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL, nil)
-		require.NoError(t, err)
-		res, err := doFast(req, nil)
+		req := fasthttp.AcquireRequest()
+		defer fasthttp.ReleaseRequest(req)
+		req.SetRequestURI(server.URL)
+		res, err := doFastRequest(ctx, req)
 		assert.Nil(t, res)
 		require.Error(t, err)
 		assert.ErrorIs(t, ctx.Err(), context.DeadlineExceeded)
@@ -394,9 +465,10 @@ func TestClient(t *testing.T) {
 		}))
 		defer server.Close()
 		ctx, cancel := context.WithCancel(context.Background())
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL, nil)
-		require.NoError(t, err)
-		res, err := doFast(req, nil)
+		req := fasthttp.AcquireRequest()
+		defer fasthttp.ReleaseRequest(req)
+		req.SetRequestURI(server.URL)
+		res, err := doFastRequest(ctx, req)
 		require.NoError(t, err)
 		cancel()
 		var one [1]byte
@@ -417,11 +489,12 @@ func TestClient(t *testing.T) {
 		defer close(release)
 		ctx, cancel := context.WithCancel(context.Background())
 		defer cancel()
-		req, err := http.NewRequestWithContext(ctx, http.MethodGet, server.URL, nil)
-		require.NoError(t, err)
+		req := fasthttp.AcquireRequest()
+		defer fasthttp.ReleaseRequest(req)
+		req.SetRequestURI(server.URL)
 		finished := make(chan error, 1)
 		go func() {
-			res, err := doFast(req, nil)
+			res, err := doFastRequest(ctx, req)
 			if res != nil {
 				_ = res.Body.Close()
 			}

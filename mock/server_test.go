@@ -218,6 +218,29 @@ func TestCopyPartChecksum(t *testing.T) {
 	}
 }
 
+func TestCopySource(t *testing.T) {
+	for _, key := range []string{"folder/a b+&☃", "folder/literal%2Fkey"} {
+		t.Run(key, func(t *testing.T) {
+			content := []byte("payload")
+			m := &Server{bucket: "test", objects: map[string]*Object{key: {Content: content, ETag: generateETag(content)}}}
+			upload := &Multipart{Parts: make(map[int]*PartInfo)}
+			res := httptest.NewRecorder()
+			m.handleCopyPart(res, httptest.NewRequest(http.MethodPut, "/test/target", nil), upload, 1, "/test/"+url.PathEscape(key))
+			require.Equal(t, http.StatusOK, res.Code)
+			require.Contains(t, upload.Parts, 1)
+			assert.Equal(t, content, upload.Parts[1].Content)
+		})
+	}
+	t.Run("invalid escape", func(t *testing.T) {
+		m := &Server{bucket: "test"}
+		upload := &Multipart{Parts: make(map[int]*PartInfo)}
+		res := httptest.NewRecorder()
+		m.handleCopyPart(res, httptest.NewRequest(http.MethodPut, "/test/target", nil), upload, 1, "/test/invalid%zz")
+		assert.Equal(t, http.StatusBadRequest, res.Code)
+		assert.Empty(t, upload.Parts)
+	})
+}
+
 func TestWriteMultipartXML(t *testing.T) {
 	var body bytes.Buffer
 	require.NoError(t, writeXMLFields(&body, "InitiateMultipartUploadResult",

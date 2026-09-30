@@ -53,14 +53,10 @@ func TestS3Operations(t *testing.T) {
     key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
     key.BaseURI = mockServer.URL()
 
-    bucket := &s3.BucketFS{
-        Key:    key,
-        Bucket: "test-bucket",
-        Ctx:    context.Background(),
-    }
+    bucket := s3.NewBucket(key, "test-bucket")
 
     // Test operations
-    etag, err := bucket.Put("test.txt", []byte("Hello, World!"))
+    etag, err := bucket.Write(context.Background(), "test.txt", []byte("Hello, World!"))
     assert.NoError(t, err)
     assert.NotEmpty(t, etag)
 
@@ -239,7 +235,7 @@ mockServer.EnableErrorSimulation(mock.ErrorSimulation{
 })
 
 // Test error handling
-_, err := bucket.Put("test.txt", []byte("content"))
+_, err := bucket.Write(context.Background(), "test.txt", []byte("content"))
 // err may or may not be nil depending on simulation
 
 // Enable different types of errors
@@ -270,40 +266,35 @@ mockServer.PutObject("large-file.bin", largeContent)
 
 ### Multipart Upload Testing
 ```go
-uploader := &s3.Uploader{
-    Key:    key,
-    Bucket: "test-bucket",
-    Object: "large-file.bin",
-}
+import (
+    "bytes"
+    "context"
+)
 
-err := uploader.Start()
+bucket := s3.NewBucket(key, "test-bucket")
+data := make([]byte, 2*s3.MinPartSize)
+err := bucket.WriteFrom(context.Background(), "large-file.bin", bytes.NewReader(data), int64(len(data)))
 assert.NoError(t, err)
-
-// Upload ID is now available in mock server
-uploadID := uploader.ID()
-upload, exists := mockServer.GetMultipartUpload(uploadID)
-assert.True(t, exists)
-assert.Equal(t, "large-file.bin", upload.Key)
-
-// Upload parts
-part1Data := make([]byte, s3.MinPartSize)
-part2Data := make([]byte, s3.MinPartSize)
-
-err = uploader.Upload(1, part1Data)
-assert.NoError(t, err)
-err = uploader.Upload(2, part2Data)
-assert.NoError(t, err)
-
-// Complete upload
-err = uploader.Close(nil)
-assert.NoError(t, err)
-
-// Verify object exists in mock server
 assert.True(t, mockServer.ObjectExists("large-file.bin"))
+```
 
-// Verify upload was cleaned up
-_, exists = mockServer.GetMultipartUpload(uploadID)
-assert.False(t, exists)
+### Compose Testing
+```go
+bucket := s3.NewBucket(key, "test-bucket")
+ctx := context.Background()
+part := make([]byte, s3.MinPartSize)
+sourceETag, err := bucket.Write(ctx, "part-1", part)
+assert.NoError(t, err)
+
+etag, err := bucket.Compose(ctx, "combined.bin", []s3.CopyPart{{
+    SourceKey: "part-1",
+    ETag:      sourceETag,
+    Offset:    0,
+    Size:      int64(len(part)),
+}})
+assert.NoError(t, err)
+assert.NotEmpty(t, etag)
+assert.True(t, mockServer.ObjectExists("combined.bin"))
 ```
 
 ## Thread Safety

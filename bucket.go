@@ -28,6 +28,7 @@ import (
 
 	"github.com/kelindar/s3/aws"
 	"github.com/kelindar/s3/fsutil"
+	"github.com/valyala/fasthttp"
 )
 
 // Bucket implements fs.FS, fs.ReadDirFS, and fs.SubFS.
@@ -147,19 +148,31 @@ func (b *Bucket) write(ctx context.Context, key string, contents []byte, conditi
 	if condition == nil {
 		res, err = doSigned(ctx, b.key, http.MethodPut, uri(b.key, b.bkt, key), contents)
 	} else {
-		req, err := http.NewRequestWithContext(ctx, http.MethodPut, uri(b.key, b.bkt, key), nil)
-		if err != nil {
-			return "", false, err
+		switch {
+		case ctx == nil:
+			return "", false, errors.New("s3 request: nil context")
+		case ctx.Err() != nil:
+			return "", false, ctx.Err()
 		}
-		if err := condition(req.Header); err != nil {
+		header := make(http.Header)
+		if err := condition(header); err != nil {
 			return "", false, fmt.Errorf("s3 PUT condition: %w", err)
 		}
-		if err := validateCondition(req.Header); err != nil {
+		if err := validateCondition(header); err != nil {
 			return "", false, err
 		}
-		ifMatch = req.Header.Get("If-Match")
-		b.key.SignV4(req, contents)
-		res, err = flakyDo(req, contents)
+		ifMatch = header.Get("If-Match")
+		req := fasthttp.AcquireRequest()
+		defer fasthttp.ReleaseRequest(req)
+		req.SetRequestURI(uri(b.key, b.bkt, key))
+		req.Header.SetMethod(fasthttp.MethodPut)
+		var storage [8][2]string
+		headers := storage[:0]
+		for name, values := range header {
+			headers = append(headers, [2]string{strings.ToLower(name), values[0]})
+		}
+		signRequest(b.key, req, contents, headers...)
+		res, err = flakyFast(ctx, req)
 	}
 	if err != nil {
 		return "", false, err

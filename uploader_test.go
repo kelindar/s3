@@ -19,6 +19,9 @@ import (
 	"context"
 	"encoding/xml"
 	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/kelindar/s3/aws"
@@ -61,13 +64,52 @@ func TestSignedRequest(t *testing.T) {
 			key.Token = "session-token"
 			u := &uploader{Key: key, Bucket: "bucket", Object: "folder/a b+%&☃", Scheme: test.scheme, Host: test.host}
 			query := "partNumber=1&uploadId=id"
-			want := u.req(context.Background(), "PUT", u.Object, query)
+			host := test.host
+			path := "/bucket/folder/a%20b%2B%25%26%E2%98%83"
+			if test.baseURI == "" {
+				host = "bucket." + host
+				path = "/folder/a%20b%2B%25%26%E2%98%83"
+			}
 			got := u.signedRequest(fasthttp.MethodPut, query, []byte("contents"))
 			defer fasthttp.ReleaseRequest(got)
-			assert.Equal(t, want.URL.String(), string(got.URI().FullURI()))
-			assert.Equal(t, want.Host, string(got.Header.Host()))
+			assert.Equal(t, test.scheme+"://"+host+path+"?"+query, string(got.URI().FullURI()))
+			assert.Equal(t, host, string(got.Header.Host()))
 			assert.Equal(t, query, string(got.URI().QueryString()))
 			assert.Equal(t, "session-token", string(got.Header.Peek("X-Amz-Security-Token")))
+		})
+	}
+}
+
+func TestMultipartQueries(t *testing.T) {
+	for _, operation := range []string{"part", "complete", "abort"} {
+		t.Run(operation, func(t *testing.T) {
+			const uploadID = "id+/="
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, uploadID, r.URL.Query().Get("uploadId"))
+				assert.NotContains(t, r.URL.RawQuery, "+")
+				_, _ = io.Copy(io.Discard, r.Body)
+				switch r.Method {
+				case http.MethodPut:
+					w.Header().Set("ETag", `"part"`)
+				case http.MethodPost:
+					_, _ = io.WriteString(w, `<CompleteMultipartUploadResult><ETag>complete</ETag></CompleteMultipartUploadResult>`)
+				case http.MethodDelete:
+					w.WriteHeader(http.StatusNoContent)
+				}
+			}))
+			defer server.Close()
+			key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
+			u := &uploader{Key: key, Bucket: "bucket", Object: "object", Scheme: "http", Host: strings.TrimPrefix(server.URL, "http://"), id: uploadID, started: true}
+			var err error
+			switch operation {
+			case "part":
+				err = u.upload(context.Background(), 1, []byte("contents"))
+			case "complete":
+				err = u.Close(context.Background(), nil)
+			case "abort":
+				err = u.Abort(context.Background())
+			}
+			require.NoError(t, err)
 		})
 	}
 }
@@ -347,7 +389,7 @@ func TestUploader(t *testing.T) {
 		// Test Upload before Start
 		data := make([]byte, MinPartSize)
 		assert.Panics(t, func() {
-			u.Upload(1, data)
+			u.uploadWithContext(context.Background(), 1, data)
 		})
 
 		// Start uploader
@@ -355,12 +397,12 @@ func TestUploader(t *testing.T) {
 
 		// Test Upload with data too small
 		smallData := make([]byte, MinPartSize-1)
-		err := u.Upload(1, smallData)
+		err := u.uploadWithContext(context.Background(), 1, smallData)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "below min part size")
 
 		// Test valid Upload
-		assert.NoError(t, u.Upload(1, data))
+		assert.NoError(t, u.uploadWithContext(context.Background(), 1, data))
 	})
 
 	t.Run("close validation", func(t *testing.T) {
@@ -386,7 +428,7 @@ func TestUploader(t *testing.T) {
 		assert.NoError(t, uploader.Start(context.Background()))
 
 		data := make([]byte, MinPartSize)
-		assert.NoError(t, uploader.Upload(1, data))
+		assert.NoError(t, uploader.uploadWithContext(context.Background(), 1, data))
 
 		// Test valid Close
 		assert.NoError(t, uploader.Close(context.Background(), []byte("final data")))
@@ -416,7 +458,7 @@ func TestUploader(t *testing.T) {
 
 		// Start uploader
 		assert.NoError(t, u.Start(context.Background()))
-		uploadID := u.ID()
+		uploadID := u.id
 
 		// Verify upload exists
 		_, exists := mockServer.GetMultipartUpload(uploadID)
@@ -424,7 +466,7 @@ func TestUploader(t *testing.T) {
 
 		// Upload a part
 		data := make([]byte, MinPartSize)
-		assert.NoError(t, u.Upload(1, data))
+		assert.NoError(t, u.uploadWithContext(context.Background(), 1, data))
 
 		// Test Abort
 		assert.NoError(t, u.Abort(context.Background()))
@@ -440,7 +482,7 @@ func TestUploader(t *testing.T) {
 			Object: "test/abort-test2.bin",
 		}
 		assert.NoError(t, u2.Start(context.Background()))
-		assert.NoError(t, u2.Upload(1, data))
+		assert.NoError(t, u2.uploadWithContext(context.Background(), 1, data))
 		assert.NoError(t, u2.Close(context.Background(), nil))
 
 		// Abort should do nothing after successful close
@@ -603,7 +645,7 @@ func TestUploader(t *testing.T) {
 
 		// Upload a part
 		data := make([]byte, MinPartSize)
-		assert.NoError(t, uploader.Upload(1, data))
+		assert.NoError(t, uploader.uploadWithContext(context.Background(), 1, data))
 
 		// Close uploader
 		assert.NoError(t, uploader.Close(context.Background(), nil))
@@ -649,9 +691,9 @@ func TestUploader(t *testing.T) {
 		}
 
 		// Upload in order: 3, 1, 2
-		assert.NoError(t, uploader.Upload(3, data3))
-		assert.NoError(t, uploader.Upload(1, data1))
-		assert.NoError(t, uploader.Upload(2, data2))
+		assert.NoError(t, uploader.uploadWithContext(context.Background(), 3, data3))
+		assert.NoError(t, uploader.uploadWithContext(context.Background(), 1, data1))
+		assert.NoError(t, uploader.uploadWithContext(context.Background(), 2, data2))
 
 		// Close uploader
 		assert.NoError(t, uploader.Close(context.Background(), nil))
@@ -691,29 +733,11 @@ func TestUploader(t *testing.T) {
 		assert.NoError(t, u.Start(context.Background()))
 
 		data := make([]byte, MinPartSize)
-		assert.NoError(t, u.Upload(1, data))
+		assert.NoError(t, u.uploadWithContext(context.Background(), 1, data))
 
 		// Close with empty final part
 		assert.NoError(t, u.Close(context.Background(), nil))
 		assert.True(t, mockServer.ObjectExists("test/empty-final.bin"))
 
-		// Test Size() before Close
-		u2 := &uploader{
-			Key:    key,
-			Bucket: bucket,
-			Object: "test/size-before-close.bin",
-		}
-
-		assert.NoError(t, u2.Start(context.Background()))
-
-		// Size should be 0 before Close
-		assert.Equal(t, int64(0), u2.Size())
-
-		assert.NoError(t, u2.Upload(1, data))
-
-		// Size should still be 0 before Close
-		assert.Equal(t, int64(0), u2.Size())
-		assert.NoError(t, u2.Close(context.Background(), nil))
-		assert.Equal(t, int64(len(data)), u2.Size())
 	})
 }

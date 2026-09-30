@@ -6,10 +6,30 @@ import (
 
 	"github.com/kelindar/s3/aws"
 	"github.com/kelindar/s3/mock"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
 func TestCompose(t *testing.T) {
+	t.Run("escaped source key", func(t *testing.T) {
+		server := mock.New("test-bucket", "us-east-1")
+		defer server.Close()
+		key := aws.DeriveKey(server.URL(), "access", "secret", "us-east-1", "s3")
+		bucket := NewBucket(key, "test-bucket")
+		contents := make([]byte, MinPartSize)
+		source := "folder/100% a+&☃"
+		etag := server.PutObject(source, contents)
+
+		_, err := bucket.Compose(context.Background(), "output", []CopyPart{{SourceKey: source, ETag: etag, Size: int64(len(contents))}})
+		require.NoError(t, err)
+		stored, found := server.ObjectContent("output")
+		require.True(t, found)
+		assert.Equal(t, contents, stored)
+		requests := server.GetRequestsWithMethod("PUT")
+		require.Len(t, requests, 1)
+		assert.Equal(t, "/test-bucket/folder/100%25%20a%2B%26%E2%98%83", requests[0].Headers["X-Amz-Copy-Source"])
+	})
+
 	t.Run("merges parts", func(t *testing.T) {
 		server := mock.New("test-bucket", "us-east-1")
 		defer server.Close()

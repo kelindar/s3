@@ -50,9 +50,9 @@ func acquireConn(ctx context.Context, host *fasthttp.HostClient, connectionClose
 		return connLease{Conn: conn.Conn(), release: func(discard bool) {
 			if discard {
 				host.CloseConn(conn)
-			} else {
-				host.ReleaseConn(conn)
+				return
 			}
+			host.ReleaseConn(conn)
 		}}, nil
 	}
 	if ctx.Done() == nil {
@@ -183,17 +183,16 @@ type responseBody struct {
 func (b *responseBody) Read(p []byte) (int, error) {
 	b.readLock.Lock()
 	defer b.readLock.Unlock()
+	var n int
+	var err error
 	switch {
 	case b.closed.Load():
 		return 0, io.ErrClosedPipe
 	case b.ctx.Err() != nil:
 		return 0, b.ctx.Err()
-	}
-	var n int
-	var err error
-	if b.stream != nil {
+	case b.stream != nil:
 		n, err = b.stream.Read(p)
-	} else {
+	default:
 		n, err = b.buffer.Read(p)
 	}
 	if err != nil {
@@ -243,7 +242,7 @@ func (b *responseBody) Close() error {
 	return b.err
 }
 
-func signRequest(key *aws.SigningKey, req *fasthttp.Request, body []byte) {
+func signRequest(key *aws.SigningKey, req *fasthttp.Request, body []byte, headers ...[2]string) {
 	uri := req.URI()
 	uri.DisablePathNormalizing = true
 	host := req.Header.Host()
@@ -251,7 +250,10 @@ func signRequest(key *aws.SigningKey, req *fasthttp.Request, body []byte) {
 		host = uri.Host()
 		req.Header.SetHostBytes(host)
 	}
-	date, hash, auth := key.SignV4Raw(string(req.Header.Method()), string(uri.PathOriginal()), string(uri.QueryString()), string(host), body)
+	for _, header := range headers {
+		req.Header.Set(header[0], header[1])
+	}
+	date, hash, auth := key.SignV4Raw(string(req.Header.Method()), string(uri.PathOriginal()), string(uri.QueryString()), string(host), body, headers...)
 	req.Header.Set("X-Amz-Date", date)
 	req.Header.Set("X-Amz-Content-Sha256", hash)
 	if key.Token != "" {
@@ -278,32 +280,6 @@ func doSigned(ctx context.Context, key *aws.SigningKey, method, uri string, body
 	return flakyFast(ctx, req)
 }
 
-func doFast(req *http.Request, body []byte) (*response, error) {
-	ctx := req.Context()
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if req.Body != nil {
-		defer req.Body.Close()
-	}
-	fastReq := fasthttp.AcquireRequest()
-	defer fasthttp.ReleaseRequest(fastReq)
-	fastReq.SetRequestURI(req.URL.String())
-	fastReq.Header.SetMethod(req.Method)
-	if req.Host != "" {
-		fastReq.Header.SetHost(req.Host)
-	}
-	for name, values := range req.Header {
-		for _, value := range values {
-			fastReq.Header.Add(name, value)
-		}
-	}
-	if body != nil {
-		fastReq.SetBodyRaw(body)
-	}
-	return doFastRequest(ctx, fastReq)
-}
-
 func doFastRequest(ctx context.Context, fastReq *fasthttp.Request) (*response, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -317,13 +293,13 @@ func doFastRequest(ctx context.Context, fastReq *fasthttp.Request) (*response, e
 	fastReq.SetUserValue("s3.body", res.Body)
 	// Request cleanup must not close the response body owned by the caller.
 	defer fastReq.RemoveUserValue("s3.body")
-	if err := defaultClient.Do(fastReq, fastRes); err != nil {
+	switch err := defaultClient.Do(fastReq, fastRes); {
+	case err != nil:
 		_ = res.Body.Close()
 		return nil, requestError(ctx, err)
-	}
-	if err := ctx.Err(); err != nil {
+	case ctx.Err() != nil:
 		_ = res.Body.Close()
-		return nil, err
+		return nil, ctx.Err()
 	}
 	res.StatusCode = fastRes.StatusCode()
 	res.ContentLength = int64(fastRes.Header.ContentLength())
@@ -332,27 +308,6 @@ func doFastRequest(ctx context.Context, fastReq *fasthttp.Request) (*response, e
 		res.Body.buffer.Reset(fastRes.Body())
 	}
 	return res, nil
-}
-
-func flakyDo(req *http.Request, body []byte) (*response, error) {
-	hasBody := req.Body != nil
-	res, err := doFast(req, body)
-	switch {
-	case err == nil && res.StatusCode != 500 && res.StatusCode != 503:
-		return res, nil
-	case hasBody && req.GetBody == nil:
-		return res, err
-	}
-	if res != nil {
-		_ = res.Body.Close()
-	}
-	if hasBody {
-		req.Body, err = req.GetBody()
-		if err != nil {
-			return nil, fmt.Errorf("req.GetBody: %w", err)
-		}
-	}
-	return doFast(req, body)
 }
 
 func flakyFast(ctx context.Context, req *fasthttp.Request) (*response, error) {

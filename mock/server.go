@@ -1258,6 +1258,11 @@ func (m *Server) handleCopyPart(w http.ResponseWriter, r *http.Request, upload *
 		m.writeErrorResponse(w, "NoSuchBucket", "Source bucket not found", http.StatusNotFound)
 		return
 	}
+	sourceKey, err := url.PathUnescape(sourceKey)
+	if err != nil {
+		m.writeErrorResponse(w, "InvalidRequest", "Invalid copy source escape", http.StatusBadRequest)
+		return
+	}
 
 	// Get the source object
 	m.mutex.RLock()
