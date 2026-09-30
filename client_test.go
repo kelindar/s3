@@ -2,10 +2,16 @@ package s3
 
 import (
 	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -16,6 +22,112 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fasthttp"
 )
+
+func TestHTTPS(t *testing.T) {
+	for _, test := range []struct {
+		name, method, target string
+		body                 []byte
+		headers              [][2]string
+		untrusted            bool
+	}{
+		{name: "empty", method: http.MethodGet, target: "/"},
+		{name: "payload", method: http.MethodPut, target: "/a/../b%2Fc%2B%26%E2%98%83?partNumber=1&uploadId=id%2B%2F%3D", body: []byte("payload")},
+		{name: "conditional", method: http.MethodPut, target: "/bucket/object", body: []byte("payload"), headers: [][2]string{{"if-match", `"etag"`}, {"if-unmodified-since", "Tue, 15 Nov 1994 08:12:31 GMT"}}},
+		{name: "copy", method: http.MethodPut, target: "/bucket/object?partNumber=1&uploadId=id%2B%2F%3D", headers: [][2]string{{"x-amz-copy-source", "/bucket/a%20b%25"}, {"x-amz-copy-source-if-match", `"etag"`}, {"x-amz-copy-source-range", "bytes=1-5242880"}}},
+		{name: "header whitespace", method: http.MethodPut, target: "/bucket/object", headers: [][2]string{{"if-unmodified-since", "  Tue,  15\tNov 1994 08:12:31 GMT  "}}},
+		{name: "untrusted", method: http.MethodGet, target: "/", untrusted: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			names := []string{"host", "x-amz-content-sha256", "x-amz-date", "x-amz-security-token"}
+			for _, header := range test.headers {
+				names = append(names, header[0])
+			}
+			slices.Sort(names)
+			signed := strings.Join(names, ";")
+			var requests atomic.Int32
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				requests.Add(1)
+				assert.NotNil(t, req.TLS)
+				assert.Equal(t, test.method, req.Method)
+				assert.Equal(t, test.target, req.RequestURI)
+				assert.Equal(t, "session-token", req.Header.Get("X-Amz-Security-Token"))
+				body, err := io.ReadAll(req.Body)
+				assert.NoError(t, err)
+				assert.Equal(t, string(test.body), string(body))
+				stamp := req.Header.Get("X-Amz-Date")
+				if _, err := time.Parse("20060102T150405Z", stamp); !assert.NoError(t, err) {
+					w.WriteHeader(http.StatusForbidden)
+					return
+				}
+				payload := fmt.Sprintf("%x", sha256.Sum256(nil))
+				if test.body != nil {
+					payload = "UNSIGNED-PAYLOAD"
+				}
+				assert.Equal(t, payload, req.Header.Get("X-Amz-Content-Sha256"))
+
+				// Rebuild SigV4 independently from the request received over TLS.
+				// https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_sigv-create-signed-request.html
+				var canonical strings.Builder
+				fmt.Fprintf(&canonical, "%s\n%s\n%s\n", req.Method, req.URL.EscapedPath(), strings.ReplaceAll(req.URL.Query().Encode(), "+", "%20"))
+				for _, name := range names {
+					value := req.Header.Get(name)
+					if name == "host" {
+						value = req.Host
+					}
+					fmt.Fprintf(&canonical, "%s:%s\n", name, strings.Join(strings.Fields(value), " "))
+				}
+				fmt.Fprintf(&canonical, "\n%s\n%s", signed, payload)
+				scope := stamp[:8] + "/us-east-1/s3/aws4_request"
+				toSign := fmt.Sprintf("AWS4-HMAC-SHA256\n%s\n%s\n%x", stamp, scope, sha256.Sum256([]byte(canonical.String())))
+				key := []byte("AWS4test-secret")
+				for _, value := range []string{stamp[:8], "us-east-1", "s3", "aws4_request", toSign} {
+					hash := hmac.New(sha256.New, key)
+					_, _ = hash.Write([]byte(value))
+					key = hash.Sum(nil)
+				}
+				want := fmt.Sprintf("AWS4-HMAC-SHA256 Credential=test-access/%s, SignedHeaders=%s, Signature=%x", scope, signed, key)
+				assert.Equal(t, want, req.Header.Get("Authorization"))
+				_, _ = io.WriteString(w, "response")
+			}))
+			defer server.Close()
+
+			original := defaultClient
+			client := newClient(original.Dial)
+			if !test.untrusted {
+				roots := x509.NewCertPool()
+				roots.AddCert(server.Certificate())
+				client.TLSConfig = &tls.Config{RootCAs: roots}
+			}
+			defaultClient = client
+			t.Cleanup(func() {
+				client.CloseIdleConnections()
+				defaultClient = original
+			})
+			key := aws.DeriveKey(server.URL, "test-access", "test-secret", "us-east-1", "s3")
+			key.Token = "session-token"
+			req := fasthttp.AcquireRequest()
+			defer fasthttp.ReleaseRequest(req)
+			req.SetRequestURI(server.URL + test.target)
+			req.Header.SetMethod(test.method)
+			signRequest(key, req, test.body, test.headers...)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			res, err := flakyFast(ctx, req)
+			if test.untrusted {
+				var certificate x509.UnknownAuthorityError
+				assert.ErrorAs(t, err, &certificate)
+				assert.Zero(t, requests.Load())
+				return
+			}
+			require.NoError(t, err)
+			defer res.Body.Close()
+			body, err := io.ReadAll(res.Body)
+			require.NoError(t, err)
+			assert.Equal(t, "response", string(body))
+			assert.EqualValues(t, 1, requests.Load())
+		})
+	}
+}
 
 func TestClient(t *testing.T) {
 	t.Run("conditional retry", func(t *testing.T) {

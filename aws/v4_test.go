@@ -83,17 +83,25 @@ e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`
 }
 
 func TestConditionalHeader(t *testing.T) {
-	req, err := http.NewRequest("PUT", "https://examplebucket.s3.amazonaws.com/test.txt", nil)
-	require.NoError(t, err)
-	req.Header.Set("If-Unmodified-Since", "Tue, 15 Nov 1994 08:12:31 GMT")
+	for _, value := range []string{
+		"Tue, 15 Nov 1994 08:12:31 GMT",
+		"  Tue,  15\tNov 1994 08:12:31 GMT  ",
+	} {
+		t.Run(value, func(t *testing.T) {
+			req, err := http.NewRequest("PUT", "https://examplebucket.s3.amazonaws.com/test.txt", nil)
+			require.NoError(t, err)
+			req.Header.Set("If-Unmodified-Since", value)
 
-	key := DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
-	key.SignV4(req, nil)
+			key := DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
+			key.SignV4(req, nil)
 
-	assert.Contains(t, req.Header.Get("Authorization"), "SignedHeaders=host;if-unmodified-since;x-amz-content-sha256;x-amz-date")
-	var out bytes.Buffer
-	canonical(&out, req)
-	assert.Contains(t, out.String(), "if-unmodified-since:Tue, 15 Nov 1994 08:12:31 GMT\n")
+			assert.Contains(t, req.Header.Get("Authorization"), "SignedHeaders=host;if-unmodified-since;x-amz-content-sha256;x-amz-date")
+			var out bytes.Buffer
+			canonical(&out, req)
+			assert.Contains(t, out.String(), "if-unmodified-since:Tue, 15 Nov 1994 08:12:31 GMT\n")
+			assert.Equal(t, value, req.Header.Get("If-Unmodified-Since"), "signing must not modify caller-owned header values")
+		})
+	}
 }
 
 func TestHostHeader(t *testing.T) {
@@ -185,6 +193,7 @@ func TestSignV4Raw(t *testing.T) {
 		{name: "payload", uri: "https://bucket.example.com/a%20b?partNumber=1&uploadId=id", body: []byte("part contents")},
 		{name: "token", uri: "https://bucket.example.com/a%20b?partNumber=1&uploadId=id", token: "session-token", body: []byte("part contents")},
 		{name: "conditions", uri: "https://bucket.example.com/object", headers: [][2]string{{"if-unmodified-since", "Tue, 15 Nov 1994 08:12:31 GMT"}, {"if-match", `"etag"`}, {"if-none-match", "*"}}},
+		{name: "header whitespace", uri: "https://bucket.example.com/object", headers: [][2]string{{"if-unmodified-since", "  Tue,  15\tNov 1994 08:12:31 GMT  "}}},
 		{name: "copy", uri: "https://bucket.example.com/object?partNumber=1&uploadId=id", token: "session-token", headers: [][2]string{{"x-amz-copy-source-range", "bytes=0-5242879"}, {"x-amz-copy-source", "/bucket/a%20b%25"}, {"x-amz-copy-source-if-match", `"etag"`}}},
 		{name: "many conditions", uri: "https://bucket.example.com/object", headers: many},
 		{name: "empty condition", uri: "https://bucket.example.com/object", headers: [][2]string{{"if-match", ""}}},

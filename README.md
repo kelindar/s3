@@ -45,7 +45,6 @@ import (
     "context"
     "fmt"
     "io"
-    "io/fs"
     
     "github.com/kelindar/s3"
     "github.com/kelindar/s3/aws"
@@ -53,7 +52,7 @@ import (
 
 func main() {
     // Create signing key from ambient credentials
-    key, err := aws.AmbientKey("s3", s3.DeriveForBucket("my-bucket"))
+    key, err := aws.AmbientKey("s3", "", s3.DeriveForBucket("my-bucket"))
     if err != nil {
         panic(err)
     }
@@ -92,7 +91,7 @@ This is the recommended way to use the library, as it automatically discovers cr
 - Web identity tokens
 
 ```go
-key, err := aws.AmbientKey("s3", s3.DeriveForBucket("my-bucket"))
+key, err := aws.AmbientKey("s3", "", s3.DeriveForBucket("my-bucket"))
 ```
 
 ### Manual Credentials

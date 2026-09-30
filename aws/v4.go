@@ -138,6 +138,20 @@ func writeSignedHeaders(dst *bytes.Buffer, req *http.Request, headers []string) 
 	}
 }
 
+func canonicalValue(dst *bytes.Buffer, value string) {
+	value = strings.TrimSpace(value)
+	for {
+		at := strings.IndexAny(value, " \t")
+		if at < 0 {
+			dst.WriteString(value)
+			return
+		}
+		dst.WriteString(value[:at])
+		dst.WriteByte(' ')
+		value = strings.TrimLeft(value[at:], " \t")
+	}
+}
+
 func (s *SigningKey) toscope(dst *bytes.Buffer, date []byte) {
 	dst.Write(date)
 	dst.WriteByte('/')
@@ -187,7 +201,7 @@ func canonical(dst *bytes.Buffer, req *http.Request) []string {
 		}
 		dst.WriteString(h)
 		dst.WriteByte(':')
-		dst.WriteString(hdr)
+		canonicalValue(dst, hdr)
 		dst.WriteByte('\n')
 	}
 	dst.WriteByte('\n')
@@ -346,7 +360,7 @@ func (s *SigningKey) SignV4Raw(method, path, query, host string, body []byte, ex
 		case "x-amz-date":
 			buf.Write(stamp)
 		default:
-			buf.WriteString(header[1])
+			canonicalValue(buf, header[1])
 		}
 		buf.WriteByte('\n')
 	}

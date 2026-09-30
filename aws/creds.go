@@ -27,6 +27,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -304,11 +305,12 @@ func scan(in io.Reader, section string, into []scanspec) error {
 }
 
 // we don't allow credentials to be loaded
-// from world-writeable locations
+// from world-writeable locations. On Windows, access is governed by ACLs and
+// FileMode synthesizes permissions from the read-only attribute instead.
 func check(info fs.FileInfo) error {
 	mode := info.Mode()
 	switch {
-	case mode&2 != 0:
+	case runtime.GOOS != "windows" && mode&0002 != 0:
 		return fmt.Errorf("%s is world-writeable %o", info.Name(), mode)
 	case mode&fs.ModeType != 0:
 		return fmt.Errorf("%s is a special file", info.Name())

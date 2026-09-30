@@ -558,6 +558,62 @@ func TestFastPutConditions(t *testing.T) {
 	})
 }
 
+func BenchmarkMultipart(b *testing.B) {
+	payload := bytes.Repeat([]byte("x"), 2*s3.MinPartSize+(128<<10))
+	contents := [][]byte{payload[:s3.MinPartSize], payload[s3.MinPartSize : 2*s3.MinPartSize], payload[2*s3.MinPartSize:]}
+	b.Run("receive", func(b *testing.B) {
+		var ctx fasthttp.RequestCtx
+		var reader bytes.Reader
+		b.SetBytes(int64(len(payload)))
+		b.ReportAllocs()
+		b.ResetTimer()
+		for range b.N {
+			for _, part := range contents {
+				reader.Reset(part)
+				ctx.Request.SetBodyStream(&reader, len(part))
+				stored, err := readFastContent(&ctx)
+				if err != nil || len(stored) != len(part) {
+					b.Fatalf("read %d bytes: %v", len(stored), err)
+				}
+			}
+		}
+	})
+	b.Run("checksum", func(b *testing.B) {
+		b.SetBytes(int64(len(payload)))
+		b.ReportAllocs()
+		b.ResetTimer()
+		for range b.N {
+			for _, part := range contents {
+				if generateETag(part) == "" {
+					b.Fatal("missing ETag")
+				}
+			}
+		}
+	})
+	b.Run("assemble", func(b *testing.B) {
+		server := &Server{bucket: "bench-bucket", objects: make(map[string]*Object), uploads: make(map[string]*Multipart)}
+		upload := &Multipart{Parts: make(map[int]*PartInfo)}
+		var body strings.Builder
+		body.WriteString(`<CompleteMultipartUpload xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`)
+		for i, content := range contents {
+			etag := generateETag(content)
+			upload.Parts[i+1] = &PartInfo{PartNumber: i + 1, ETag: etag, Content: content}
+			fmt.Fprintf(&body, `<Part><PartNumber>%d</PartNumber><ETag>&#34;%s&#34;</ETag></Part>`, i+1, etag[1:len(etag)-1])
+		}
+		body.WriteString(`</CompleteMultipartUpload>`)
+		encoded := []byte(body.String())
+		b.SetBytes(int64(len(payload)))
+		b.ReportAllocs()
+		b.ResetTimer()
+		for range b.N {
+			server.uploads["active"] = upload
+			if _, failure := server.completeMultipart("active", "object", encoded); failure != nil {
+				b.Fatal(failure)
+			}
+		}
+	})
+}
+
 func BenchmarkListingHandler(b *testing.B) {
 	for _, count := range []int{100, 1000} {
 		server := New("bench-bucket", "us-east-1")

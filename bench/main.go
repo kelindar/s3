@@ -43,6 +43,9 @@ func benchSign(b *bench.B) {
 
 	b.Run("sign/v4", func(int) { key.SignV4(req, nil) })
 	b.Run("sign/body", func(int) { key.SignV4(req, body) })
+	b.Run("sign/raw", func(int) {
+		key.SignV4Raw(http.MethodPut, "/object", "", "bench-bucket.s3.us-east-1.amazonaws.com", nil)
+	})
 	b.Run("sign/url", func(int) {
 		_, err := key.SignURL("https://bench-bucket.s3.us-east-1.amazonaws.com/object", time.Hour)
 		check(err)
