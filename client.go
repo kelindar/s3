@@ -1,8 +1,8 @@
 package s3
 
 import (
+	"bufio"
 	"bytes"
-	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/kelindar/s3/aws"
@@ -27,32 +28,120 @@ func newClient(dial fasthttp.DialFunc) *fasthttp.Client {
 		DisablePathNormalizing:    true,
 		StreamResponseBody:        true,
 		MaxIdemponentCallAttempts: 1,
+		Transport:                 transport{},
 	}
 }
 
-type cancelConn struct {
+type connLease struct {
 	net.Conn
-	stop func() bool
+	release func(bool)
 }
 
-func (c *cancelConn) Close() error {
-	c.stop()
-	return c.Conn.Close()
-}
-
-// A cancellable request needs its own connection so its context can close it.
-func cancellableClient(ctx context.Context) *fasthttp.Client {
-	return newClient(func(addr string) (net.Conn, error) {
-		dialCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		defer cancel()
-		conn, err := (&net.Dialer{}).DialContext(dialCtx, "tcp", addr)
+func acquireConn(ctx context.Context, host *fasthttp.HostClient, connectionClose bool) (connLease, error) {
+	var timeout time.Duration
+	if deadline, ok := ctx.Deadline(); ok {
+		timeout = time.Until(deadline)
+	}
+	acquire := func() (connLease, error) {
+		conn, err := host.AcquireConn(timeout, connectionClose)
 		if err != nil {
-			return nil, err
+			return connLease{}, err
 		}
-		tracked := &cancelConn{Conn: conn}
-		tracked.stop = context.AfterFunc(ctx, func() { _ = conn.Close() })
-		return tracked, nil
-	})
+		return connLease{Conn: conn.Conn(), release: func(discard bool) {
+			if discard {
+				host.CloseConn(conn)
+			} else {
+				host.ReleaseConn(conn)
+			}
+		}}, nil
+	}
+	if ctx.Done() == nil {
+		return acquire()
+	}
+
+	// Dialing may block before a connection exists to interrupt. A cancelled
+	// caller leaves the acquisition to close its lease when dialing finishes.
+	type result struct {
+		conn connLease
+		err  error
+	}
+	ready := make(chan result)
+	go func() {
+		conn, err := acquire()
+		select {
+		case ready <- result{conn, err}:
+		case <-ctx.Done():
+			if conn.release != nil {
+				conn.release(true)
+			}
+		}
+	}()
+	select {
+	case res := <-ready:
+		return res.conn, res.err
+	case <-ctx.Done():
+		return connLease{}, ctx.Err()
+	}
+}
+
+type transport struct{}
+
+func (transport) RoundTrip(host *fasthttp.HostClient, req *fasthttp.Request, res *fasthttp.Response) (bool, error) {
+	body := req.UserValue("s3.body").(*responseBody)
+	conn, err := acquireConn(body.ctx, host, req.ConnectionClose())
+	if err != nil {
+		return false, err
+	}
+	body.conn = conn
+	body.host = host
+	if body.ctx.Done() != nil {
+		body.cancelDone = make(chan struct{})
+		body.stop = context.AfterFunc(body.ctx, func() {
+			_ = conn.Close()
+			close(body.cancelDone)
+		})
+	}
+	if err := body.ctx.Err(); err != nil {
+		return false, err
+	}
+	res.ParseNetConn(conn.Conn)
+	deadline, _ := body.ctx.Deadline()
+	if err := conn.SetWriteDeadline(deadline); err != nil {
+		return false, err
+	}
+	bw := host.AcquireWriter(conn.Conn)
+	err = req.Write(bw)
+	if err == nil {
+		err = bw.Flush()
+	}
+	host.ReleaseWriter(bw)
+	if err != nil {
+		return false, err
+	}
+	readDeadline := deadline
+	if host.ReadTimeout > 0 {
+		limit := time.Now().Add(host.ReadTimeout)
+		if readDeadline.IsZero() || limit.Before(readDeadline) {
+			readDeadline = limit
+		}
+	}
+	if err := conn.SetReadDeadline(readDeadline); err != nil {
+		return false, err
+	}
+	res.SkipBody = res.SkipBody || req.Header.IsHead()
+	body.reader = host.AcquireReader(conn.Conn)
+	if err := res.ReadLimitBody(body.reader, host.MaxResponseBodySize); err != nil {
+		return false, err
+	}
+
+	// The default limit covers headers; only the request context limits the body.
+	if err := conn.SetReadDeadline(deadline); err != nil {
+		return false, err
+	}
+	body.stream = res.BodyStream()
+	body.complete = body.stream == nil || res.Header.ContentLength() == 0
+	body.discard = req.ConnectionClose() || res.ConnectionClose()
+	return false, nil
 }
 
 type response struct {
@@ -74,34 +163,81 @@ func (h responseHeader) Get(name string) string {
 }
 
 type responseBody struct {
-	response *fasthttp.Response
-	client   *fasthttp.Client
-	stream   io.Reader
-	buffer   bytes.Reader
-	ctx      context.Context
-	once     sync.Once
-	err      error
+	response   *fasthttp.Response
+	stream     io.Reader
+	buffer     bytes.Reader
+	ctx        context.Context
+	conn       connLease
+	host       *fasthttp.HostClient
+	reader     *bufio.Reader
+	stop       func() bool
+	cancelDone chan struct{}
+	complete   bool
+	discard    bool
+	closed     atomic.Bool
+	readLock   sync.Mutex
+	once       sync.Once
+	err        error
 }
 
 func (b *responseBody) Read(p []byte) (int, error) {
+	b.readLock.Lock()
+	defer b.readLock.Unlock()
 	switch {
-	case b.response == nil:
+	case b.closed.Load():
 		return 0, io.ErrClosedPipe
-	case b.ctx != nil && b.ctx.Err() != nil:
+	case b.ctx.Err() != nil:
 		return 0, b.ctx.Err()
-	case b.stream != nil:
-		return b.stream.Read(p)
 	}
-	return b.buffer.Read(p)
+	var n int
+	var err error
+	if b.stream != nil {
+		n, err = b.stream.Read(p)
+	} else {
+		n, err = b.buffer.Read(p)
+	}
+	if err != nil {
+		err = requestError(b.ctx, err)
+		b.complete = err == io.EOF
+	}
+	return n, err
+}
+
+func requestError(ctx context.Context, err error) error {
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return ctxErr
+	}
+
+	// A socket deadline can fire before the context's timer goroutine runs.
+	if deadline, ok := ctx.Deadline(); ok && !time.Now().Before(deadline) {
+		return context.DeadlineExceeded
+	}
+	return err
 }
 
 func (b *responseBody) Close() error {
 	b.once.Do(func() {
+		b.closed.Store(true)
+
+		// Join a running callback before the connection can reenter the pool.
+		if b.stop != nil && !b.stop() {
+			<-b.cancelDone
+		}
+		locked := b.readLock.TryLock()
+		if !locked {
+			_ = b.conn.Close()
+			b.readLock.Lock()
+		}
+		defer b.readLock.Unlock()
+		discard := b.discard || !locked || !b.complete || b.ctx.Err() != nil
 		b.err = b.response.CloseBodyStream()
 		fasthttp.ReleaseResponse(b.response)
 		b.response = nil
-		if b.client != nil {
-			b.client.CloseIdleConnections()
+		if b.reader != nil {
+			b.host.ReleaseReader(b.reader)
+		}
+		if b.conn.release != nil {
+			b.conn.release(discard)
 		}
 	})
 	return b.err
@@ -176,37 +312,24 @@ func doFastRequest(ctx context.Context, fastReq *fasthttp.Request) (*response, e
 		fastReq.SetTimeout(time.Until(deadline))
 	}
 	fastRes := fasthttp.AcquireResponse()
-	client := defaultClient
-	if ctx.Done() != nil {
-		client = cancellableClient(ctx)
-	}
-	if err := client.Do(fastReq, fastRes); err != nil {
-		fasthttp.ReleaseResponse(fastRes)
-		if client != defaultClient {
-			client.CloseIdleConnections()
-		}
-		return nil, cmp.Or(ctx.Err(), err)
+	res := &response{body: responseBody{response: fastRes, ctx: ctx}}
+	res.Body = &res.body
+	fastReq.SetUserValue("s3.body", res.Body)
+	// Request cleanup must not close the response body owned by the caller.
+	defer fastReq.RemoveUserValue("s3.body")
+	if err := defaultClient.Do(fastReq, fastRes); err != nil {
+		_ = res.Body.Close()
+		return nil, requestError(ctx, err)
 	}
 	if err := ctx.Err(); err != nil {
-		fasthttp.ReleaseResponse(fastRes)
-		if client != defaultClient {
-			client.CloseIdleConnections()
-		}
+		_ = res.Body.Close()
 		return nil, err
 	}
-	res := &response{
-		StatusCode:    fastRes.StatusCode(),
-		ContentLength: int64(fastRes.Header.ContentLength()),
-		Header:        responseHeader{fastRes},
-		body:          responseBody{response: fastRes, stream: fastRes.BodyStream()},
-	}
-	res.Body = &res.body
+	res.StatusCode = fastRes.StatusCode()
+	res.ContentLength = int64(fastRes.Header.ContentLength())
+	res.Header = responseHeader{fastRes}
 	if res.Body.stream == nil {
 		res.Body.buffer.Reset(fastRes.Body())
-	}
-	if ctx.Done() != nil {
-		res.Body.ctx = ctx
-		res.Body.client = client
 	}
 	return res, nil
 }

@@ -103,6 +103,8 @@ func TestMultipartResponseDecode(t *testing.T) {
 		`<Error><Code>InvalidPart</Code><Message>bad &lt;part&gt;</Message></Error>`,
 		`<Error><Ignored><Code>wrong</Code></Ignored><Code>right</Code></Error>`,
 		`<Error><Message><![CDATA[unsupported fast path]]></Message></Error>`,
+		`<Error><Message>a]]>b</Message></Error>`,
+		`<Error><Message>a]]&gt;b</Message></Error>`,
 		`<Error><Message>broken`,
 	} {
 		t.Run(input, func(t *testing.T) {
@@ -125,6 +127,7 @@ func TestMultipartResponseDecode(t *testing.T) {
 }
 
 func FuzzMultipartResponseDecode(f *testing.F) {
+	f.Add([]byte(`<Error><Message>a]]>b</Message></Error>`))
 	for _, input := range []string{
 		`<InitiateMultipartUploadResult><Bucket>b</Bucket><Key>k&amp;v</Key><UploadId>id</UploadId></InitiateMultipartUploadResult>`,
 		`<CopyPartResult><ETag>&quot;abc&quot;</ETag></CopyPartResult>`,

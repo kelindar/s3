@@ -646,6 +646,9 @@ func validListingXMLRune(value rune) bool {
 }
 
 func validListingXMLText(src []byte) bool {
+	if bytes.Contains(src, []byte("]]>")) {
+		return false
+	}
 	for i := 0; i < len(src); {
 		if src[i] == '&' {
 			_, size, ok := listingXMLEntity(src[i:])

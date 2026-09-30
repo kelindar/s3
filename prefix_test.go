@@ -473,6 +473,8 @@ func TestListResponseDecode(t *testing.T) {
 		{name: "objects and prefixes", xml: `<ListBucketResult xmlns="urn:s3"><IsTruncated>true</IsTruncated><Contents><Key>folder/a&amp;b.txt</Key><LastModified>2026-01-02T03:04:05.000Z</LastModified><ETag>&quot;e&quot;</ETag><Size>12</Size><StorageClass>STANDARD</StorageClass></Contents><CommonPrefixes><Prefix>folder/sub/</Prefix></CommonPrefixes><EncodingType>url</EncodingType><NextContinuationToken>next&amp;page</NextContinuationToken><Owner><ID>ignored</ID></Owner></ListBucketResult>`},
 		{name: "reordered fields", xml: `<ListBucketResult><NextContinuationToken>token</NextContinuationToken><Contents><Size>0</Size><ETag>etag</ETag><Key>key</Key></Contents><IsTruncated>false</IsTruncated></ListBucketResult>`},
 		{name: "numeric entities", xml: `<ListBucketResult><Contents><Key>emoji-&#x1F600;-&#38;.txt</Key></Contents></ListBucketResult>`},
+		{name: "invalid text terminator", xml: `<ListBucketResult><Contents><Key>a]]>b</Key></Contents></ListBucketResult>`},
+		{name: "escaped text terminator", xml: `<ListBucketResult><Contents><Key>a]]&gt;b</Key></Contents></ListBucketResult>`},
 		{name: "encoded scalar fallback", xml: `<ListBucketResult><IsTruncated>&#116;rue</IsTruncated><Contents><Key>key</Key><LastModified>2026-01-02T03:04:05&#90;</LastModified><Size>&#49;</Size></Contents></ListBucketResult>`},
 		{name: "xml declaration", xml: `<?xml version="1.0" encoding="UTF-8"?><ListBucketResult/>`},
 		{name: "comment fallback", xml: `<ListBucketResult><!--page--><Contents><Key>key</Key></Contents></ListBucketResult>`},
@@ -529,6 +531,7 @@ func TestListBatchOwnership(t *testing.T) {
 }
 
 func FuzzListResponseDecode(f *testing.F) {
+	f.Add([]byte(`<ListBucketResult><Contents><Key>a]]>b</Key></Contents></ListBucketResult>`))
 	f.Add([]byte(`<ListBucketResult><Contents><Key>key</Key><Size>1</Size></Contents></ListBucketResult>`))
 	f.Add([]byte(`<ListBucketResult><CommonPrefixes><Prefix>dir/</Prefix></CommonPrefixes></ListBucketResult>`))
 	f.Add([]byte(`<ListBucketResult><IsTruncated>invalid</IsTruncated></ListBucketResult>`))

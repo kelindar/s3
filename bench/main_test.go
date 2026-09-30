@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"testing"
+	"time"
 
 	"github.com/kelindar/s3"
 	"github.com/kelindar/s3/aws"
@@ -23,6 +24,37 @@ func TestListingData(t *testing.T) {
 	require.Len(t, data, 2)
 	require.Contains(t, data, "listing/file-0000.txt")
 	require.Contains(t, data, "listing/file-0001.txt")
+}
+
+func BenchmarkWriteContext(b *testing.B) {
+	for _, name := range []string{"background", "cancel", "deadline"} {
+		b.Run(name, func(b *testing.B) {
+			bucket, server := mockBucket()
+			defer server.Close()
+			ctx := context.Background()
+			switch name {
+			case "cancel":
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				defer cancel()
+			case "deadline":
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, time.Hour)
+				defer cancel()
+			}
+			payload := []byte("payload")
+			_, err := bucket.Write(ctx, "object", payload)
+			require.NoError(b, err)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				if _, err := bucket.Write(ctx, "object", payload); err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.StopTimer()
+		})
+	}
 }
 
 func BenchmarkUploadMultipart(b *testing.B) {
