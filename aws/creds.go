@@ -17,6 +17,7 @@ package aws
 
 import (
 	"bufio"
+	"cmp"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -86,9 +87,7 @@ func AmbientCreds(regionName string) (id, secret, region, token string, err erro
 	token = envdefault("", "AWS_SESSION_TOKEN")
 
 	// Resolve region if not provided
-	if region = regionName; regionName == "" {
-		region = envdefault(regionName, "AWS_REGION", "AWS_DEFAULT_REGION")
-	}
+	region = cmp.Or(regionName, envdefault("", "AWS_REGION", "AWS_DEFAULT_REGION"))
 
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -154,7 +153,7 @@ func WebIdentityCreds(client *http.Client) (id, secret, region, token string, ex
 	region = os.Getenv("AWS_REGION")
 	roleARN := os.Getenv("AWS_ROLE_ARN")
 	webIdentityTokenFile := os.Getenv("AWS_WEB_IDENTITY_TOKEN_FILE")
-	roleSessionName := os.Getenv("AWS_ROLE_SESSION_NAME")
+	roleSessionName := cmp.Or(os.Getenv("AWS_ROLE_SESSION_NAME"), "default")
 	switch {
 	case region == "":
 		return "", "", "", "", time.Time{}, fmt.Errorf("AWS_REGION not set")
@@ -163,18 +162,13 @@ func WebIdentityCreds(client *http.Client) (id, secret, region, token string, ex
 	case webIdentityTokenFile == "":
 		return "", "", "", "", time.Time{}, fmt.Errorf("AWS_WEB_IDENTITY_TOKEN_FILE not set")
 	}
-	if roleSessionName == "" {
-		roleSessionName = "default"
-	}
 
 	webIdentityToken, err := os.ReadFile(webIdentityTokenFile)
 	if err != nil {
 		return "", "", "", "", time.Time{}, fmt.Errorf("can't read web-identity token from %q: %w", webIdentityTokenFile, err)
 	}
 
-	if client == nil {
-		client = http.DefaultClient
-	}
+	client = cmp.Or(client, http.DefaultClient)
 
 	u, _ := url.Parse("https://sts.amazonaws.com/?Action=AssumeRoleWithWebIdentity&Version=2011-06-15")
 	q := u.Query()
@@ -256,12 +250,8 @@ func AmbientKey(service, regionName string, derive DeriveFn) (*SigningKey, error
 // S3EndPoint returns the endpoint of the object
 // storage service.
 func S3EndPoint(region string) string {
-	endPoint := os.Getenv("S3_ENDPOINT")
-	if endPoint == "" {
-		endPoint = fmt.Sprintf("https://s3.%s.amazonaws.com", region)
-	}
-	endPoint = strings.TrimSuffix(endPoint, "/")
-	return endPoint
+	endPoint := cmp.Or(os.Getenv("S3_ENDPOINT"), fmt.Sprintf("https://s3.%s.amazonaws.com", region))
+	return strings.TrimSuffix(endPoint, "/")
 }
 
 // B2EndPoint returns the endpoint of the Backblaze B2

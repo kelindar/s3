@@ -24,11 +24,21 @@ func (b *Bucket) Compose(ctx context.Context, key string, parts []CopyPart) (str
 	case len(parts) == 0 || len(parts) > MaxParts:
 		return "", fmt.Errorf("s3 Compose: invalid part count %d", len(parts))
 	}
+	for i, part := range parts {
+		part.SourceKey = path.Clean(part.SourceKey)
+		switch {
+		case !fs.ValidPath(part.SourceKey) || part.SourceKey == "." || part.ETag == "" || part.Offset < 0 || part.Size < MinPartSize:
+			return "", fmt.Errorf("s3 Compose: invalid part %d", i+1)
+		case part.Offset > (1<<63-1)-part.Size:
+			return "", fmt.Errorf("s3 Compose: invalid part %d range", i+1)
+		}
+	}
 
-	u := &uploader{Key: b.key, Client: b.Client, Bucket: b.bkt, Object: key}
+	u := &uploader{Key: b.key, Bucket: b.bkt, Object: key}
 	if err := u.Start(ctx); err != nil {
 		return "", fmt.Errorf("s3 Compose: %w", err)
 	}
+	u.parts = make([]tagpart, 0, len(parts))
 	complete := false
 	defer func() {
 		if !complete {
@@ -37,10 +47,8 @@ func (b *Bucket) Compose(ctx context.Context, key string, parts []CopyPart) (str
 	}()
 
 	for i, part := range parts {
-		if part.SourceKey = path.Clean(part.SourceKey); !fs.ValidPath(part.SourceKey) || part.ETag == "" || part.Offset < 0 || part.Size < MinPartSize {
-			return "", fmt.Errorf("s3 Compose: invalid part %d", i+1)
-		}
-		source := &Reader{Key: b.key, Client: b.Client, Bucket: b.bkt, Path: part.SourceKey, ETag: part.ETag, Size: part.Offset + part.Size}
+		part.SourceKey = path.Clean(part.SourceKey)
+		source := &Reader{Key: b.key, Bucket: b.bkt, Path: part.SourceKey, ETag: part.ETag, Size: part.Offset + part.Size}
 		if err := u.CopyFrom(ctx, int64(i+1), source, part.Offset, part.Offset+part.Size); err != nil {
 			return "", fmt.Errorf("s3 Compose: part %d: %w", i+1, err)
 		}

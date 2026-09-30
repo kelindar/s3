@@ -27,6 +27,7 @@ import (
 	"os"
 	"path"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -195,11 +196,7 @@ func testWalkGlob(t *testing.T, b *Bucket, prefix string) {
 	for _, full := range dirs {
 		// NOTE: don't use path.Join, it will remove
 		// the trailing '/'
-		if prefix[len(prefix)-1] != '/' {
-			full = prefix + "/" + full
-		} else {
-			full = prefix + full
-		}
+		full = strings.TrimSuffix(prefix, "/") + "/" + full
 		_, err := b.Write(context.Background(), full, []byte(fmt.Sprintf("contents of %q", full)))
 		assert.NoError(t, err)
 	}
@@ -618,6 +615,37 @@ func TestBucket_WriteFrom(t *testing.T) {
 	assert.Equal(t, testData, content)
 }
 
+func TestSmallWriteFrom(t *testing.T) {
+	server := mock.New("test-bucket", "us-east-1")
+	defer server.Close()
+	key := aws.DeriveKey("", "access", "secret", "us-east-1", "s3")
+	key.BaseURI = server.URL()
+	bucket := NewBucket(key, "test-bucket")
+
+	for _, size := range []int{0, 1, 128 << 10} {
+		contents := bytes.Repeat([]byte("x"), size)
+		name := fmt.Sprintf("small/%d", size)
+		err := bucket.WriteFrom(context.Background(), name, bytes.NewReader(contents), int64(size))
+		assert.NoError(t, err)
+		got, ok := server.ObjectContent(name)
+		assert.True(t, ok)
+		assert.Equal(t, contents, got)
+	}
+	assert.Len(t, server.GetRequestsWithMethod(http.MethodPut), 3)
+	assert.Empty(t, server.GetRequestsWithMethod(http.MethodPost))
+
+	before := server.RequestCount()
+	err := bucket.WriteFrom(context.Background(), "small/short", bytes.NewReader([]byte("short")), 6)
+	assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
+	assert.Equal(t, before, server.RequestCount())
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = bucket.WriteFrom(ctx, "small/cancelled", bytes.NewReader([]byte("x")), 1)
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.Equal(t, before, server.RequestCount())
+}
+
 func TestBucketListContext(t *testing.T) {
 	mockServer := mock.New("test-bucket", "us-east-1")
 	defer mockServer.Close()
@@ -650,6 +678,44 @@ func TestBucketListPagination(t *testing.T) {
 		count++
 	}
 	assert.Equal(t, 1001, count)
+	entries, err := NewBucket(key, "test-bucket").ReadDir("logs")
+	assert.NoError(t, err)
+	assert.Len(t, entries, 1001)
+}
+
+func TestListConcurrent(t *testing.T) {
+	server := mock.New("test-bucket", "us-east-1")
+	defer server.Close()
+	for i := range 100 {
+		server.PutObject(fmt.Sprintf("logs/%04d", i), nil)
+	}
+	key := aws.DeriveKey("", "test", "test", "us-east-1", "s3")
+	key.BaseURI = server.URL()
+	bucket := NewBucket(key, "test-bucket")
+
+	var workers sync.WaitGroup
+	errors := make(chan error, 8)
+	for range 8 {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for range 10 {
+				entries, err := bucket.ReadDir("logs")
+				if err == nil && (len(entries) != 100 || entries[0].Name() != "0000" || entries[99].Name() != "0099") {
+					err = fmt.Errorf("unexpected listing of %d entries", len(entries))
+				}
+				if err != nil {
+					errors <- err
+					return
+				}
+			}
+		}()
+	}
+	workers.Wait()
+	close(errors)
+	for err := range errors {
+		assert.NoError(t, err)
+	}
 }
 
 func TestCancel(t *testing.T) {

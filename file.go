@@ -66,6 +66,9 @@ func (f *File) Open() (fs.File, error) { return f, nil }
 // If you need to read a sub-range of the
 // object, consider using f.Reader.RangeReader
 func (f *File) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
 	if f.body != nil {
 		n, err := f.body.Read(p)
 		f.pos += int64(n)
@@ -78,6 +81,9 @@ func (f *File) Read(p []byte) (int, error) {
 		f.body.Close()
 		f.body = nil
 	}
+	if f.pos >= f.Reader.Size {
+		return 0, io.EOF
+	}
 
 	body, err := f.Reader.RangeReader(f.pos, f.Size()-f.pos)
 	if err != nil {
@@ -88,6 +94,11 @@ func (f *File) Read(p []byte) (int, error) {
 	n, err := f.body.Read(p)
 	f.pos += int64(n)
 	return n, err
+}
+
+// WriteTo implements io.WriterTo using the file's current position and body.
+func (f *File) WriteTo(w io.Writer) (int64, error) {
+	return io.Copy(w, struct{ io.Reader }{f})
 }
 
 // Info implements fs.DirEntry.Info

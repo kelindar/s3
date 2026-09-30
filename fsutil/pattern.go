@@ -101,12 +101,12 @@ func (m *Matcher) Match(pattern, name string) (bool, error) {
 			return false
 		}
 		for i := range m.caps {
-			if m.caps[i][0] == "" {
+			switch m.caps[i][0] {
+			case "":
 				m.caps[i][0] = name
 				m.caps[i][1] = value
 				return true
-			}
-			if m.caps[i][0] == name {
+			case name:
 				return false
 			}
 		}
@@ -124,14 +124,12 @@ outer:
 			// special handling for terminal wildcard
 			got, rem := matchwc(name)
 			name = rem
-			if ident != "" {
-				if got == "" {
-					// disallow empty capture
-					return false, nil
-				}
-				if !put(ident, got) {
-					return false, ErrBadPattern
-				}
+			switch {
+			case ident != "" && got == "":
+				// disallow empty capture
+				return false, nil
+			case ident != "" && !put(ident, got):
+				return false, ErrBadPattern
 			}
 			break
 		}
@@ -157,10 +155,8 @@ outer:
 				continue
 			}
 			if pattern != "" || rem == "" {
-				if ident != "" {
-					if !put(ident, name[:i]) {
-						return false, ErrBadPattern
-					}
+				if ident != "" && !put(ident, name[:i]) {
+					return false, ErrBadPattern
 				}
 				name = rem
 				continue outer
@@ -230,18 +226,16 @@ func (m *Matcher) Expand(template string) ([]byte, error) {
 // "foo-{bar}.json" into "foo-*.json".
 func ToGlob(pattern string) (string, error) {
 	wc, id, part, rest, ok := splitmatch(pattern)
-	if !ok {
+	switch {
+	case !ok:
 		return "", ErrBadPattern
-	}
 	// avoid allocation if possible
-	if rest == "" {
-		if wc {
-			if id != "" {
-				return "*" + part, nil // pattern like "{id}part"
-			}
-			return pattern, nil // pattern like "*part"
-		}
+	case rest == "" && !wc:
 		return part, nil // pattern like "part"
+	case rest == "" && id != "":
+		return "*" + part, nil // pattern like "{id}part"
+	case rest == "":
+		return pattern, nil // pattern like "*part"
 	}
 	var sb strings.Builder
 	if wc {
@@ -295,14 +289,14 @@ func splitmatch(pattern string) (wc bool, ident, part, rest string, ok bool) {
 	}
 	// check for a non-wildcard segment
 	for i := 0; i < len(pattern); i++ {
-		ch := pattern[i]
-		if ch == '\\' {
+		switch pattern[i] {
+		case '\\':
 			if i >= len(pattern)-1 {
 				// require next character
 				return wc, ident, part, rest, false
 			}
 			i++
-		} else if ch == '*' || ch == '{' {
+		case '*', '{':
 			// don't proceed past wildcard
 			return wc, ident, pattern[:i], pattern[i:], true
 		}
@@ -404,11 +398,11 @@ func matchwc(s string) (match, rem string) {
 func splittemplate(template string) (ident, part, rest string, ok bool) {
 	if template != "" && template[0] == '$' {
 		template = template[1:]
-		if template == "" {
+		switch {
+		case template == "":
 			// disallow terminal '$'
 			return ident, part, rest, false
-		}
-		if template[0] == '$' {
+		case template[0] == '$':
 			// TODO: consume consecutive $$s?
 			return "", "$", template[1:], true
 		}
@@ -429,12 +423,9 @@ func splittemplate(template string) (ident, part, rest string, ok bool) {
 			template = template[1:]
 		}
 	}
-	i := strings.IndexByte(template, '$')
-	if i < 0 {
-		part = template
-	} else {
-		part = template[:i]
-		rest = template[i:]
+	part = template
+	if i := strings.IndexByte(template, '$'); i >= 0 {
+		part, rest = template[:i], template[i:]
 	}
 	return ident, part, rest, true
 }

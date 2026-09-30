@@ -32,10 +32,9 @@ import (
 
 // Bucket implements fs.FS, fs.ReadDirFS, and fs.SubFS.
 type Bucket struct {
-	key    *aws.SigningKey // signing key
-	bkt    string          // bucket name
-	Client *http.Client    // HTTP client used for requests, if nil then DefaultClient is used
-	Lazy   bool            // If true, causes the initial Open call to use a HEAD operation rather than a GET operation.
+	key  *aws.SigningKey // signing key
+	bkt  string          // bucket name
+	Lazy bool            // If true, causes the initial Open call to use a HEAD operation rather than a GET operation.
 }
 
 // NewBucket creates a new Bucket instance.
@@ -46,17 +45,9 @@ func NewBucket(key *aws.SigningKey, bucket string) *Bucket {
 	}
 }
 
-func (b *Bucket) client() *http.Client {
-	if b.Client == nil {
-		return &DefaultClient
-	}
-	return b.Client
-}
-
 func (b *Bucket) sub(name string) *Prefix {
 	return &Prefix{
 		Key:    b.key,
-		Client: b.Client,
 		Bucket: b.bkt,
 		Path:   name,
 	}
@@ -150,21 +141,26 @@ func (b *Bucket) write(ctx context.Context, key string, contents []byte, conditi
 		return "", false, badpath("s3 PUT", key)
 	}
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodPut, uri(b.key, b.bkt, key), nil)
-	if err != nil {
-		return "", false, err
-	}
-	if condition != nil {
+	var res *response
+	var err error
+	var ifMatch string
+	if condition == nil {
+		res, err = doSigned(ctx, b.key, http.MethodPut, uri(b.key, b.bkt, key), contents)
+	} else {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPut, uri(b.key, b.bkt, key), nil)
+		if err != nil {
+			return "", false, err
+		}
 		if err := condition(req.Header); err != nil {
 			return "", false, fmt.Errorf("s3 PUT condition: %w", err)
 		}
 		if err := validateCondition(req.Header); err != nil {
 			return "", false, err
 		}
+		ifMatch = req.Header.Get("If-Match")
+		b.key.SignV4(req, contents)
+		res, err = flakyDo(req, contents)
 	}
-
-	b.key.SignV4(req, contents)
-	res, err := flakyDo(b.client(), req)
 	if err != nil {
 		return "", false, err
 	}
@@ -174,10 +170,10 @@ func (b *Bucket) write(ctx context.Context, key string, contents []byte, conditi
 		return "", false, nil
 	case res.StatusCode != http.StatusOK:
 		code, message := extractS3Error(res.Body)
-		if res.StatusCode == http.StatusNotFound && req.Header.Get("If-Match") != "" && code == "NoSuchKey" {
+		if res.StatusCode == http.StatusNotFound && ifMatch != "" && code == "NoSuchKey" {
 			return "", false, nil
 		}
-		return "", false, fmt.Errorf("s3 PUT: %s %s", res.Status, message)
+		return "", false, fmt.Errorf("s3 PUT: %s %s", res.status(), message)
 	default:
 		return res.Header.Get("ETag"), true, nil
 	}
@@ -186,10 +182,10 @@ func (b *Bucket) write(ctx context.Context, key string, contents []byte, conditi
 // Sub implements fs.SubFS.Sub.
 func (b *Bucket) Sub(dir string) (fs.FS, error) {
 	dir = path.Clean(dir)
-	if !fs.ValidPath(dir) {
+	switch {
+	case !fs.ValidPath(dir):
 		return nil, badpath("sub", dir)
-	}
-	if dir == "." {
+	case dir == ".":
 		return b, nil
 	}
 	return b.sub(dir + "/"), nil
@@ -216,18 +212,18 @@ func (b *Bucket) OpenContext(ctx context.Context, name string) (fs.File, error) 
 	// a directory
 	isDir := strings.HasSuffix(name, "/")
 	name = path.Clean(name)
-	if !fs.ValidPath(name) {
+	switch {
+	case !fs.ValidPath(name):
 		return nil, badpath("open", name)
-	}
 	// opening the "root directory"
-	if name == "." {
+	case name == ".":
 		return b.subContext(ctx, "."), nil
 	}
 	if !isDir {
 		// try a HEAD or GET operation; these
 		// are cheaper and faster than
 		// full listing operations
-		f, err := openContext(ctx, b.key, b.bkt, name, !b.Lazy, b.client())
+		f, err := openContext(ctx, b.key, b.bkt, name, !b.Lazy)
 		if err == nil || !errors.Is(err, fs.ErrNotExist) {
 			return f, err
 		}
@@ -255,7 +251,6 @@ func (b *Bucket) OpenRangeContext(ctx context.Context, name, etag string, start,
 		return nil, badpath("OpenRange", name)
 	}
 	r := Reader{
-		Client: b.Client,
 		Key:    b.key,
 		Bucket: b.bkt,
 		Path:   name,
@@ -268,10 +263,10 @@ func (b *Bucket) OpenRangeContext(ctx context.Context, name, etag string, start,
 // VisitDir implements fs.VisitDirFS
 func (b *Bucket) VisitDir(name, seek, pattern string, walk fsutil.VisitDirFn) error {
 	name = path.Clean(name)
-	if !fs.ValidPath(name) {
+	switch {
+	case !fs.ValidPath(name):
 		return badpath("visitdir", name)
-	}
-	if name == "." {
+	case name == ".":
 		return b.sub(".").VisitDir(".", seek, pattern, walk)
 	}
 	return b.sub(name+"/").VisitDir(".", seek, pattern, walk)
@@ -279,15 +274,28 @@ func (b *Bucket) VisitDir(name, seek, pattern string, walk fsutil.VisitDirFn) er
 
 // ReadDir implements fs.ReadDirFS
 func (b *Bucket) ReadDir(name string) ([]fs.DirEntry, error) {
-	var entries []fs.DirEntry
-	for entry, err := range b.List(context.Background(), name) {
-		if err != nil {
-			return nil, err
-		}
-		entries = append(entries, entry)
+	name = path.Clean(name)
+	if !fs.ValidPath(name) {
+		return nil, badpath("readdir", name)
+	}
+	prefix := b.sub(".")
+	if name != "." {
+		prefix = b.sub(name + "/")
 	}
 
-	name = path.Clean(name)
+	var entries []fs.DirEntry
+	for token := ""; ; {
+		page, next, err := prefix.readDirAtContext(context.Background(), -1, token, "", "")
+		if err != nil && !errors.Is(err, io.EOF) {
+			return nil, &fs.PathError{Op: "readdir", Path: prefix.Path, Err: err}
+		}
+		entries = append(entries, page...)
+		if errors.Is(err, io.EOF) || next == "" {
+			break
+		}
+		token = next
+	}
+
 	if len(entries) == 0 && name != "." {
 		// An empty listing usually means the directory does not exist.
 		f, err := b.sub(name + "/").openDir()
@@ -325,14 +333,13 @@ func (b *Bucket) List(ctx context.Context, name string) iter.Seq2[fs.DirEntry, e
 					return
 				}
 			}
-			if errors.Is(err, io.EOF) {
+			switch {
+			case errors.Is(err, io.EOF):
 				return
-			}
-			if err != nil {
+			case err != nil:
 				yield(nil, &fs.PathError{Op: "readdir", Path: prefix.Path, Err: err})
 				return
-			}
-			if next == "" {
+			case next == "":
 				return
 			}
 			token = next
@@ -346,18 +353,13 @@ func (b *Bucket) Delete(ctx context.Context, fullpath string) error {
 	if !fs.ValidPath(fullpath) {
 		return fmt.Errorf("%s: %s", fullpath, fs.ErrInvalid)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, uri(b.key, b.bkt, fullpath), nil)
-	if err != nil {
-		return err
-	}
-	b.key.SignV4(req, nil)
-	res, err := flakyDo(b.client(), req)
+	res, err := doSigned(ctx, b.key, http.MethodDelete, uri(b.key, b.bkt, fullpath), nil)
 	if err != nil {
 		return err
 	}
 	defer res.Body.Close()
 	if res.StatusCode != 204 {
-		return fmt.Errorf("s3 DELETE: %s %s", res.Status, extractMessage(res.Body))
+		return fmt.Errorf("s3 DELETE: %s %s", res.status(), extractMessage(res.Body))
 	}
 	return nil
 }
@@ -366,18 +368,32 @@ func (b *Bucket) Delete(ctx context.Context, fullpath string) error {
 func (b *Bucket) WriteFrom(ctx context.Context, key string, r io.ReaderAt, size int64) error {
 	key = path.Clean(key)
 	_, base := path.Split(key)
-	switch {
+	switch err := ctx.Err(); {
 	case !fs.ValidPath(key):
 		return badpath("s3 Upload", key)
 	case base == ".":
 		return badpath("s3 Upload", key)
 	case size < 0:
 		return fmt.Errorf("size must be non-negative, got %d", size)
+	case err != nil:
+		return err
+	}
+	if size < MinPartSize {
+		contents := make([]byte, int(size))
+		if size > 0 {
+			if _, err := io.ReadFull(io.NewSectionReader(r, 0, size), contents); err != nil {
+				return fmt.Errorf("reading s3 object: %w", err)
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		_, err := b.Write(ctx, key, contents)
+		return err
 	}
 
 	uploader := &uploader{
 		Key:    b.key,
-		Client: b.Client,
 		Bucket: b.bkt,
 		Object: key,
 	}

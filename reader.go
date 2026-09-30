@@ -21,12 +21,12 @@
 package s3
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"io"
 	"io/fs"
-	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -34,30 +34,6 @@ import (
 
 	"github.com/kelindar/s3/aws"
 )
-
-// DefaultClient is the default HTTP client
-// used for requests made from this package.
-var DefaultClient = http.Client{
-	Transport: &http.Transport{
-		ResponseHeaderTimeout: 60 * time.Second,
-		// Empirically, AWS creates about 40
-		// DNS entries for S3, so 5 connections
-		// per host is about 100 total connections.
-		// (Note that the default here is 2!)
-		MaxIdleConnsPerHost: 5,
-		// Don't set Accept-Encoding: gzip
-		// because it leads to the go client natively
-		// decompressing gzipped objects.
-		DisableCompression: true,
-		// AWS S3 occasionally provides "dead" hosts
-		// in their round-robin DNS responses, and the
-		// fastest way to identify them is during
-		// connection establishment:
-		DialContext: (&net.Dialer{
-			Timeout: 2 * time.Second,
-		}).DialContext,
-	},
-}
 
 var (
 	// ErrInvalidBucket is returned from calls that attempt
@@ -117,13 +93,7 @@ type Reader struct {
 	// every so often (see aws.SigningKey.Expired)
 	Key *aws.SigningKey `xml:"-"`
 
-	// Client is the HTTP client used to
-	// make HTTP requests. By default it is
-	// populated with DefaultClient, but
-	// it may be set to any reasonable http client
-	// implementation.
-	Client *http.Client `xml:"-"`
-	ctx    context.Context
+	ctx context.Context
 
 	// ETag is the ETag of the object in S3
 	// as returned by listing or a HEAD operation.
@@ -142,17 +112,16 @@ type Reader struct {
 
 // rawURI produces a URI with a pre-escaped path+query string
 func rawURI(k *aws.SigningKey, bucket string, query string) string {
-	endPoint := k.BaseURI
-	if endPoint == "" {
-		// use virtual-host style if the bucket is compatible
-		// (fallback to path-style if not)
-		if strings.IndexByte(bucket, '.') < 0 {
-			return "https://" + bucket + ".s3." + k.Region + ".amazonaws.com" + "/" + query
-		} else {
-			return "https://s3." + k.Region + ".amazonaws.com" + "/" + bucket + "/" + query
-		}
+	switch {
+	case k.BaseURI != "":
+		return k.BaseURI + "/" + bucket + "/" + query
+	// use virtual-host style if the bucket is compatible
+	// (fallback to path-style if not)
+	case strings.IndexByte(bucket, '.') < 0:
+		return "https://" + bucket + ".s3." + k.Region + ".amazonaws.com" + "/" + query
+	default:
+		return "https://s3." + k.Region + ".amazonaws.com" + "/" + bucket + "/" + query
 	}
-	return endPoint + "/" + bucket + "/" + query
 }
 
 // perform S3-specific path escaping;
@@ -161,7 +130,15 @@ func rawURI(k *aws.SigningKey, bucket string, query string) string {
 // back into / because AWS accepts those
 // as part of the URI
 func almostPathEscape(s string) string {
-	return strings.ReplaceAll(queryEscape(s), "%2F", "/")
+	for i := 0; i < len(s); i++ {
+		switch c := s[i]; {
+		case c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9':
+		case c == '-' || c == '_' || c == '.' || c == '~' || c == '/':
+		default:
+			return strings.ReplaceAll(queryEscape(s), "%2F", "/")
+		}
+	}
+	return s
 }
 
 func queryEscape(s string) string {
@@ -215,47 +192,21 @@ func NewFile(k *aws.SigningKey, bucket, object, etag string, size int64) *File {
 // Open performs a GET on an S3 object
 // and returns the associated File.
 func Open(k *aws.SigningKey, bucket, object string, contents bool) (*File, error) {
-	return openContext(context.Background(), k, bucket, object, contents, &DefaultClient)
+	return openContext(context.Background(), k, bucket, object, contents)
 }
 
-// openContext opens an object using ctx and client for S3 requests.
-func openContext(ctx context.Context, k *aws.SigningKey, bucket, object string, contents bool, client *http.Client) (*File, error) {
+// openContext opens an object using ctx for S3 requests.
+func openContext(ctx context.Context, k *aws.SigningKey, bucket, object string, contents bool) (*File, error) {
 	f := new(File)
-	err := f.openContext(ctx, client, k, bucket, object, contents)
+	err := f.openContext(ctx, k, bucket, object, contents)
 	if err != nil {
 		return nil, err
 	}
 	return f, nil
 }
 
-func flakyDo(cl *http.Client, req *http.Request) (*http.Response, error) {
-	hasBody := req.Body != nil
-	if cl == nil {
-		cl = &DefaultClient
-	}
-	res, err := cl.Do(req)
-	if err == nil && (res.StatusCode != 500 && res.StatusCode != 503) {
-		return res, err
-	}
-	if hasBody && req.GetBody == nil {
-		// can't re-do this request because
-		// we can't rewind the Body reader
-		return res, err
-	}
-	if res != nil {
-		res.Body.Close()
-	}
-	if hasBody {
-		req.Body, err = req.GetBody()
-		if err != nil {
-			return nil, fmt.Errorf("req.GetBody: %w", err)
-		}
-	}
-	return cl.Do(req)
-}
-
-func (f *File) openContext(ctx context.Context, client *http.Client, k *aws.SigningKey, bucket, object string, contents bool) error {
-	body, err := f.Reader.openContext(ctx, client, k, bucket, object, contents)
+func (f *File) openContext(ctx context.Context, k *aws.SigningKey, bucket, object string, contents bool) error {
+	body, err := f.Reader.openContext(ctx, k, bucket, object, contents)
 	if err != nil {
 		if body != nil {
 			body.Close()
@@ -271,10 +222,10 @@ func (f *File) openContext(ctx context.Context, client *http.Client, k *aws.Sign
 }
 
 func (r *Reader) open(k *aws.SigningKey, bucket, object string, contents bool) (io.ReadCloser, error) {
-	return r.openContext(context.Background(), &DefaultClient, k, bucket, object, contents)
+	return r.openContext(context.Background(), k, bucket, object, contents)
 }
 
-func (r *Reader) openContext(ctx context.Context, client *http.Client, k *aws.SigningKey, bucket, object string, contents bool) (io.ReadCloser, error) {
+func (r *Reader) openContext(ctx context.Context, k *aws.SigningKey, bucket, object string, contents bool) (io.ReadCloser, error) {
 	if !ValidBucket(bucket) {
 		return nil, badBucket(bucket)
 	}
@@ -282,17 +233,12 @@ func (r *Reader) openContext(ctx context.Context, client *http.Client, k *aws.Si
 	if contents {
 		method = http.MethodGet
 	}
-	req, err := http.NewRequestWithContext(ctx, method, uri(k, bucket, object), nil)
+	res, err := doSigned(ctx, k, method, uri(k, bucket, object), nil)
 	if err != nil {
 		return nil, err
 	}
-	k.SignV4(req, nil)
-
-	res, err := flakyDo(client, req)
-	if err != nil {
-		return nil, err
-	}
-	if res.StatusCode != 200 {
+	switch {
+	case res.StatusCode != 200:
 		var inner error
 		switch res.StatusCode {
 		case 404:
@@ -302,7 +248,7 @@ func (r *Reader) openContext(ctx context.Context, client *http.Client, k *aws.Si
 		default:
 			// NOTE: we can't extractMessage() here, because HEAD
 			// errors do not produce a response with an error message
-			inner = fmt.Errorf("s3.Open: %s returned %s", req.Method, res.Status)
+			inner = fmt.Errorf("s3.Open: %s returned %s", method, res.status())
 		}
 		err := &fs.PathError{
 			Op:   "open",
@@ -310,14 +256,12 @@ func (r *Reader) openContext(ctx context.Context, client *http.Client, k *aws.Si
 			Err:  inner,
 		}
 		return res.Body, err
-	}
-	if res.ContentLength < 0 {
+	case res.ContentLength < 0:
 		return res.Body, fmt.Errorf("s3.Open: content length %d invalid", res.ContentLength)
 	}
-	lm, _ := time.Parse(time.RFC1123, res.Header.Get("LastModified"))
+	lm, _ := time.Parse(time.RFC1123, res.Header.Get("Last-Modified"))
 	*r = Reader{
 		Key:          k,
-		Client:       client,
 		ctx:          ctx,
 		ETag:         res.Header.Get("ETag"),
 		LastModified: lm,
@@ -330,19 +274,13 @@ func (r *Reader) openContext(ctx context.Context, client *http.Client, k *aws.Si
 
 // WriteTo implements io.WriterTo
 func (r *Reader) WriteTo(w io.Writer) (int64, error) {
-	req, err := http.NewRequestWithContext(r.requestContext(), "GET", uri(r.Key, r.Bucket, r.Path), nil)
-	if err != nil {
-		return 0, err
-	}
-	r.Key.SignV4(req, nil)
-
-	res, err := flakyDo(r.Client, req)
+	res, err := doSigned(r.requestContext(), r.Key, http.MethodGet, uri(r.Key, r.Bucket, r.Path), nil)
 	if err != nil {
 		return 0, err
 	}
 	defer res.Body.Close()
 	if res.StatusCode != 200 {
-		return 0, fmt.Errorf("s3.Reader.WriteTo: status %s %q", res.Status, extractMessage(res.Body))
+		return 0, fmt.Errorf("s3.Reader.WriteTo: status %s %q", res.status(), extractMessage(res.Body))
 	}
 	return io.Copy(w, res.Body)
 }
@@ -357,10 +295,7 @@ func (r *Reader) RangeReader(off, width int64) (io.ReadCloser, error) {
 }
 
 func (r *Reader) requestContext() context.Context {
-	if r.ctx != nil {
-		return r.ctx
-	}
-	return context.Background()
+	return cmp.Or(r.ctx, context.Background())
 }
 
 func (r *Reader) rangeReaderContext(ctx context.Context, off, width int64) (io.ReadCloser, error) {
@@ -374,14 +309,14 @@ func (r *Reader) rangeReaderContext(ctx context.Context, off, width int64) (io.R
 	}
 	r.Key.SignV4(req, nil)
 
-	res, err := flakyDo(r.Client, req)
+	res, err := flakyDo(req, nil)
 	if err != nil {
 		return nil, err
 	}
 	switch res.StatusCode {
 	default:
 		defer res.Body.Close()
-		return nil, fmt.Errorf("s3.Reader.RangeReader: status %s %q", res.Status, extractMessage(res.Body))
+		return nil, fmt.Errorf("s3.Reader.RangeReader: status %s %q", res.status(), extractMessage(res.Body))
 	case http.StatusPreconditionFailed:
 		res.Body.Close()
 		return nil, ErrETagChanged
@@ -407,19 +342,13 @@ func (r *Reader) ReadAt(dst []byte, off int64) (int, error) {
 // BucketRegion returns the region associated
 // with the given bucket.
 func BucketRegion(k *aws.SigningKey, bucket string) (string, error) {
-	if !ValidBucket(bucket) {
+	switch {
+	case !ValidBucket(bucket):
 		return "", badBucket(bucket)
-	}
-	if k.BaseURI != "" {
+	case k.BaseURI != "":
 		return k.Region, nil
 	}
-	uri := rawURI(k, bucket, "")
-	req, err := http.NewRequest(http.MethodHead, uri, nil)
-	if err != nil {
-		return "", err
-	}
-	k.SignV4(req, nil)
-	res, err := flakyDo(&DefaultClient, req)
+	res, err := doSigned(context.Background(), k, http.MethodHead, rawURI(k, bucket, ""), nil)
 	if err != nil {
 		return "", err
 	}
@@ -430,13 +359,9 @@ func BucketRegion(k *aws.SigningKey, bucket string) (string, error) {
 	case 200, 301:
 		// ok
 	default:
-		return "", fmt.Errorf("s3.BucketRegion: %s %q", res.Status, extractMessage(res.Body))
+		return "", fmt.Errorf("s3.BucketRegion: %s %q", res.status(), extractMessage(res.Body))
 	}
-	region := res.Header.Get("x-amz-bucket-region")
-	if region == "" {
-		return k.Region, nil
-	}
-	return region, nil
+	return cmp.Or(res.Header.Get("x-amz-bucket-region"), k.Region), nil
 }
 
 // DeriveForBucket can be passed to aws.AmbientCreds
@@ -455,10 +380,10 @@ func DeriveForBucket(bucket string) aws.DeriveFn {
 		k := aws.DeriveKey(baseURI, id, secret, region, service)
 		k.Token = token
 		bregion, err := BucketRegion(k, bucket)
-		if err != nil {
+		switch {
+		case err != nil:
 			return nil, err
-		}
-		if bregion == region {
+		case bregion == region:
 			return k, nil
 		}
 		k = aws.DeriveKey(baseURI, id, secret, bregion, service)

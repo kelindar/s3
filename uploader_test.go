@@ -17,12 +17,135 @@ package s3
 import (
 	"bytes"
 	"context"
+	"encoding/xml"
+	"io"
 	"testing"
 
 	"github.com/kelindar/s3/aws"
 	"github.com/kelindar/s3/mock"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/valyala/fasthttp"
 )
+
+func TestUploadBuffers(t *testing.T) {
+	server := mock.New("test-bucket", "us-east-1")
+	defer server.Close()
+	server.SetRequestLogging(false)
+	key := aws.DeriveKey(server.URL(), "access", "secret", "us-east-1", "s3")
+	bucket := NewBucket(key, "test-bucket")
+
+	for _, value := range []byte{1, 2} {
+		contents := bytes.Repeat([]byte{value}, 2*MinPartSize+17)
+		require.NoError(t, bucket.WriteFrom(context.Background(), "object", bytes.NewReader(contents), int64(len(contents))))
+		stored, found := server.ObjectContent("object")
+		require.True(t, found)
+		assert.Equal(t, contents, stored)
+	}
+
+	// A short read must not upload bytes left in a buffer by a previous request.
+	err := bucket.WriteFrom(context.Background(), "short", bytes.NewReader([]byte("short")), MinPartSize)
+	assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
+	assert.False(t, server.ObjectExists("short"))
+}
+
+func TestSignedRequest(t *testing.T) {
+	for _, test := range []struct {
+		name, baseURI, scheme, host string
+	}{
+		{"aws", "", "https", "s3.us-east-1.amazonaws.com"},
+		{"custom", "http://127.0.0.1:9000", "http", "127.0.0.1:9000"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			key := aws.DeriveKey(test.baseURI, "access", "secret", "us-east-1", "s3")
+			key.Token = "session-token"
+			u := &uploader{Key: key, Bucket: "bucket", Object: "folder/a b+%&☃", Scheme: test.scheme, Host: test.host}
+			query := "partNumber=1&uploadId=id"
+			want := u.req(context.Background(), "PUT", u.Object, query)
+			got := u.signedRequest(fasthttp.MethodPut, query, []byte("contents"))
+			defer fasthttp.ReleaseRequest(got)
+			assert.Equal(t, want.URL.String(), string(got.URI().FullURI()))
+			assert.Equal(t, want.Host, string(got.Header.Host()))
+			assert.Equal(t, query, string(got.URI().QueryString()))
+			assert.Equal(t, "session-token", string(got.Header.Peek("X-Amz-Security-Token")))
+		})
+	}
+}
+
+func TestCompleteXML(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		parts []tagpart
+	}{
+		{name: "empty"},
+		{name: "one", parts: []tagpart{{Num: 1, ETag: `"abc"`}}},
+		{name: "escaped", parts: []tagpart{{Num: 1, ETag: `"a&b"`}, {Num: 10000, ETag: "'x<y>\t\r\n"}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			want, err := xml.Marshal(&struct {
+				XMLName xml.Name  `xml:"CompleteMultipartUpload"`
+				NS      string    `xml:"xmlns,attr"`
+				Parts   []tagpart `xml:"Part"`
+			}{NS: "http://s3.amazonaws.com/doc/2006-03-01/", Parts: test.parts})
+			require.NoError(t, err)
+			got, err := encodeCompleteMultipart(test.parts)
+			require.NoError(t, err)
+			assert.Equal(t, string(want), string(got))
+		})
+	}
+}
+
+func TestMultipartResponseDecode(t *testing.T) {
+	for _, input := range []string{
+		`<InitiateMultipartUploadResult><Bucket>test</Bucket><Key>a&amp;b</Key><UploadId>id-1</UploadId></InitiateMultipartUploadResult>`,
+		`<?xml version="1.0"?><CopyPartResult><ETag>&quot;abc&quot;</ETag></CopyPartResult>`,
+		`<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Location>here</Location><Bucket>test</Bucket><Key>key</Key><ETag>etag</ETag></CompleteMultipartUploadResult>`,
+		`<Error><Code>InvalidPart</Code><Message>bad &lt;part&gt;</Message></Error>`,
+		`<Error><Ignored><Code>wrong</Code></Ignored><Code>right</Code></Error>`,
+		`<Error><Message><![CDATA[unsupported fast path]]></Message></Error>`,
+		`<Error><Message>broken`,
+	} {
+		t.Run(input, func(t *testing.T) {
+			var want multipartResponse
+			wantErr := xml.NewDecoder(bytes.NewBufferString(input)).Decode(&want)
+			got, err := decodeMultipartResponse(bytes.NewBufferString(input))
+			require.Equal(t, wantErr == nil, err == nil)
+			if err == nil {
+				want.XMLName.Space = "" // Callers only use the local root name.
+				assert.Equal(t, want, got)
+			}
+		})
+	}
+
+	input := []byte(`<CopyPartResult><ETag>retained</ETag></CopyPartResult>`)
+	got, err := decodeMultipartResponse(bytes.NewReader(input))
+	require.NoError(t, err)
+	clear(input)
+	assert.Equal(t, "retained", got.ETag)
+}
+
+func FuzzMultipartResponseDecode(f *testing.F) {
+	for _, input := range []string{
+		`<InitiateMultipartUploadResult><Bucket>b</Bucket><Key>k&amp;v</Key><UploadId>id</UploadId></InitiateMultipartUploadResult>`,
+		`<CopyPartResult><ETag>&quot;abc&quot;</ETag></CopyPartResult>`,
+		`<CompleteMultipartUploadResult><ETag>abc</ETag></CompleteMultipartUploadResult>`,
+		`<Error><Code>InvalidPart</Code><Message>bad</Message></Error>`,
+	} {
+		f.Add([]byte(input))
+	}
+	f.Fuzz(func(t *testing.T, data []byte) {
+		var want multipartResponse
+		wantErr := xml.NewDecoder(bytes.NewReader(data)).Decode(&want)
+		got, gotErr := decodeMultipartResponse(bytes.NewReader(data))
+		switch {
+		case (wantErr == nil) != (gotErr == nil):
+			t.Fatalf("decode disagreement for %q: stdlib=%v fast=%v", data, wantErr, gotErr)
+		case gotErr == nil:
+			want.XMLName.Space = ""
+			assert.Equal(t, want, got)
+		}
+	})
+}
 
 // Test the public API through Bucket.WriteFrom
 func TestWriteFrom(t *testing.T) {
@@ -30,6 +153,7 @@ func TestWriteFrom(t *testing.T) {
 		bucket := "test-bucket"
 		mockServer := mock.New(bucket, "us-east-1")
 		defer mockServer.Close()
+		mockServer.SetRequestLogging(false)
 
 		key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
 		key.BaseURI = mockServer.URL()

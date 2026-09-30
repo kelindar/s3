@@ -54,4 +54,16 @@ func TestCompose(t *testing.T) {
 		require.Error(t, err)
 		require.Empty(t, server.ListMultipartUploads())
 	})
+
+	t.Run("validates range before starting upload", func(t *testing.T) {
+		server := mock.New("test-bucket", "us-east-1")
+		defer server.Close()
+		key := aws.DeriveKey("", "test", "test", "us-east-1", "s3")
+		key.BaseURI = server.URL()
+		bucket := NewBucket(key, "test-bucket")
+		part := CopyPart{SourceKey: "source.log", ETag: "etag", Offset: int64(^uint64(0) >> 1), Size: MinPartSize}
+		_, err := bucket.Compose(context.Background(), "out.log", []CopyPart{part})
+		require.Error(t, err)
+		require.Zero(t, server.RequestCount())
+	})
 }

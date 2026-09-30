@@ -115,7 +115,6 @@ You can customize the behavior of the bucket by setting options:
 
 ```go
 bucket := s3.NewBucket(key, "my-bucket")
-bucket.Client = httpClient   // Optional: Custom HTTP client
 bucket.Lazy = true           // Optional: Use HEAD instead of GET for Open()
 ```
 

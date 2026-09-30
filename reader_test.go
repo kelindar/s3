@@ -18,66 +18,61 @@ package s3
 import (
 	"bytes"
 	"io"
+	"net/url"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/kelindar/s3/aws"
 	"github.com/kelindar/s3/mock"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-func TestValidBuckets(t *testing.T) {
-	bucketNames := []string{
+func TestValidBucket(t *testing.T) {
+	tests := map[string]bool{
 		// from AWS docs
-		"docexamplebucket1",
-		"log-delivery-march-2020",
-		"my-hosted-content",
+		"docexamplebucket1":       true,
+		"log-delivery-march-2020": true,
+		"my-hosted-content":       true,
 
 		// from AWS docs (valid, but not recommended)
-		"docexamplewebsite.com",
-		"www.docexamplewebsite.com",
-		"my.example.s3.bucket",
+		"docexamplewebsite.com":     true,
+		"www.docexamplewebsite.com": true,
+		"my.example.s3.bucket":      true,
 
 		// additional valid bucket names
-		"default",
-		"abc",
-		"123456789",
-		"this.is.a.long.bucket-name",
-		"123456789a123456789b123456789c123456789d123456789e123456789f123",
-	}
-	for _, bucketName := range bucketNames {
-		t.Run(bucketName, func(t *testing.T) {
-			assert.True(t, ValidBucket(bucketName), "bucket name %q should be valid", bucketName)
-		})
-	}
-}
+		"default":                    true,
+		"abc":                        true,
+		"123456789":                  true,
+		"this.is.a.long.bucket-name": true,
+		"123456789a123456789b123456789c123456789d123456789e123456789f123": true,
 
-func TestInvalidBuckets(t *testing.T) {
-	bucketNames := []string{
 		// from AWS docs (invalid)
-		"doc_example_bucket",  // contains underscores
-		"DocExampleBucket",    // contains uppercase letters
-		"doc-example-bucket-", // ends with a hyphen
+		"doc_example_bucket":  false, // contains underscores
+		"DocExampleBucket":    false, // contains uppercase letters
+		"doc-example-bucket-": false, // ends with a hyphen
 
 		// additional invalid bucket names
-		"-startwithhyphen",       // starts with a hyphen
-		".startwithdot",          // starts with a dot
-		"double..dot",            // two consecutive dots
-		"xn---invalid-prefix",    // invalid prefix
-		"invalid-suffix-s3alias", // invalid suffix
-		"a",                      // too short (at least 3 chars)
-		"ab",                     // too short (at least 2 chars)
-		"123456789a123456789b123456789c123456789d123456789e123456789F1234", // too long (<=63 chars)
+		"-startwithhyphen":       false, // starts with a hyphen
+		".startwithdot":          false, // starts with a dot
+		"double..dot":            false, // two consecutive dots
+		"xn---invalid-prefix":    false, // invalid prefix
+		"invalid-suffix-s3alias": false, // invalid suffix
+		"a":                      false, // too short (at least 3 chars)
+		"ab":                     false, // too short (at least 3 chars)
+		"123456789a123456789b123456789c123456789d123456789e123456789F1234": false, // too long (<=63 chars)
 		// TODO: IP check is not implemented and is treated as a valid bucket-name
-		//"192.168.5.4",		  // IP address
+		//"192.168.5.4": false, // IP address
 	}
-	for _, bucketName := range bucketNames {
-		t.Run(bucketName, func(t *testing.T) {
-			assert.False(t, ValidBucket(bucketName), "bucket name %q should be invalid", bucketName)
+	for name, want := range tests {
+		t.Run(name, func(t *testing.T) {
+			assert.Equal(t, want, ValidBucket(name), "bucket name %q", name)
 		})
 	}
 }
 
-func TestReader_RangeReader(t *testing.T) {
+func TestReader(t *testing.T) {
 	bucket := "test-bucket"
 	mockServer := mock.New(bucket, "us-east-1")
 	defer mockServer.Close()
@@ -85,86 +80,50 @@ func TestReader_RangeReader(t *testing.T) {
 	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
 	key.BaseURI = mockServer.URL()
 
-	// Create test content
-	content := []byte("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")
-	objectKey := "test/range-test.txt"
-	etag := mockServer.PutObject(objectKey, content)
-
-	reader := &Reader{
-		Key:    key,
-		Client: &DefaultClient,
-		ETag:   etag,
-		Size:   int64(len(content)),
-		Bucket: bucket,
-		Path:   objectKey,
+	put := func(objectKey string, content []byte) *Reader {
+		return &Reader{
+			Key:    key,
+			ETag:   mockServer.PutObject(objectKey, content),
+			Size:   int64(len(content)),
+			Bucket: bucket,
+			Path:   objectKey,
+		}
 	}
 
-	// Test range read
-	rangeReader, err := reader.RangeReader(10, 10)
-	assert.NoError(t, err)
-	defer rangeReader.Close()
+	t.Run("range reader", func(t *testing.T) {
+		content := []byte("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+		reader := put("test/range-test.txt", content)
 
-	rangeContent, err := io.ReadAll(rangeReader)
-	assert.NoError(t, err)
-	assert.Equal(t, content[10:20], rangeContent)
-}
+		rangeReader, err := reader.RangeReader(10, 10)
+		require.NoError(t, err)
+		defer rangeReader.Close()
 
-func TestReader_ReadAt(t *testing.T) {
-	bucket := "test-bucket"
-	mockServer := mock.New(bucket, "us-east-1")
-	defer mockServer.Close()
+		rangeContent, err := io.ReadAll(rangeReader)
+		assert.NoError(t, err)
+		assert.Equal(t, content[10:20], rangeContent)
+	})
 
-	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
-	key.BaseURI = mockServer.URL()
+	t.Run("read at", func(t *testing.T) {
+		content := []byte("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+		reader := put("test/readat-test.txt", content)
 
-	content := []byte("0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ")
-	objectKey := "test/readat-test.txt"
-	etag := mockServer.PutObject(objectKey, content)
+		buf := make([]byte, 10)
+		n, err := reader.ReadAt(buf, 5)
+		assert.NoError(t, err)
+		assert.Equal(t, 10, n)
+		assert.Equal(t, content[5:15], buf)
+	})
 
-	reader := &Reader{
-		Key:    key,
-		Client: &DefaultClient,
-		ETag:   etag,
-		Size:   int64(len(content)),
-		Bucket: bucket,
-		Path:   objectKey,
-	}
+	t.Run("write to", func(t *testing.T) {
+		content := []byte("WriteTo test content")
+		reader := put("test/writeto-test.txt", content)
 
-	// Test ReadAt
-	buf := make([]byte, 10)
-	n, err := reader.ReadAt(buf, 5)
-	assert.NoError(t, err)
-	assert.Equal(t, 10, n)
-	assert.Equal(t, content[5:15], buf)
-}
-
-func TestReader_WriteTo(t *testing.T) {
-	bucket := "test-bucket"
-	mockServer := mock.New(bucket, "us-east-1")
-	defer mockServer.Close()
-
-	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
-	key.BaseURI = mockServer.URL()
-
-	content := []byte("WriteTo test content")
-	objectKey := "test/writeto-test.txt"
-	etag := mockServer.PutObject(objectKey, content)
-
-	reader := &Reader{
-		Key:    key,
-		Client: &DefaultClient,
-		ETag:   etag,
-		Size:   int64(len(content)),
-		Bucket: bucket,
-		Path:   objectKey,
-	}
-
-	// Test WriteTo
-	var buf bytes.Buffer
-	n, err := reader.WriteTo(&buf)
-	assert.NoError(t, err)
-	assert.Equal(t, int64(len(content)), n)
-	assert.Equal(t, content, buf.Bytes())
+		var buf bytes.Buffer
+		n, err := reader.WriteTo(&buf)
+		assert.NoError(t, err)
+		assert.Equal(t, int64(len(content)), n)
+		assert.Equal(t, content, buf.Bytes())
+	})
 }
 
 func TestStat(t *testing.T) {
@@ -184,6 +143,9 @@ func TestStat(t *testing.T) {
 	assert.Equal(t, objectKey, reader.Path)
 	assert.Equal(t, int64(len(content)), reader.Size)
 	assert.NotEmpty(t, reader.ETag)
+	stored, ok := mockServer.GetObject(objectKey)
+	require.True(t, ok)
+	assert.WithinDuration(t, stored.LastModified, reader.LastModified, time.Second)
 }
 
 func TestNewFile(t *testing.T) {
@@ -218,6 +180,18 @@ func TestURL(t *testing.T) {
 	assert.ErrorIs(t, err, ErrInvalidBucket)
 }
 
+func TestPathEscape(t *testing.T) {
+	for value := 0; value < 128; value++ {
+		path := "a/" + string(rune(value)) + "z"
+		want := strings.ReplaceAll(strings.ReplaceAll(url.QueryEscape(path), "+", "%20"), "%2F", "/")
+		assert.Equal(t, want, almostPathEscape(path), "path %q", path)
+	}
+	for _, path := range []string{"folder/file.txt", "folder/é😀.txt"} {
+		want := strings.ReplaceAll(strings.ReplaceAll(url.QueryEscape(path), "+", "%20"), "%2F", "/")
+		assert.Equal(t, want, almostPathEscape(path), "path %q", path)
+	}
+}
+
 func TestBucketRegion(t *testing.T) {
 	bucket := "test-bucket"
 	mockServer := mock.New(bucket, "us-east-1")
@@ -226,14 +200,22 @@ func TestBucketRegion(t *testing.T) {
 	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
 	key.BaseURI = mockServer.URL()
 
-	region, err := BucketRegion(key, bucket)
-	assert.NoError(t, err)
-	assert.Equal(t, "us-east-1", region)
+	t.Run("custom base uri", func(t *testing.T) {
+		region, err := BucketRegion(key, bucket)
+		assert.NoError(t, err)
+		assert.Equal(t, "us-east-1", region)
+	})
 
-	// Test invalid bucket
-	_, err = BucketRegion(key, "invalid_bucket")
-	assert.Error(t, err)
-	assert.ErrorIs(t, err, ErrInvalidBucket)
+	t.Run("default aws", func(t *testing.T) {
+		// Outcome depends on network access to AWS, so only the code path is exercised.
+		defaultKey := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
+		_, _ = BucketRegion(defaultKey, bucket)
+	})
+
+	t.Run("invalid bucket", func(t *testing.T) {
+		_, err := BucketRegion(key, "invalid_bucket")
+		assert.ErrorIs(t, err, ErrInvalidBucket)
+	})
 }
 
 func TestDeriveForBucket(t *testing.T) {
@@ -258,32 +240,6 @@ func TestDeriveForBucket(t *testing.T) {
 	assert.Error(t, err)
 }
 
-func TestBucketRegion_Comprehensive(t *testing.T) {
-	bucket := "test-bucket"
-	mockServer := mock.New(bucket, "us-east-1")
-	defer mockServer.Close()
-
-	key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
-	key.BaseURI = mockServer.URL()
-
-	// Test with custom base URI (should return key.Region)
-	region, err := BucketRegion(key, bucket)
-	assert.NoError(t, err)
-	assert.Equal(t, "us-east-1", region)
-
-	// Test with default AWS (no custom base URI)
-	defaultKey := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
-	// This will likely fail in test environment, but tests the code path
-	_, err = BucketRegion(defaultKey, bucket)
-	// We expect an error since we're not in AWS environment, but it might succeed in some cases
-	// so we don't assert the error
-
-	// Test invalid bucket
-	_, err = BucketRegion(key, "invalid_bucket")
-	assert.Error(t, err)
-	assert.ErrorIs(t, err, ErrInvalidBucket)
-}
-
 func TestReaderErrors(t *testing.T) {
 	t.Run("range reader", func(t *testing.T) {
 		bucket := "test-bucket"
@@ -300,7 +256,6 @@ func TestReaderErrors(t *testing.T) {
 
 		reader := &Reader{
 			Key:    key,
-			Client: &DefaultClient,
 			ETag:   etag,
 			Size:   int64(len(content)),
 			Bucket: bucket,
@@ -314,7 +269,6 @@ func TestReaderErrors(t *testing.T) {
 		// Test with invalid bucket in reader
 		invalidReader := &Reader{
 			Key:    key,
-			Client: &DefaultClient,
 			ETag:   etag,
 			Size:   int64(len(content)),
 			Bucket: "invalid_bucket",
@@ -329,7 +283,6 @@ func TestReaderErrors(t *testing.T) {
 		// Test with non-existent object
 		nonExistentReader := &Reader{
 			Key:    key,
-			Client: &DefaultClient,
 			ETag:   "fake-etag",
 			Size:   100,
 			Bucket: bucket,
@@ -351,7 +304,6 @@ func TestReaderErrors(t *testing.T) {
 		// Test with non-existent object
 		reader := &Reader{
 			Key:    key,
-			Client: &DefaultClient,
 			ETag:   "fake-etag",
 			Size:   100,
 			Bucket: bucket,
@@ -365,7 +317,6 @@ func TestReaderErrors(t *testing.T) {
 		// Test with invalid bucket
 		invalidReader := &Reader{
 			Key:    key,
-			Client: &DefaultClient,
 			ETag:   "fake-etag",
 			Size:   100,
 			Bucket: "invalid_bucket",
@@ -387,7 +338,6 @@ func TestReaderErrors(t *testing.T) {
 		// Test with non-existent object
 		reader := &Reader{
 			Key:    key,
-			Client: &DefaultClient,
 			ETag:   "fake-etag",
 			Size:   100,
 			Bucket: bucket,

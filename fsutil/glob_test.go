@@ -123,10 +123,10 @@ func TestWalkGlobOps(t *testing.T) {
 		if name, ok := strings.CutSuffix(list[i], "/"); ok {
 			err := os.Mkdir(filepath.Join(tmp, name), 0750)
 			assert.NoError(t, err, "creating dir %q", name)
-		} else {
-			err := os.WriteFile(filepath.Join(tmp, list[i]), []byte{}, 0640)
-			assert.NoError(t, err, "creating file %q", list[i])
+			continue
 		}
+		err := os.WriteFile(filepath.Join(tmp, list[i]), []byte{}, 0640)
+		assert.NoError(t, err, "creating file %q", list[i])
 	}
 	tfs := &traceFS{fs: os.DirFS(tmp)}
 	var got []string

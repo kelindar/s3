@@ -15,10 +15,12 @@
 package s3
 
 import (
+	"bytes"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"io/fs"
-	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,6 +28,7 @@ import (
 	"github.com/kelindar/s3/fsutil"
 	"github.com/kelindar/s3/mock"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestPrefix(t *testing.T) {
@@ -421,25 +424,121 @@ func TestPrefix(t *testing.T) {
 		}
 	})
 
-	t.Run("client", func(t *testing.T) {
-		bucket := "test-bucket"
-		key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
+}
 
-		// Test with nil client
-		prefix := &Prefix{
-			Key:    key,
-			Bucket: bucket,
-			Path:   "test/",
-			Client: nil,
+func TestListQuery(t *testing.T) {
+	server := mock.New("test-bucket", "us-east-1")
+	defer server.Close()
+	key := aws.DeriveKey("", "test", "test", "us-east-1", "s3")
+	key.BaseURI = server.URL()
+	prefix := &Prefix{Key: key, Bucket: "test-bucket", Path: "dir/"}
+
+	_, err := prefix.list(7, "next+ page", "file 2", "file")
+	require.NoError(t, err)
+	requests := server.GetRequestLog()
+	require.Len(t, requests, 1)
+	assert.Equal(t, "continuation-token=next%2B+page&delimiter=%2F&list-type=2&max-keys=7&prefix=dir%2Ffile&start-after=dir%2Ffile%202", requests[0].Query)
+}
+
+func BenchmarkListXMLDecode(b *testing.B) {
+	for _, count := range []int{100, 1000} {
+		var fixture bytes.Buffer
+		fixture.WriteString("<ListBucketResult><IsTruncated>false</IsTruncated>")
+		for i := range count {
+			fmt.Fprintf(&fixture, "<Contents><Key>folder/file-%04d.txt</Key><LastModified>2026-01-02T03:04:05.000Z</LastModified><ETag>etag</ETag><Size>1</Size></Contents>", i)
 		}
+		fixture.WriteString("</ListBucketResult>")
+		data := fixture.Bytes()
+		b.Run(fmt.Sprint(count), func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				result, err := decodeListResponse(data)
+				switch {
+				case err != nil:
+					b.Fatal(err)
+				case len(result.Contents) != count:
+					b.Fatalf("decoded %d entries, want %d", len(result.Contents), count)
+				}
+			}
+		})
+	}
+}
 
-		client := prefix.client()
-		assert.Equal(t, &DefaultClient, client)
+func TestListResponseDecode(t *testing.T) {
+	tests := []struct {
+		name string
+		xml  string
+	}{
+		{name: "empty", xml: `<ListBucketResult/>`},
+		{name: "objects and prefixes", xml: `<ListBucketResult xmlns="urn:s3"><IsTruncated>true</IsTruncated><Contents><Key>folder/a&amp;b.txt</Key><LastModified>2026-01-02T03:04:05.000Z</LastModified><ETag>&quot;e&quot;</ETag><Size>12</Size><StorageClass>STANDARD</StorageClass></Contents><CommonPrefixes><Prefix>folder/sub/</Prefix></CommonPrefixes><EncodingType>url</EncodingType><NextContinuationToken>next&amp;page</NextContinuationToken><Owner><ID>ignored</ID></Owner></ListBucketResult>`},
+		{name: "reordered fields", xml: `<ListBucketResult><NextContinuationToken>token</NextContinuationToken><Contents><Size>0</Size><ETag>etag</ETag><Key>key</Key></Contents><IsTruncated>false</IsTruncated></ListBucketResult>`},
+		{name: "numeric entities", xml: `<ListBucketResult><Contents><Key>emoji-&#x1F600;-&#38;.txt</Key></Contents></ListBucketResult>`},
+		{name: "encoded scalar fallback", xml: `<ListBucketResult><IsTruncated>&#116;rue</IsTruncated><Contents><Key>key</Key><LastModified>2026-01-02T03:04:05&#90;</LastModified><Size>&#49;</Size></Contents></ListBucketResult>`},
+		{name: "xml declaration", xml: `<?xml version="1.0" encoding="UTF-8"?><ListBucketResult/>`},
+		{name: "comment fallback", xml: `<ListBucketResult><!--page--><Contents><Key>key</Key></Contents></ListBucketResult>`},
+		{name: "prefixed fallback", xml: `<s:ListBucketResult xmlns:s="urn:s3"><s:Contents><s:Key>key</s:Key></s:Contents></s:ListBucketResult>`},
+		{name: "invalid declaration", xml: `<?xml garbage?><ListBucketResult/>`},
+		{name: "invalid attribute", xml: `<ListBucketResult xmlns!="urn:s3"/>`},
+		{name: "bad scalar", xml: `<ListBucketResult><Contents><Size>bad</Size></Contents></ListBucketResult>`},
+		{name: "truncated", xml: `<ListBucketResult><Contents><Key>key</Key></Contents>`},
+	}
+	type standardListResponse listResponse
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := decodeListResponse([]byte(test.xml))
+			var want listResponse
+			wantErr := xml.Unmarshal([]byte(test.xml), (*standardListResponse)(&want))
+			assert.Equal(t, wantErr != nil, err != nil)
+			if err == nil && wantErr == nil {
+				assert.Equal(t, want, got)
+			}
+		})
+	}
+}
 
-		// Test with custom client
-		customClient := &http.Client{}
-		prefix.Client = customClient
-		client = prefix.client()
-		assert.Equal(t, customClient, client)
+func TestListResponseOwnership(t *testing.T) {
+	data := []byte(`<ListBucketResult><Contents><Key>file.txt</Key><ETag>&quot;tag&quot;</ETag></Contents><CommonPrefixes><Prefix>dir/</Prefix></CommonPrefixes><NextContinuationToken>next</NextContinuationToken></ListBucketResult>`)
+	result, err := decodeListResponse(data)
+	require.NoError(t, err)
+	require.Len(t, result.Contents, 1)
+	require.Len(t, result.CommonPrefixes, 1)
+	for i := range data {
+		data[i] = 'x'
+	}
+	assert.Equal(t, "file.txt", result.Contents[0].Path())
+	assert.Equal(t, `"tag"`, result.Contents[0].ETag)
+	assert.Equal(t, "dir/", result.CommonPrefixes[0].Path)
+	assert.Equal(t, "next", result.NextToken)
+}
+
+func TestListBatchOwnership(t *testing.T) {
+	var body bytes.Buffer
+	body.WriteString("<ListBucketResult>")
+	for i := range 130 {
+		fmt.Fprintf(&body, "<Contents><ETag>&quot;tag-%d&quot;</ETag><Key>dir/file-%04d%s&amp;x</Key><Size>%d</Size></Contents>", i, i, strings.Repeat("x", i%23), i)
+	}
+	body.WriteString("</ListBucketResult>")
+	data := body.Bytes()
+	var want standardListResponse
+	require.NoError(t, xml.Unmarshal(data, &want))
+	got, err := decodeListResponse(data)
+	require.NoError(t, err)
+	assert.Equal(t, listResponse(want), got)
+	clear(data)
+	assert.Equal(t, listResponse(want), got)
+}
+
+func FuzzListResponseDecode(f *testing.F) {
+	f.Add([]byte(`<ListBucketResult><Contents><Key>key</Key><Size>1</Size></Contents></ListBucketResult>`))
+	f.Add([]byte(`<ListBucketResult><CommonPrefixes><Prefix>dir/</Prefix></CommonPrefixes></ListBucketResult>`))
+	f.Add([]byte(`<ListBucketResult><IsTruncated>invalid</IsTruncated></ListBucketResult>`))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		got, err := decodeListResponse(data)
+		var want standardListResponse
+		wantErr := xml.Unmarshal(data, &want)
+		assert.Equal(t, wantErr == nil, err == nil)
+		if err == nil {
+			assert.Equal(t, listResponse(want), got)
+		}
 	})
 }

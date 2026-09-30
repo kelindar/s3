@@ -119,10 +119,10 @@ type walkDirFn func(f fs.FS, name, seek, pattern string, fn WalkDirFn) error
 func flatwalk(walkdir walkDirFn, f fs.FS, name, seek, pattern string, limit uint) ([]string, error) {
 	var out []string
 	err := walkdir(f, name, seek, pattern, func(p string, d DirEntry, err error) error {
-		if limit > 0 && uint(len(out)) >= limit {
+		switch {
+		case limit > 0 && uint(len(out)) >= limit:
 			panic("fs.SkipAll did not work as expected")
-		}
-		if err != nil {
+		case err != nil:
 			return err
 		}
 		out = append(out, p)
@@ -189,10 +189,10 @@ func FuzzWalkDir(f *testing.F) {
 		if !strings.Contains(list[i], ".") {
 			err := os.Mkdir(filepath.Join(tmp, list[i]), 0750)
 			assert.NoError(f, err, "creating dir %q", list[i])
-		} else {
-			err := os.WriteFile(filepath.Join(tmp, list[i]), []byte{}, 0640)
-			assert.NoError(f, err, "creating file %q", list[i])
+			continue
 		}
+		err := os.WriteFile(filepath.Join(tmp, list[i]), []byte{}, 0640)
+		assert.NoError(f, err, "creating file %q", list[i])
 	}
 	dir := os.DirFS(tmp)
 	for _, seek := range seeks {
@@ -209,9 +209,10 @@ func FuzzWalkDir(f *testing.F) {
 			// make sure path is not rejected by the
 			// file system
 			f, err := dir.Open(seek)
-			if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			switch {
+			case err != nil && !errors.Is(err, fs.ErrNotExist):
 				return false
-			} else if err == nil {
+			case err == nil:
 				f.Close()
 			}
 		}
@@ -252,10 +253,10 @@ func FuzzWalkDir(f *testing.F) {
 
 func FuzzSegments(f *testing.F) {
 	trivial := func(p string) (int, bool) {
-		if p == "" || p == "." {
+		switch {
+		case p == "" || p == ".":
 			return 0, true
-		}
-		if !fs.ValidPath(p) {
+		case !fs.ValidPath(p):
 			return 0, false
 		}
 		return strings.Count(p, "/") + 1, true
@@ -284,13 +285,12 @@ func FuzzSegments(f *testing.F) {
 
 func FuzzTrim(f *testing.F) {
 	trivial := func(p string, n int) (front, next string, ok bool) {
-		if p != "" && !fs.ValidPath(p) {
+		switch {
+		case p != "" && !fs.ValidPath(p):
 			return "", "", false
-		}
-		if p == "" || p == "." {
-			if n == 0 {
-				return "", p, true
-			}
+		case (p == "" || p == ".") && n == 0:
+			return "", p, true
+		case p == "" || p == ".":
 			return p, "", true
 		}
 		join := func(ps []string) string {
@@ -370,13 +370,12 @@ func FuzzPathcmp(f *testing.F) {
 
 func FuzzTreecmp(f *testing.F) {
 	trivial := func(root, p string) int {
-		if root == "." {
+		switch {
+		case root == ".":
 			return 0
-		}
-		if p == "." {
+		case p == ".":
 			return -1
-		}
-		if root == p || strings.HasPrefix(p, root) && p[len(root)] == '/' {
+		case root == p || strings.HasPrefix(p, root) && p[len(root)] == '/':
 			return 0
 		}
 		// make a file tree
@@ -392,10 +391,10 @@ func FuzzTreecmp(f *testing.F) {
 			return pathcmp(a, b)
 		})
 		// look for p
-		if tree[0] == p {
+		switch p {
+		case tree[0]:
 			return -1
-		}
-		if tree[len(tree)-1] == p {
+		case tree[len(tree)-1]:
 			return 1
 		}
 		return 0

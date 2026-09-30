@@ -49,14 +49,13 @@ func WalkGlob(f fs.FS, seek, pattern string, walk WalkGlobFn) error {
 	}
 	pre := MetaPrefix(pattern)
 	outer := func(p string, d DirEntry, err error) error {
-		if err != nil {
+		switch file, ok := d.(fs.File); {
+		case err != nil:
 			return walk(p, nil, err)
-		}
-		if d.IsDir() {
+		case d.IsDir():
 			return nil
-		}
-		if f, ok := d.(fs.File); ok {
-			return walk(p, f, nil)
+		case ok:
+			return walk(p, file, nil)
 		}
 		file, err := f.Open(p)
 		return walk(p, file, err)

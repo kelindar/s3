@@ -20,6 +20,7 @@ package aws
 
 import (
 	"bytes"
+	"cmp"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -30,6 +31,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -67,8 +69,11 @@ func signedHeaders(req *http.Request) []string {
 	headers := sigheaders
 	var extra []string
 	for header := range req.Header {
+		if len(header) < 3 || !strings.EqualFold(header[:3], "if-") {
+			continue
+		}
 		name := strings.ToLower(header)
-		if !strings.HasPrefix(name, "if-") || req.Header.Get(name) == "" || slices.Contains(sigheaders, name) {
+		if signedHeaderValue(req, name) == "" || slices.Contains(sigheaders, name) {
 			continue
 		}
 		extra = append(extra, name)
@@ -84,10 +89,45 @@ func signedHeaders(req *http.Request) []string {
 	return headers
 }
 
+func signedHeaderValue(req *http.Request, name string) string {
+	switch name {
+	case "host":
+		switch values := req.Header["Host"]; {
+		case len(values) > 0:
+			return values[0]
+		case req.Host != "":
+			return req.Host
+		}
+		return req.URL.Host
+	case "if-match":
+		name = "If-Match"
+	case "if-none-match":
+		name = "If-None-Match"
+	case "x-amz-content-sha256":
+		name = "X-Amz-Content-Sha256"
+	case "x-amz-copy-source":
+		name = "X-Amz-Copy-Source"
+	case "x-amz-copy-source-if-match":
+		name = "X-Amz-Copy-Source-If-Match"
+	case "x-amz-copy-source-range":
+		name = "X-Amz-Copy-Source-Range"
+	case "x-amz-date":
+		name = "X-Amz-Date"
+	case "x-amz-security-token":
+		name = "X-Amz-Security-Token"
+	default:
+		name = http.CanonicalHeaderKey(name)
+	}
+	if values := req.Header[name]; len(values) > 0 {
+		return values[0]
+	}
+	return ""
+}
+
 func writeSignedHeaders(dst *bytes.Buffer, req *http.Request, headers []string) {
 	first := true
 	for _, header := range headers {
-		if req.Header.Get(header) == "" {
+		if signedHeaderValue(req, header) == "" {
 			continue
 		}
 		if !first {
@@ -98,8 +138,8 @@ func writeSignedHeaders(dst *bytes.Buffer, req *http.Request, headers []string) 
 	}
 }
 
-func (s *SigningKey) toscope(dst *bytes.Buffer, now time.Time) {
-	dst.WriteString(now.Format(shortFormat))
+func (s *SigningKey) toscope(dst *bytes.Buffer, date []byte) {
+	dst.Write(date)
 	dst.WriteByte('/')
 	dst.WriteString(s.Region)
 	dst.WriteByte('/')
@@ -110,46 +150,35 @@ func (s *SigningKey) toscope(dst *bytes.Buffer, now time.Time) {
 // string to sign
 // see
 // https://docs.aws.amazon.com/general/latest/gr/sigv4-create-canonical-request.html
-func (s *SigningKey) tosign(dst *bytes.Buffer, now time.Time, reqhash string) {
+func (s *SigningKey) tosign(dst *bytes.Buffer, stamp, reqhash []byte) {
 	dst.WriteString("AWS4-HMAC-SHA256\n")
 	// date value
-	dst.WriteString(now.Format(longFormat))
+	dst.Write(stamp)
 	dst.WriteByte('\n')
 	// request scope
-	s.toscope(dst, now)
+	s.toscope(dst, stamp[:8])
 	dst.WriteByte('\n')
 	// request hash
-	dst.WriteString(reqhash)
+	dst.Write(reqhash)
 }
 
 // write the 'canonical request' into dst
 // see https://docs.aws.amazon.com/general/latest/gr/sigv4-create-canonical-request.html
-func canonical(dst *bytes.Buffer, req *http.Request) {
+func canonical(dst *bytes.Buffer, req *http.Request) []string {
 	dst.WriteString(req.Method)
 	dst.WriteByte('\n')
 
-	uri := req.URL.EscapedPath()
-	if uri == "" {
-		uri = "/"
-	}
-	dst.WriteString(uri)
+	dst.WriteString(cmp.Or(req.URL.EscapedPath(), "/"))
 	dst.WriteByte('\n')
 
 	querystr := strings.TrimSuffix(req.URL.RawQuery, " HTTP/1.1")
 	dst.WriteString(querystr)
 	dst.WriteByte('\n')
 
-	// we are *required* to signed the host header;
-	// everything else is optional (except for HTTP/2,
-	// which requires the authority header)
-	if req.Header.Get("Host") == "" {
-		req.Header.Set("Host", req.URL.Host)
-	}
-
 	var bodyhash string
 	headers := signedHeaders(req)
 	for _, h := range headers {
-		hdr := req.Header.Get(h)
+		hdr := signedHeaderValue(req, h)
 		if hdr == "" {
 			continue
 		}
@@ -170,9 +199,24 @@ func canonical(dst *bytes.Buffer, req *http.Request) {
 	// needs to match the header,
 	// even if it is the string UNSIGNED-PAYLOAD
 	if bodyhash == "" {
-		bodyhash = req.Header.Get("x-amz-content-sha256")
+		bodyhash = signedHeaderValue(req, "x-amz-content-sha256")
 	}
 	dst.WriteString(bodyhash)
+	return headers
+}
+
+type signingBody struct {
+	bytes.Reader
+}
+
+func newSigningBody(body []byte) *signingBody {
+	reader := &signingBody{}
+	reader.Reset(body)
+	return reader
+}
+
+func (r *signingBody) Close() error {
+	return nil
 }
 
 // SignV4 signs an http.Request using the
@@ -190,55 +234,132 @@ func canonical(dst *bytes.Buffer, req *http.Request) {
 // a bare trailing '=' so that they are canonicalized
 // correctly.
 func (s *SigningKey) SignV4(req *http.Request, body []byte) {
-	var buf bytes.Buffer
+	var storage [512]byte
+	buf := bytes.NewBuffer(storage[:0])
+	valueCount := 3
+	if s.Token != "" {
+		valueCount++
+	}
+	values := make([]string, valueCount)
 
 	now := signtime().UTC()
-	req.Header.Set("x-amz-date", now.Format(longFormat))
+	values[0] = now.Format(longFormat)
+	req.Header["X-Amz-Date"] = values[0:1:1]
 	if s.Token != "" {
-		req.Header.Set("x-amz-security-token", s.Token)
+		values[3] = s.Token
+		req.Header["X-Amz-Security-Token"] = values[3:4:4]
 	}
 
 	// canonical() uses the value we set here
 	// as the hash of the body
+	//
+	// note: could also just calculate the sha256 of the payload,
+	// but really we should just use HTTPS, which provides
+	// better integrity guarantees anyway...
+	values[1] = "UNSIGNED-PAYLOAD"
 	if body == nil {
-		req.Header.Set("x-amz-content-sha256", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
-	} else {
-		// note: could also just calculate the sha256 of the payload,
-		// but really we should just use HTTPS, which provides
-		// better integrity guarantees anyway...
-		req.Header.Set("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+		values[1] = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 	}
+	req.Header["X-Amz-Content-Sha256"] = values[1:2:2]
 
 	// compute signature
 	// and stick it into hexbuf
 	var hexbuf [2 * sha256.Size]byte
-	canonical(&buf, req)
+	headers := canonical(buf, req)
 	h := sha256.Sum256(buf.Bytes())
 	buf.Reset()
-	s.tosign(&buf, now, hex.EncodeToString(h[:]))
+	var reqhash [2 * sha256.Size]byte
+	hex.Encode(reqhash[:], h[:])
+	s.tosign(buf, []byte(values[0]), reqhash[:])
 	s.sign(buf.Bytes(), hexbuf[:], now)
 
 	buf.Reset()
 	buf.WriteString("AWS4-HMAC-SHA256 Credential=")
 	buf.WriteString(s.AccessKey)
 	buf.WriteByte('/')
-	s.toscope(&buf, now)
+	s.toscope(buf, []byte(values[0][:8]))
 	buf.WriteString(", SignedHeaders=")
-	writeSignedHeaders(&buf, req, signedHeaders(req))
+	writeSignedHeaders(buf, req, headers)
 	buf.WriteString(", Signature=")
 	buf.Write(hexbuf[:])
 
-	req.Header.Set("Authorization", buf.String())
+	values[2] = buf.String()
+	req.Header["Authorization"] = values[2:3:3]
 
-	if body != nil {
-		req.Body = io.NopCloser(bytes.NewReader(body))
-		req.ContentLength = int64(len(body))
-		req.GetBody = func() (io.ReadCloser, error) {
-			return io.NopCloser(bytes.NewReader(body)), nil
-		}
-	} else {
+	if body == nil {
 		req.Body = nil
+		return
 	}
+	req.Body = newSigningBody(body)
+	req.ContentLength = int64(len(body))
+	req.GetBody = func() (io.ReadCloser, error) {
+		return newSigningBody(body), nil
+	}
+}
+
+// SignV4Raw signs a request whose only signed headers are host, the S3 payload
+// hash, date, and optional security token. path must already be escaped and
+// query must already be in canonical order. The caller sets the returned date,
+// payload hash, and authorization headers, plus X-Amz-Security-Token when set.
+func (s *SigningKey) SignV4Raw(method, path, query, host string, body []byte) (date, payloadHash, authorization string) {
+	var storage [512]byte
+	buf := bytes.NewBuffer(storage[:0])
+	now := signtime().UTC()
+	var stampStorage [len(longFormat)]byte
+	stamp := now.AppendFormat(stampStorage[:0], longFormat)
+	path = cmp.Or(path, "/")
+	payloadHash = "UNSIGNED-PAYLOAD"
+	if body == nil {
+		payloadHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+	}
+	const baseHeaders = "host;x-amz-content-sha256;x-amz-date"
+	headers := baseHeaders
+	if s.Token != "" {
+		headers += ";x-amz-security-token"
+	}
+
+	buf.WriteString(method)
+	buf.WriteByte('\n')
+	buf.WriteString(path)
+	buf.WriteByte('\n')
+	buf.WriteString(query)
+	buf.WriteString("\nhost:")
+	buf.WriteString(host)
+	buf.WriteString("\nx-amz-content-sha256:")
+	buf.WriteString(payloadHash)
+	buf.WriteString("\nx-amz-date:")
+	buf.Write(stamp)
+	buf.WriteByte('\n')
+	if s.Token != "" {
+		buf.WriteString("x-amz-security-token:")
+		buf.WriteString(s.Token)
+		buf.WriteByte('\n')
+	}
+	buf.WriteByte('\n')
+	buf.WriteString(headers)
+	buf.WriteByte('\n')
+	buf.WriteString(payloadHash)
+
+	var hexbuf [2 * sha256.Size]byte
+	h := sha256.Sum256(buf.Bytes())
+	buf.Reset()
+	var reqhash [2 * sha256.Size]byte
+	hex.Encode(reqhash[:], h[:])
+	s.tosign(buf, stamp, reqhash[:])
+	s.sign(buf.Bytes(), hexbuf[:], now)
+
+	buf.Reset()
+	buf.Write(stamp)
+	buf.WriteString("AWS4-HMAC-SHA256 Credential=")
+	buf.WriteString(s.AccessKey)
+	buf.WriteByte('/')
+	s.toscope(buf, stamp[:8])
+	buf.WriteString(", SignedHeaders=")
+	buf.WriteString(headers)
+	buf.WriteString(", Signature=")
+	buf.Write(hexbuf[:])
+	result := buf.String()
+	return result[:len(stamp)], payloadHash, result[len(stamp):]
 }
 
 // SignURL signs an HTTP request by creating
@@ -246,37 +367,64 @@ func (s *SigningKey) SignV4(req *http.Request, body []byte) {
 // is valid for only the specified duration.
 func (s *SigningKey) SignURL(uri string, validfor time.Duration) (string, error) {
 	now := signtime().UTC()
+	var stampStorage [len(longFormat)]byte
+	stamp := now.AppendFormat(stampStorage[:0], longFormat)
 	u, err := url.Parse(uri)
 	if err != nil {
 		return "", err
 	}
 	host := u.Host
-	var scope bytes.Buffer
-	scope.WriteString(s.AccessKey)
-	scope.WriteByte('/')
-	s.toscope(&scope, now)
-
-	q := u.Query()
-	q.Add("X-Amz-Algorithm", "AWS4-HMAC-SHA256")
-	q.Add("X-Amz-Credential", scope.String())
-	q.Add("X-Amz-Date", now.Format(longFormat))
-	q.Add("X-Amz-Expires", strconv.FormatInt(int64(validfor/time.Second), 10))
-	q.Add("X-Amz-SignedHeaders", "host")
-	if s.Token != "" {
-		q.Add("X-Amz-Security-Token", s.Token)
+	path := u.EscapedPath()
+	var queryStorage [512]byte
+	query := bytes.NewBuffer(queryStorage[:0])
+	if u.RawQuery == "" {
+		// These fixed fields are already in canonical query order.
+		query.WriteString("X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=")
+		query.WriteString(url.QueryEscape(s.AccessKey))
+		query.WriteString("%2F")
+		query.Write(stamp[:8])
+		query.WriteString("%2F")
+		query.WriteString(url.QueryEscape(s.Region))
+		query.WriteString("%2F")
+		query.WriteString(url.QueryEscape(s.Service))
+		query.WriteString("%2Faws4_request&X-Amz-Date=")
+		query.Write(stamp)
+		query.WriteString("&X-Amz-Expires=")
+		var digits [20]byte
+		query.Write(strconv.AppendInt(digits[:0], int64(validfor/time.Second), 10))
+		if s.Token != "" {
+			query.WriteString("&X-Amz-Security-Token=")
+			query.WriteString(url.QueryEscape(s.Token))
+		}
+		query.WriteString("&X-Amz-SignedHeaders=host")
+	} else {
+		var scopeStorage [128]byte
+		scope := bytes.NewBuffer(scopeStorage[:0])
+		scope.WriteString(s.AccessKey)
+		scope.WriteByte('/')
+		s.toscope(scope, stamp[:8])
+		q := u.Query()
+		q.Add("X-Amz-Algorithm", "AWS4-HMAC-SHA256")
+		q.Add("X-Amz-Credential", scope.String())
+		q.Add("X-Amz-Date", string(stamp))
+		q.Add("X-Amz-Expires", strconv.FormatInt(int64(validfor/time.Second), 10))
+		q.Add("X-Amz-SignedHeaders", "host")
+		if s.Token != "" {
+			q.Add("X-Amz-Security-Token", s.Token)
+		}
+		query.WriteString(q.Encode())
 	}
-
-	// TODO: if we have a SecurityToken, add it
 
 	// build 'canonical request'
 	// method
-	var dst bytes.Buffer
+	var dstStorage [512]byte
+	dst := bytes.NewBuffer(dstStorage[:0])
 	dst.WriteString("GET\n")
 	// canonical URI
-	dst.WriteString(u.EscapedPath())
+	dst.WriteString(path)
 	dst.WriteByte('\n')
-	// canonical query string (url.Values.Encode() does the sorting)
-	dst.WriteString(q.Encode())
+	// canonical query string
+	dst.Write(query.Bytes())
 	dst.WriteByte('\n')
 	// canonical headers: just 'host:<host>'
 	dst.WriteString("host:")
@@ -288,19 +436,28 @@ func (s *SigningKey) SignURL(uri string, validfor time.Duration) (string, error)
 	var hexbuf [2 * sha256.Size]byte
 	h := sha256.Sum256(dst.Bytes())
 	dst.Reset()
-	reqhash := hex.EncodeToString(h[:])
-	s.tosign(&dst, now, reqhash)
+	var reqhash [2 * sha256.Size]byte
+	hex.Encode(reqhash[:], h[:])
+	s.tosign(dst, stamp, reqhash[:])
 	s.sign(dst.Bytes(), hexbuf[:], now)
-	query := q.Encode() + "&X-Amz-Signature=" + string(hexbuf[:])
-	// we're overriding the request scheme here to HTTPS,
-	// since we're only signing the host header
-	return u.Scheme + "://" + u.Host + u.EscapedPath() + "?" + query, nil
+	query.WriteString("&X-Amz-Signature=")
+	query.Write(hexbuf[:])
+	var result strings.Builder
+	result.Grow(len(u.Scheme) + 3 + len(host) + len(path) + 1 + query.Len())
+	result.WriteString(u.Scheme)
+	result.WriteString("://")
+	result.WriteString(host)
+	result.WriteString(path)
+	result.WriteByte('?')
+	result.Write(query.Bytes())
+	return result.String(), nil
 }
 
 // SigningKey is a key that can be used
 // to sign AWS service requests.
 //
-// The date-specific signing key is derived for each request.
+// SigningKey must not be copied after its first use. Credential fields may be
+// changed between calls, but not concurrently with signing.
 type SigningKey struct {
 	BaseURI   string    // S3 base URI (empty is default AWS S3)
 	Region    string    // AWS Region
@@ -309,6 +466,20 @@ type SigningKey struct {
 	Secret    string    // AWS Secret key
 	Token     string    // Token, if key is from STS
 	Derived   time.Time // time token was derived
+	cacheMu   sync.Mutex
+	cache     *signingCache
+}
+
+type signingCache struct {
+	year      int
+	month     time.Month
+	day       int
+	accessKey string
+	secret    string
+	token     string
+	region    string
+	service   string
+	key       [sha256.Size]byte
 }
 
 func macinto(key, mem []byte) []byte {
@@ -354,12 +525,40 @@ func (s *SigningKey) InRegion(region string) *SigningKey {
 }
 
 func (s *SigningKey) pickKey(when time.Time) []byte {
-	return derive(s.Secret, when, s.Region, s.Service)
+	when = when.UTC()
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	if c := s.cache; c != nil && c.year == when.Year() && c.month == when.Month() && c.day == when.Day() &&
+		c.accessKey == s.AccessKey && c.secret == s.Secret && c.token == s.Token && c.region == s.Region && c.service == s.Service {
+		return c.key[:]
+	}
+	key := derive(s.Secret, when, s.Region, s.Service)
+	c := &signingCache{
+		year: when.Year(), month: when.Month(), day: when.Day(),
+		accessKey: s.AccessKey, secret: s.Secret, token: s.Token, region: s.Region, service: s.Service,
+	}
+	copy(c.key[:], key)
+	s.cache = c
+	return c.key[:]
 }
 
 func (s *SigningKey) sign(src, dst []byte, when time.Time) {
-	var tmp [sha256.Size]byte
-	m := hmac.New(sha256.New, s.pickKey(when))
-	m.Write(src)
-	hex.Encode(dst, m.Sum(tmp[:0]))
+	var pad [sha256.BlockSize]byte
+	// The derived signing key is always one SHA-256 digest, shorter than a block.
+	copy(pad[:], s.pickKey(when))
+	for i := range pad {
+		pad[i] ^= 0x36
+	}
+	h := sha256.New()
+	h.Write(pad[:])
+	h.Write(src)
+	var sum [sha256.Size]byte
+	inner := h.Sum(sum[:0])
+	for i := range pad {
+		pad[i] ^= 0x36 ^ 0x5c
+	}
+	h.Reset()
+	h.Write(pad[:])
+	h.Write(inner)
+	hex.Encode(dst, h.Sum(sum[:0]))
 }

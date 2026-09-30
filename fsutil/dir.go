@@ -81,14 +81,14 @@ func OpenRange(src fs.FS, name, etag string, off, width int64) (io.ReadCloser, e
 			return nil, fmt.Errorf("fsutil.OpenRange: ETag mismatch: %s != %s", etag, fetag)
 		}
 	}
-	if ra, ok := f.(io.ReaderAt); ok {
+	switch r := f.(type) {
+	case io.ReaderAt:
 		return &readCloser{
-			Reader: io.NewSectionReader(ra, off, width),
+			Reader: io.NewSectionReader(r, off, width),
 			Closer: f,
 		}, nil
-	}
-	if seeker, ok := f.(io.Seeker); ok {
-		_, err := seeker.Seek(off, io.SeekStart)
+	case io.Seeker:
+		_, err := r.Seek(off, io.SeekStart)
 		if err != nil {
 			f.Close()
 			return nil, err
@@ -245,11 +245,11 @@ func WalkDir(f fs.FS, name, seek, pattern string, fn WalkDirFn) error {
 // walkDir does the work for WalkDir but does
 // not hide fs.SkipAll from the caller.
 func walkDir(f fs.FS, name, seek, pattern string, fn WalkDirFn) error {
-	if !fs.ValidPath(name) {
-		return patherr("walkdir", name, fs.ErrInvalid)
-	}
 	err := validpat(pattern)
-	if err != nil {
+	switch {
+	case !fs.ValidPath(name):
+		return patherr("walkdir", name, fs.ErrInvalid)
+	case err != nil:
 		return patherr("walkdir", name, err)
 	}
 	// if a seek path was provided, we can start
@@ -266,11 +266,10 @@ func walkDir(f fs.FS, name, seek, pattern string, fn WalkDirFn) error {
 		case 0:
 			// seek is within the tree: we can start
 			// walking from the seek path
-			seen, err := seekTo(f, name, seek, pattern, fn)
-			if err != nil {
+			switch seen, err := seekTo(f, name, seek, pattern, fn); {
+			case err != nil:
 				return err
-			}
-			if seen {
+			case seen:
 				// we have confirmation name is a
 				// directory, so no need to stat it
 				d = &dirent{fs: f, name: name, dir: true}
@@ -312,13 +311,13 @@ func walkDir(f fs.FS, name, seek, pattern string, fn WalkDirFn) error {
 // rooted at name (see treecmp).
 func seekTo(f fs.FS, name, seek, pattern string, fn WalkDirFn) (seen bool, err error) {
 	for p := seek; p != name; p = path.Dir(p) {
-		if treecmp(name, p) != 0 {
+		switch {
+		case treecmp(name, p) != 0:
 			// we somehow made our way outside of the
 			// tree; this shouldn't happen, but avoid
 			// a possible infinite loop...
 			panic("fsutil.seekdir: seek is not within tree")
-		}
-		if seen {
+		case seen:
 			d := &dirent{fs: f, name: p, dir: true}
 			err := walkInto(f, p, seek, pattern, d, fn)
 			if err != nil && err != fs.SkipDir {
@@ -327,9 +326,10 @@ func seekTo(f fs.FS, name, seek, pattern string, fn WalkDirFn) (seen bool, err e
 			continue
 		}
 		d, err := stat(f, p)
-		if errors.Is(err, fs.ErrNotExist) {
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
 			continue // keep looking...
-		} else if err != nil {
+		case err != nil:
 			err = fn(p, nil, err)
 			if err != nil && err != fs.SkipDir {
 				return false, err
@@ -378,17 +378,15 @@ func walkInto(f fs.FS, name, seek, pattern string, d DirEntry, fn WalkDirFn) err
 	if !ok {
 		return patherrf("walkdir", name, "bad pattern %q", pattern)
 	}
-	if pattern0 != "" && pattern1 == "" {
+	switch cmp := pathcmp(name, seek0); {
+	case pattern0 != "" && pattern1 == "":
 		// no need to descend into the directory,
 		// the pattern is not long enough to include
 		// anything inside it...
 		return nil
-	}
-	cmp := pathcmp(name, seek0)
-	if cmp < 0 || !match(pattern0, name) {
+	case cmp < 0 || !match(pattern0, name):
 		return nil
-	}
-	if cmp > 0 {
+	case cmp > 0:
 		// don't pass seek into VisitDir if we've
 		// already passed the seek point
 		seek1 = ""
@@ -401,7 +399,10 @@ func walkInto(f fs.FS, name, seek, pattern string, d DirEntry, fn WalkDirFn) err
 		if skipAll {
 			return fs.SkipAll
 		}
-		full := path.Join(name, d.Name())
+		full := d.Name()
+		if name != "." {
+			full = name + "/" + full
+		}
 		err := walkInto(f, full, seek, pattern, d, fn)
 		if err == fs.SkipAll {
 			skipAll = true
@@ -462,19 +463,16 @@ func pathcmp(a, b string) int {
 			bi++
 		}
 		ae, be := a[:ai], b[:bi]
-		if ae < be {
+		switch {
+		case ae < be:
 			return -1
-		}
-		if ae > be {
+		case ae > be:
 			return 1
-		}
-		if ai == len(a) {
-			if bi == len(b) {
-				return 0
-			}
+		case ai == len(a) && bi == len(b):
+			return 0
+		case ai == len(a):
 			return -1
-		}
-		if bi == len(b) {
+		case bi == len(b):
 			return 1
 		}
 		a, b = a[ai+1:], b[bi+1:]
@@ -507,16 +505,14 @@ func treecmp(root, p string) int {
 			pi++
 		}
 		re, pe := root[:ri], p[:pi]
-		if re < pe {
+		switch {
+		case re < pe:
 			return 1 // p comes after
-		}
-		if re > pe {
+		case re > pe:
 			return -1 // p comes before
-		}
-		if ri == len(root) {
+		case ri == len(root):
 			return 0 // p is inside
-		}
-		if pi == len(p) {
+		case pi == len(p):
 			return -1 // tree is in p (p comes before)
 		}
 		root, p = root[ri+1:], p[pi+1:]
@@ -542,11 +538,10 @@ func segments(name string) (int, bool) {
 		for i < len(name) && name[i] != '/' {
 			i++
 		}
-		elem := name[:i]
-		if elem == "" || elem == "." || elem == ".." {
+		switch elem := name[:i]; {
+		case elem == "" || elem == "." || elem == "..":
 			return 0, false
-		}
-		if i == len(name) {
+		case i == len(name):
 			return n, true
 		}
 		name = name[i+1:]
@@ -563,17 +558,15 @@ func segments(name string) (int, bool) {
 //
 // If n < 0, trim panics.
 func trim(p string, n int) (front, next string, ok bool) {
-	if n < 0 {
+	switch {
+	case n < 0:
 		panic("fsutil: trim out of bounds: " + strconv.Itoa(n))
-	}
-	if p == "" || p == "." {
-		// special case ("" or ".")
-		if n == 0 {
-			return "", p, true
-		}
+	// special case ("" or ".")
+	case (p == "" || p == ".") && n == 0:
+		return "", p, true
+	case p == "" || p == ".":
 		return p, "", true
-	}
-	if !fs.ValidPath(p) {
+	case !fs.ValidPath(p):
 		return "", "", false
 	}
 	seen := 0
@@ -584,17 +577,17 @@ func trim(p string, n int) (front, next string, ok bool) {
 			j++
 		}
 		elem := p[i:j]
-		if elem == "" || elem == "." || elem == ".." {
+		switch {
+		case elem == "" || elem == "." || elem == "..":
 			return "", "", false
-		}
-		if n == 0 {
+		case n == 0:
 			return "", elem, true
 		}
 		seen++
-		if seen > n {
+		switch {
+		case seen > n:
 			return p[:i-1], elem, true
-		}
-		if j == len(p) {
+		case j == len(p):
 			return p[:j], "", true
 		}
 		i = j + 1
