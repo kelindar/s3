@@ -6,7 +6,6 @@ require (
 	github.com/kelindar/bench v0.4.1
 	github.com/kelindar/s3 v0.0.0
 	github.com/stretchr/testify v1.11.1
-	github.com/valyala/fasthttp v1.74.0
 )
 
 require (
@@ -22,6 +21,7 @@ require (
 	github.com/tklauser/go-sysconf v0.3.16 // indirect
 	github.com/tklauser/numcpus v0.11.0 // indirect
 	github.com/valyala/bytebufferpool v1.0.0 // indirect
+	github.com/valyala/fasthttp v1.74.0 // indirect
 	github.com/yusufpapurcu/wmi v1.2.4 // indirect
 	golang.org/x/sync v0.15.0 // indirect
 	golang.org/x/sys v0.47.0 // indirect

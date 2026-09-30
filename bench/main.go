@@ -32,10 +32,7 @@ func main() {
 		benchGlob(b)
 		benchUpload(b)
 		benchCompose(b)
-	},
-		bench.WithFile("bench-implemented.gob"),
-		bench.WithReference("bench-100x10ms.gob"),
-	)
+	}, bench.WithFile("bench.gob"))
 }
 
 func benchSign(b *bench.B) {
