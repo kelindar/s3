@@ -20,6 +20,7 @@ import (
 	"cmp"
 	"context"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -63,6 +64,7 @@ func (p *Prefix) sub(name string) *Prefix {
 
 // Open opens the object or pseudo-directory
 // at the provided path.
+// If both exist, Open prefers the pseudo-directory.
 // The returned fs.File will be a *File if
 // the combined Prefix and path lead to an object;
 // if the combind prefix and path produce another
@@ -75,11 +77,17 @@ func (p *Prefix) Open(file string) (fs.File, error) {
 	file = path.Clean(file)
 	switch {
 	case file == ".":
-		return p, nil
+		dir := *p
+		dir.token, dir.dirEOF = "", false
+		return &dir, nil
 	case !fs.ValidPath(file):
 		return nil, badpath("open", file)
 	}
-	return p.sub(file).openDir()
+	dir, err := p.sub(file).openDir()
+	if err == nil || !errors.Is(err, fs.ErrNotExist) {
+		return dir, err
+	}
+	return openContext(p.requestContext(), p.Key, p.Bucket, p.join(file), true)
 }
 
 func (p *Prefix) openDir() (fs.File, error) {
@@ -178,22 +186,38 @@ func (p *Prefix) ReadDir(n int) ([]fs.DirEntry, error) {
 
 func (p *Prefix) readDirContext(ctx context.Context, n int) ([]fs.DirEntry, error) {
 	if p.dirEOF {
-		return nil, io.EOF
+		if n > 0 {
+			return nil, io.EOF
+		}
+		return nil, nil
 	}
-	d, next, err := p.readDirAtContext(ctx, n, p.token, "", "")
-	if err == io.EOF {
-		p.dirEOF = true
-		if len(d) > 0 || n < 0 {
-			// the spec for fs.ReadDirFile says
-			// ReadDir(-1) shouldn't produce an explicit EOF
-			err = nil
+	var entries []fs.DirEntry
+	for {
+		limit := n
+		if n > 0 {
+			limit -= len(entries)
+		}
+		page, next, err := p.readDirAtContext(ctx, limit, p.token, "", "")
+		if err != nil && err != io.EOF {
+			return entries, &fs.PathError{Op: "readdir", Path: p.Path, Err: err}
+		}
+		if len(entries) == 0 {
+			entries = page
+		} else {
+			entries = append(entries, page...)
+		}
+		p.token = next
+		if err == io.EOF || next == "" {
+			p.dirEOF = true
+			if n > 0 && len(entries) == 0 {
+				return entries, io.EOF
+			}
+			return entries, nil
+		}
+		if n > 0 && len(entries) >= n {
+			return entries, nil
 		}
 	}
-	if err != nil {
-		return nil, &fs.PathError{Op: "readdir", Path: p.Path, Err: err}
-	}
-	p.token = next
-	return d, nil
 }
 
 type listResponse struct {

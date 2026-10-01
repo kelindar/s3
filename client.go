@@ -254,7 +254,7 @@ func signRequest(key *aws.SigningKey, req *fasthttp.Request, body []byte, header
 		req.Header.Set(header[0], header[1])
 	}
 	var storage [512]byte
-	date, hash, auth := key.SignV4Into(storage[:0], req.Header.Method(), uri.PathOriginal(), uri.QueryString(), host, body, headers...)
+	date, hash, auth := key.Sign(storage[:0], req.Header.Method(), uri.PathOriginal(), uri.QueryString(), host, body, headers...)
 	req.Header.SetBytesV("X-Amz-Date", date)
 	req.Header.Set("X-Amz-Content-Sha256", hash)
 	if key.Token != "" {

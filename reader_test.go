@@ -17,9 +17,13 @@ package s3
 
 import (
 	"bytes"
+	"fmt"
 	"io"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -125,6 +129,60 @@ func TestReader(t *testing.T) {
 		assert.Equal(t, int64(len(content)), n)
 		assert.Equal(t, content, buf.Bytes())
 	})
+}
+
+func TestReadAtBounds(t *testing.T) {
+	var requests atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		requests.Add(1)
+		http.ServeContent(w, req, "object", time.Time{}, bytes.NewReader([]byte("abcd")))
+	}))
+	defer server.Close()
+	key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
+	r := Reader{Key: key, Bucket: "bucket", Path: "object", Size: 4}
+	for _, test := range []struct {
+		name     string
+		off      int64
+		width, n int
+		err      error
+	}{
+		{name: "partial eof", off: 2, width: 4, n: 2, err: io.EOF},
+		{name: "at eof", off: 4, width: 1, err: io.EOF},
+		{name: "past eof", off: 5, width: 1, err: io.EOF},
+		{name: "empty", off: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			before := requests.Load()
+			dst := make([]byte, test.width)
+			n, err := r.ReadAt(dst, test.off)
+			assert.Equal(t, test.n, n)
+			assert.ErrorIs(t, err, test.err)
+			if test.n == 2 {
+				assert.Equal(t, "cd", string(dst[:n]))
+			} else {
+				assert.Equal(t, before, requests.Load())
+			}
+		})
+	}
+	for _, test := range []struct{ off, width int64 }{{-1, 1}, {0, -1}, {1<<63 - 1, 2}, {0, 0}} {
+		t.Run(fmt.Sprintf("range %d %d", test.off, test.width), func(t *testing.T) {
+			before := requests.Load()
+			body, err := r.RangeReader(test.off, test.width)
+			if body != nil {
+				defer body.Close()
+			}
+			if test.width == 0 {
+				require.NoError(t, err)
+				data, err := io.ReadAll(body)
+				assert.NoError(t, err)
+				assert.Empty(t, data)
+			} else {
+				assert.Error(t, err)
+				assert.Nil(t, body)
+			}
+			assert.Equal(t, before, requests.Load())
+		})
+	}
 }
 
 func TestStat(t *testing.T) {

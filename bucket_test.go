@@ -26,6 +26,7 @@ import (
 	"net/http"
 	"os"
 	"path"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -693,6 +694,37 @@ func TestBucketListPagination(t *testing.T) {
 	assert.Len(t, entries, 1001)
 	assert.Equal(t, "0000", entries[0].Name())
 	assert.Equal(t, "1000", entries[1000].Name())
+}
+
+func TestDirectoryOrder(t *testing.T) {
+	server := mock.New("test-bucket", "us-east-1")
+	defer server.Close()
+	key := aws.DeriveKey(server.URL(), "access", "secret", "us-east-1", "s3")
+	bucket := NewBucket(key, "test-bucket")
+	server.PutObject("a/child", nil)
+	for i := range 1000 {
+		server.PutObject(fmt.Sprintf("a-%04d", i), nil)
+	}
+	entries, err := bucket.ReadDir(".")
+	require.NoError(t, err)
+	require.Equal(t, 1001, len(entries))
+	assert.Equal(t, "a", entries[0].Name())
+	var names []string
+	err = bucket.VisitDir(".", "", "", func(entry fsutil.DirEntry) error {
+		names = append(names, entry.Name())
+		return nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, 1001, len(names))
+	assert.Equal(t, "a", names[0])
+	assert.True(t, slices.IsSorted(names))
+	names = nil
+	err = bucket.VisitDir(".", "a-0998", "", func(entry fsutil.DirEntry) error {
+		names = append(names, entry.Name())
+		return nil
+	})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"a-0999"}, names)
 }
 
 func TestEmptyReadDir(t *testing.T) {

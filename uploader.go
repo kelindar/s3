@@ -236,7 +236,7 @@ var uploadBuffers = make(chan *[MinPartSize]byte, 2)
 func calculatePartSize(totalSize int64) int64 {
 	partSize := int64(MinPartSize)
 	if totalSize > 0 { // Keep doubling until we have ≤10,000 parts
-		for totalSize/partSize > MaxParts {
+		for (totalSize-1)/partSize >= MaxParts {
 			partSize *= 2
 		}
 	}

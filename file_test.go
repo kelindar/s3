@@ -29,6 +29,14 @@ import (
 )
 
 func TestFile(t *testing.T) {
+	t.Run("invalid seek whence", func(t *testing.T) {
+		file := NewFile(nil, "test-bucket", "object", "etag", 10)
+		assert.NotPanics(t, func() {
+			pos, err := file.Seek(0, 99)
+			assert.Error(t, err)
+			assert.Zero(t, pos)
+		})
+	})
 	t.Run("basic properties", func(t *testing.T) {
 		bucket := "test-bucket"
 		mockServer := mock.New(bucket, "us-east-1")
@@ -54,7 +62,7 @@ func TestFile(t *testing.T) {
 		assert.Equal(t, int64(len(content)), file.Size())
 		assert.False(t, file.IsDir())
 		assert.Equal(t, fs.FileMode(0644), file.Mode())
-		assert.Equal(t, fs.FileMode(0644), file.Type())
+		assert.Equal(t, fs.FileMode(0), file.Type())
 
 		// Test Stat
 		info, err := file.Stat()

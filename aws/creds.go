@@ -112,7 +112,11 @@ func AmbientCreds(regionName string) (id, secret, region, token string, err erro
 		defer f.Close()
 
 		var ssoStartURL string
-		err = scan(f, fmt.Sprintf("profile %s", profile), []scanspec{
+		section := profile
+		if profile != "default" {
+			section = "profile " + profile
+		}
+		err = scan(f, section, []scanspec{
 			{"region", &region},
 			{"sso_start_url", &ssoStartURL},
 		})
@@ -128,13 +132,10 @@ func AmbientCreds(regionName string) (id, secret, region, token string, err erro
 	if id == "" || secret == "" {
 		switch {
 		case fileExists(homeCred):
-			id, secret, err = loadCredentials(homeCred, profile)
+			id, secret, token, err = loadCredentials(homeCred, profile)
 		case fileExists(hereCred):
-			id, secret, err = loadCredentials(hereCred, profile)
+			id, secret, token, err = loadCredentials(hereCred, profile)
 		}
-
-		// credentials file never contain a session token, so it should be reset
-		token = ""
 	}
 
 	switch {
@@ -357,28 +358,29 @@ func EC2Role(role, service string, derive DeriveFn) (*SigningKey, error) {
 }
 
 // loadCredentials loads the credentials from the credentials file
-// and returns the id and secret.
-func loadCredentials(credentialsfile, profile string) (id, secret string, err error) {
+// and returns the id, secret, and optional session token.
+func loadCredentials(credentialsfile, profile string) (id, secret, token string, err error) {
 	f, err := os.Open(credentialsfile)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	defer f.Close()
 
 	info, err := f.Stat()
 	if err != nil {
-		return "", "", fmt.Errorf("examining credentials: %w", err)
+		return "", "", "", fmt.Errorf("examining credentials: %w", err)
 	}
 
 	if err := check(info); err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 
 	if err := scan(f, profile, []scanspec{
 		{"aws_access_key_id", &id},
 		{"aws_secret_access_key", &secret},
+		{"aws_session_token", &token},
 	}); err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 
 	return

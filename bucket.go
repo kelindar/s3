@@ -24,6 +24,7 @@ import (
 	"iter"
 	"net/http"
 	"path"
+	"slices"
 	"strings"
 
 	"github.com/kelindar/s3/aws"
@@ -321,6 +322,7 @@ func (b *Bucket) ReadDir(name string) ([]fs.DirEntry, error) {
 		}
 		f.Close()
 	}
+	slices.SortFunc(entries, func(a, b fs.DirEntry) int { return strings.Compare(a.Name(), b.Name()) })
 	return entries, nil
 }
 
@@ -419,6 +421,11 @@ func (b *Bucket) WriteFrom(ctx context.Context, key string, r io.ReaderAt, size 
 	if err := uploader.Start(ctx); err != nil {
 		return fmt.Errorf("starting multipart upload: %w", err)
 	}
+	defer func() {
+		if !uploader.finished {
+			_ = uploader.Abort(context.WithoutCancel(ctx))
+		}
+	}()
 
 	return uploader.UploadFrom(ctx, r, size)
 }

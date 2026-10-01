@@ -179,6 +179,32 @@ func TestHTTPS(t *testing.T) {
 }
 
 func TestClient(t *testing.T) {
+	t.Run("exact body reuse", func(t *testing.T) {
+		var connections atomic.Int32
+		server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			w.Header().Set("Content-Length", "4")
+			_, _ = io.WriteString(w, "body")
+		}))
+		server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+			if state == http.StateNew {
+				connections.Add(1)
+			}
+		}
+		server.Start()
+		defer server.Close()
+		key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
+		for range 2 {
+			res, err := doSigned(context.Background(), key, http.MethodGet, server.URL, nil)
+			require.NoError(t, err)
+			var data [4]byte
+			_, err = io.ReadFull(res.Body, data[:])
+			closeErr := res.Body.Close()
+			require.NoError(t, err)
+			assert.NoError(t, closeErr)
+			assert.Equal(t, "body", string(data[:]))
+		}
+		assert.EqualValues(t, 1, connections.Load())
+	})
 	t.Run("conditional retry", func(t *testing.T) {
 		var attempts atomic.Int32
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

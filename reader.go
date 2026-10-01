@@ -354,6 +354,12 @@ func (r *Reader) requestContext() context.Context {
 }
 
 func (r *Reader) rangeReaderContext(ctx context.Context, off, width int64) (io.ReadCloser, error) {
+	switch {
+	case off < 0 || width < 0 || off > (1<<63-1)-width:
+		return nil, fmt.Errorf("s3.Reader.RangeReader: invalid range %d + %d", off, width)
+	case width == 0:
+		return http.NoBody, nil
+	}
 	req := fasthttp.AcquireRequest()
 	defer fasthttp.ReleaseRequest(req)
 	setURI(req, r.Key, r.Bucket, r.Path, "")
@@ -389,12 +395,25 @@ func (r *Reader) rangeReaderContext(ctx context.Context, off, width int64) (io.R
 
 // ReadAt implements io.ReaderAt
 func (r *Reader) ReadAt(dst []byte, off int64) (int, error) {
-	rd, err := r.RangeReader(off, int64(len(dst)))
+	switch {
+	case off < 0:
+		return 0, fmt.Errorf("s3.Reader.ReadAt: negative offset %d", off)
+	case len(dst) == 0:
+		return 0, nil
+	case off >= r.Size:
+		return 0, io.EOF
+	}
+	width := min(int64(len(dst)), r.Size-off)
+	rd, err := r.RangeReader(off, width)
 	if err != nil {
 		return 0, err
 	}
 	defer rd.Close()
-	return io.ReadFull(rd, dst)
+	n, err := io.ReadFull(rd, dst[:int(width)])
+	if err == nil && n < len(dst) {
+		err = io.EOF
+	}
+	return n, err
 }
 
 // BucketRegion returns the region associated

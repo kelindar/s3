@@ -39,6 +39,31 @@ import (
 	"github.com/valyala/fasthttp/fasthttpadaptor"
 )
 
+func TestRangeBounds(t *testing.T) {
+	for _, test := range []struct {
+		header             string
+		length, start, end int64
+		invalid            bool
+	}{
+		{header: "bytes=1-99", length: 4, start: 1, end: 3},
+		{header: "bytes=-99", length: 4, end: 3},
+		{header: "bytes=-0", length: 4, invalid: true},
+		{header: "bytes=4-99", length: 4, invalid: true},
+		{header: "bytes=-1", invalid: true},
+	} {
+		t.Run(test.header, func(t *testing.T) {
+			start, end, err := parseRange(test.header, test.length)
+			if test.invalid {
+				assert.Error(t, err)
+			} else {
+				require.NoError(t, err)
+				assert.Equal(t, test.start, start)
+				assert.Equal(t, test.end, end)
+			}
+		})
+	}
+}
+
 func TestFastUploadPart(t *testing.T) {
 	m := New("test-bucket", "us-east-1")
 	defer m.Close()
@@ -69,7 +94,9 @@ func TestScanCompleteMultipart(t *testing.T) {
 	body := []byte(`<CompleteMultipartUpload xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Part><PartNumber>2</PartNumber><ETag>&#34;aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa&#34;</ETag></Part></CompleteMultipartUpload>`)
 	parts, ok := scanCompleteMultipart(body)
 	assert.True(t, ok)
-	assert.Equal(t, []int{2}, parts)
+	require.Len(t, parts, 1)
+	assert.Equal(t, 2, parts[0].number)
+	assert.True(t, parts[0].etagValid)
 	_, ok = scanCompleteMultipart(bytes.Replace(body, []byte("&#34;"), []byte("&quot;"), 1))
 	assert.False(t, ok)
 }
@@ -82,7 +109,7 @@ func TestCompleteMultipartFallback(t *testing.T) {
 	m.uploads["active"] = &Multipart{Parts: map[int]*PartInfo{
 		1: {PartNumber: 1, ETag: generateETag(content), Content: content},
 	}}
-	body := `<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>&quot;ignored&quot;</ETag></Part></CompleteMultipartUpload>`
+	body := fmt.Sprintf(`<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>%s</ETag></Part></CompleteMultipartUpload>`, generateETag(content))
 	res, err := http.Post(m.URL()+"/test-bucket/object?uploadId=active", "application/xml", strings.NewReader(body))
 	require.NoError(t, err)
 	defer res.Body.Close()
@@ -90,6 +117,47 @@ func TestCompleteMultipartFallback(t *testing.T) {
 	stored, ok := m.ObjectContent("object")
 	assert.True(t, ok)
 	assert.Equal(t, content, stored)
+}
+
+func TestCompleteETag(t *testing.T) {
+	content := []byte("payload")
+	wrongETag := generateETag([]byte("different payload"))
+	for _, test := range []struct {
+		name string
+		fast bool
+	}{
+		{name: "fast", fast: true},
+		{name: "fallback"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			m := New("test-bucket", "us-east-1")
+			defer m.Close()
+			m.SetRequestLogging(false)
+			m.uploads["active"] = &Multipart{Parts: map[int]*PartInfo{
+				1: {PartNumber: 1, ETag: generateETag(content), Content: content},
+			}}
+
+			var body string
+			if test.fast {
+				body = fmt.Sprintf(`<CompleteMultipartUpload xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Part><PartNumber>1</PartNumber><ETag>&#34;%s&#34;</ETag></Part></CompleteMultipartUpload>`, wrongETag[1:len(wrongETag)-1])
+			} else {
+				body = fmt.Sprintf(`<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>%s</ETag></Part></CompleteMultipartUpload>`, wrongETag)
+			}
+			res, err := http.Post(m.URL()+"/test-bucket/object?uploadId=active", "application/xml", strings.NewReader(body))
+			require.NoError(t, err)
+			defer res.Body.Close()
+			assert.Equal(t, http.StatusBadRequest, res.StatusCode)
+			var failure struct {
+				Code string `xml:"Code"`
+			}
+			require.NoError(t, xml.NewDecoder(res.Body).Decode(&failure))
+			assert.Equal(t, "InvalidPart", failure.Code)
+			_, exists := m.GetMultipartUpload("active")
+			assert.True(t, exists)
+			_, exists = m.GetObject("object")
+			assert.False(t, exists)
+		})
+	}
 }
 
 func TestFastMultipart(t *testing.T) {
@@ -871,14 +939,9 @@ func TestServer(t *testing.T) {
 		etag := mockServer.PutObject("head-test.txt", testContent)
 
 		// Test HEAD request directly using HTTP client to ensure handleHeadObject is tested
-		key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
-		key.BaseURI = mockServer.URL()
-
 		// Make a direct HEAD request to test the handler
 		req, err := http.NewRequest("HEAD", mockServer.URL()+"/test-bucket/head-test.txt", nil)
 		assert.NoError(t, err)
-
-		key.SignV4(req, nil)
 
 		client := &http.Client{}
 		resp, err := client.Do(req)
@@ -893,7 +956,6 @@ func TestServer(t *testing.T) {
 		// Test HEAD request for non-existent object
 		req2, err := http.NewRequest("HEAD", mockServer.URL()+"/test-bucket/non-existent.txt", nil)
 		assert.NoError(t, err)
-		key.SignV4(req2, nil)
 
 		resp2, err := client.Do(req2)
 		assert.NoError(t, err)
@@ -1071,14 +1133,11 @@ func TestServer(t *testing.T) {
 		assert.False(t, exists)
 
 		// Test S3 Select and multipart abort via direct HTTP
-		key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
-		key.BaseURI = mockServer.URL()
 		client := &http.Client{}
 
 		// Test S3 Select
 		mockServer.PutObject("test.json", []byte(`{"id": 1}`))
 		req, _ := http.NewRequest("POST", mockServer.URL()+"/test-bucket/test.json?select=", strings.NewReader("SELECT * FROM S3Object"))
-		key.SignV4(req, []byte("SELECT * FROM S3Object"))
 		resp, err := client.Do(req)
 		assert.NoError(t, err)
 		defer resp.Body.Close()
@@ -1086,7 +1145,6 @@ func TestServer(t *testing.T) {
 
 		// Test multipart initiate and abort
 		req2, _ := http.NewRequest("POST", mockServer.URL()+"/test-bucket/test.bin?uploads=", nil)
-		key.SignV4(req2, nil)
 		resp2, err := client.Do(req2)
 		assert.NoError(t, err)
 		defer resp2.Body.Close()
@@ -1102,7 +1160,6 @@ func TestServer(t *testing.T) {
 		}
 
 		req3, _ := http.NewRequest("DELETE", mockServer.URL()+"/test-bucket/test.bin?uploadId="+uploadID, nil)
-		key.SignV4(req3, nil)
 		resp3, err := client.Do(req3)
 		assert.NoError(t, err)
 		defer resp3.Body.Close()

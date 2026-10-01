@@ -17,12 +17,12 @@ package aws
 
 import (
 	"bytes"
+	"cmp"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
-	"io"
-	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -50,137 +50,22 @@ func setnow(t *testing.T, tm time.Time) {
 	fakenow = tm
 }
 
-// test against the example in the documentation
-func TestCanonical(t *testing.T) {
-	previous := sigheaders
-	// use these headers
-	sigheaders = []string{"content-type", "host", "x-amz-date"}
-	defer func() {
-		sigheaders = previous
-	}()
-
-	req, err := http.NewRequest("GET", "https://iam.amazonaws.com/?Action=ListUsers&Version=2010-05-08 HTTP/1.1", nil)
-	assert.NoError(t, err)
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded; charset=utf-8")
-	req.Header.Set("X-Amz-Date", "20150830T123600Z")
-	req.Header.Set("x-amz-content-sha256", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855")
-
-	var out bytes.Buffer
-	canonical(&out, req)
-	outstr := out.String()
-	const want = `GET
-/
-Action=ListUsers&Version=2010-05-08
-content-type:application/x-www-form-urlencoded; charset=utf-8
-host:iam.amazonaws.com
-x-amz-date:20150830T123600Z
-
-content-type;host;x-amz-date
-e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`
-	assert.Equal(t, want, outstr, "canonical request didn't match")
-	h := sha256.Sum256(out.Bytes())
-	hstr := hex.EncodeToString(h[:])
-	assert.Equal(t, "f536975d06c0309214f805bb90ccff089219ecd68b2577efef23edd43b7e1a59", hstr)
-}
-
-func TestConditionalHeader(t *testing.T) {
-	for _, value := range []string{
-		"Tue, 15 Nov 1994 08:12:31 GMT",
-		"  Tue,  15\tNov 1994 08:12:31 GMT  ",
+func TestQueryEncoding(t *testing.T) {
+	for _, test := range []struct{ query, want string }{
+		{"b=2&a=hello+world&a=%2f&acl", "a=%2F&a=hello%20world&acl=&b=2"},
+		{"a0=c&a=d&.=b&%C3%A9=a", "%C3%A9=a&.=b&a=d&a0=c"},
 	} {
-		t.Run(value, func(t *testing.T) {
-			req, err := http.NewRequest("PUT", "https://examplebucket.s3.amazonaws.com/test.txt", nil)
+		t.Run(test.query, func(t *testing.T) {
+			query, err := url.ParseQuery(test.query)
 			require.NoError(t, err)
-			req.Header.Set("If-Unmodified-Since", value)
-
-			key := DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
-			key.SignV4(req, nil)
-
-			assert.Contains(t, req.Header.Get("Authorization"), "SignedHeaders=host;if-unmodified-since;x-amz-content-sha256;x-amz-date")
-			var out bytes.Buffer
-			canonical(&out, req)
-			assert.Contains(t, out.String(), "if-unmodified-since:Tue, 15 Nov 1994 08:12:31 GMT\n")
-			assert.Equal(t, value, req.Header.Get("If-Unmodified-Since"), "signing must not modify caller-owned header values")
+			var encoded bytes.Buffer
+			encodeQuery(&encoded, query)
+			assert.Equal(t, test.want, encoded.String())
 		})
 	}
 }
 
-func TestHostHeader(t *testing.T) {
-	req, err := http.NewRequest(http.MethodGet, "https://example.com/object", nil)
-	require.NoError(t, err)
-	req.Host = "bucket.example.com"
-	key := DeriveKey("", "access", "secret", "us-east-1", "s3")
-	key.SignV4(req, nil)
-
-	var canonicalRequest bytes.Buffer
-	canonical(&canonicalRequest, req)
-	assert.Contains(t, canonicalRequest.String(), "host:bucket.example.com\n")
-	assert.Empty(t, req.Header.Get("Host"))
-}
-
-func TestSignV4Headers(t *testing.T) {
-	req, err := http.NewRequest(http.MethodPut, "https://example.com/object", nil)
-	require.NoError(t, err)
-
-	const old = "old-value"
-	headers := []string{"X-Amz-Date", "X-Amz-Content-Sha256", "Authorization", "X-Amz-Security-Token"}
-	retained := make(map[string][]string, len(headers))
-	for _, header := range headers {
-		req.Header[header] = []string{old, "stale-value"}
-		retained[header] = req.Header[header]
-	}
-	clone := req.Clone(t.Context())
-
-	key := DeriveKey("", "access", "secret", "us-east-1", "s3")
-	key.Token = "session-token"
-	key.SignV4(req, nil)
-
-	for _, header := range headers {
-		assert.Equal(t, []string{old, "stale-value"}, retained[header])
-		assert.Equal(t, retained[header], clone.Header[header])
-		assert.Len(t, req.Header[header], 1)
-		assert.Equal(t, 1, cap(req.Header[header]))
-	}
-	assert.Equal(t, "session-token", req.Header.Get("X-Amz-Security-Token"))
-}
-
-func TestSignV4Readers(t *testing.T) {
-	const payload = "independent body readers"
-	req, err := http.NewRequest(http.MethodPut, "https://example.com/object", nil)
-	require.NoError(t, err)
-	key := DeriveKey("", "access", "secret", "us-east-1", "s3")
-	key.SignV4(req, []byte(payload))
-	clone := req.Clone(t.Context())
-
-	_, ok := req.Body.(io.WriterTo)
-	assert.True(t, ok)
-
-	first, err := req.GetBody()
-	require.NoError(t, err)
-	defer first.Close()
-	second, err := clone.GetBody()
-	require.NoError(t, err)
-	defer second.Close()
-	_, ok = first.(io.WriterTo)
-	assert.True(t, ok)
-	_, ok = second.(io.WriterTo)
-	assert.True(t, ok)
-
-	partial := make([]byte, 3)
-	n, err := first.Read(partial)
-	require.NoError(t, err)
-	assert.Equal(t, 3, n)
-	assert.Equal(t, payload[:3], string(partial))
-
-	got, err := io.ReadAll(second)
-	require.NoError(t, err)
-	assert.Equal(t, payload, string(got))
-	got, err = io.ReadAll(first)
-	require.NoError(t, err)
-	assert.Equal(t, payload[3:], string(got))
-}
-
-func TestSignV4Raw(t *testing.T) {
+func TestSign(t *testing.T) {
 	many := make([][2]string, 20)
 	for i := range many {
 		many[i] = [2]string{"if-custom-" + strconv.Itoa(i), "value"}
@@ -192,9 +77,11 @@ func TestSignV4Raw(t *testing.T) {
 	}{
 		{name: "root", uri: "https://bucket.example.com"},
 		{name: "payload", uri: "https://bucket.example.com/a%20b?partNumber=1&uploadId=id", body: []byte("part contents")},
+		{name: "empty payload", uri: "https://bucket.example.com/object", body: []byte{}},
 		{name: "token", uri: "https://bucket.example.com/a%20b?partNumber=1&uploadId=id", token: "session-token", body: []byte("part contents")},
 		{name: "conditions", uri: "https://bucket.example.com/object", headers: [][2]string{{"if-unmodified-since", "Tue, 15 Nov 1994 08:12:31 GMT"}, {"if-match", `"etag"`}, {"if-none-match", "*"}}},
 		{name: "header whitespace", uri: "https://bucket.example.com/object", headers: [][2]string{{"if-unmodified-since", "  Tue,  15\tNov 1994 08:12:31 GMT  "}}},
+		{name: "metadata", uri: "https://bucket.example.com/object", headers: [][2]string{{"x-amz-meta-test", "value"}}},
 		{name: "copy", uri: "https://bucket.example.com/object?partNumber=1&uploadId=id", token: "session-token", headers: [][2]string{{"x-amz-copy-source-range", "bytes=0-5242879"}, {"x-amz-copy-source", "/bucket/a%20b%25"}, {"x-amz-copy-source-if-match", `"etag"`}}},
 		{name: "many conditions", uri: "https://bucket.example.com/object", headers: many},
 		{name: "empty condition", uri: "https://bucket.example.com/object", headers: [][2]string{{"if-match", ""}}},
@@ -204,28 +91,62 @@ func TestSignV4Raw(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			key := DeriveKey("", "access", "secret", "us-east-1", "s3")
 			key.Token = test.token
-			req, err := http.NewRequest(http.MethodPut, test.uri, nil)
+			u, err := url.Parse(test.uri)
 			require.NoError(t, err)
-			for _, header := range test.headers {
-				req.Header.Set(header[0], header[1])
-			}
 			retained := append([][2]string(nil), test.headers...)
-			key.SignV4(req, test.body)
-			date, hash, auth := key.SignV4Raw(req.Method, req.URL.EscapedPath(), req.URL.RawQuery, req.Host, test.body, test.headers...)
-			assert.Equal(t, req.Header.Get("X-Amz-Date"), date)
-			assert.Equal(t, req.Header.Get("X-Amz-Content-Sha256"), hash)
-			assert.Equal(t, req.Header.Get("Authorization"), auth)
+			date := fakenow.UTC().Format(longFormat)
+			hash := "UNSIGNED-PAYLOAD"
+			if test.body == nil {
+				hash = hex.EncodeToString(sha256.New().Sum(nil))
+			}
+
+			// Rebuild the canonical request and HMAC independently of Sign.
+			headers := [][2]string{{"host", u.Host}, {"x-amz-content-sha256", hash}, {"x-amz-date", date}}
+			if test.token != "" {
+				headers = append(headers, [2]string{"x-amz-security-token", test.token})
+			}
+			for _, header := range test.headers {
+				if header[1] != "" {
+					headers = append(headers, header)
+				}
+			}
+			slices.SortFunc(headers, func(a, b [2]string) int { return strings.Compare(a[0], b[0]) })
+			var canonical strings.Builder
+			canonical.WriteString("PUT\n" + cmp.Or(u.EscapedPath(), "/") + "\n" + u.RawQuery + "\n")
+			var names []string
+			for _, header := range headers {
+				canonical.WriteString(header[0] + ":" + strings.Join(strings.Fields(header[1]), " ") + "\n")
+				names = append(names, header[0])
+			}
+			signed := strings.Join(names, ";")
+			canonical.WriteString("\n" + signed + "\n" + hash)
+			requestHash := sha256.Sum256([]byte(canonical.String()))
+			scope := date[:8] + "/" + key.Region + "/" + key.Service + "/aws4_request"
+			toSign := "AWS4-HMAC-SHA256\n" + date + "\n" + scope + "\n" + hex.EncodeToString(requestHash[:])
+			signingKey := []byte("AWS4" + key.Secret)
+			for _, value := range []string{date[:8], key.Region, key.Service, "aws4_request"} {
+				mac := hmac.New(sha256.New, signingKey)
+				_, err := mac.Write([]byte(value))
+				require.NoError(t, err)
+				signingKey = mac.Sum(nil)
+			}
+			mac := hmac.New(sha256.New, signingKey)
+			_, err = mac.Write([]byte(toSign))
+			require.NoError(t, err)
+			auth := "AWS4-HMAC-SHA256 Credential=" + key.AccessKey + "/" + scope + ", SignedHeaders=" + signed + ", Signature=" + hex.EncodeToString(mac.Sum(nil))
+
 			for _, capacity := range []int{0, 16, 512, 4096} {
 				storage := bytes.Repeat([]byte{'x'}, capacity)
-				gotDate, gotHash, gotAuth := key.SignV4Into(storage, []byte(req.Method), []byte(req.URL.EscapedPath()), []byte(req.URL.RawQuery), []byte(req.Host), test.body, test.headers...)
+				gotDate, gotHash, gotAuth := key.Sign(storage, []byte("PUT"), []byte(u.EscapedPath()), []byte(u.RawQuery), []byte(u.Host), test.body, test.headers...)
 				assert.Equal(t, date, string(gotDate))
 				assert.Equal(t, hash, gotHash)
 				assert.Equal(t, auth, string(gotAuth))
-				clear(gotDate[:cap(gotDate)])
-				assert.Equal(t, req.Header.Get("X-Amz-Date"), date, "raw date owns its storage")
-				assert.Equal(t, req.Header.Get("Authorization"), auth, "owned raw outputs survive reuse of caller storage")
+				if capacity == 4096 {
+					assert.Same(t, &storage[0], &gotDate[0], "date aliases caller storage")
+					assert.Same(t, &storage[len(gotDate)], &gotAuth[0], "authorization aliases caller storage")
+				}
+				assert.Equal(t, retained, test.headers, "signing must not modify caller-owned header pairs")
 			}
-			assert.Equal(t, retained, test.headers, "signing must not modify caller-owned header pairs")
 		})
 	}
 }
@@ -293,13 +214,10 @@ func TestSigningKeyRollover(t *testing.T) {
 
 	setnow(t, time.Date(2015, time.September, 1, 12, 36, 0, 0, time.UTC))
 	fresh := DeriveKey("", accessKey, secretKey, "us-east-1", "s3")
-	longLivedRequest, err := http.NewRequest(http.MethodGet, "https://examplebucket.s3.amazonaws.com/test.txt", nil)
-	assert.NoError(t, err)
-	freshRequest := longLivedRequest.Clone(t.Context())
-	longLived.SignV4(longLivedRequest, nil)
-	fresh.SignV4(freshRequest, nil)
-
-	assert.Equal(t, freshRequest.Header.Get("Authorization"), longLivedRequest.Header.Get("Authorization"))
+	var oldStorage, newStorage [512]byte
+	_, _, oldAuth := longLived.Sign(oldStorage[:0], []byte("GET"), []byte("/test.txt"), nil, []byte("examplebucket.s3.amazonaws.com"), nil)
+	_, _, newAuth := fresh.Sign(newStorage[:0], []byte("GET"), []byte("/test.txt"), nil, []byte("examplebucket.s3.amazonaws.com"), nil)
+	assert.Equal(t, newAuth, oldAuth)
 }
 
 func TestSigningKeyCache(t *testing.T) {
@@ -392,8 +310,11 @@ func TestSignURLEncoding(t *testing.T) {
 		uri      string
 		validFor time.Duration
 	}{
-		{"https://example.com/a%2Fb", -time.Second},
+		{"https://example.com/a%2Fb", time.Hour},
 		{"https://example.com/a%2Fb?z=2&a=hello+world&a=percent%25", time.Hour},
+		{"https://example.com/a%2Fb?a=z&a=a&a0=next&%C3%A9=unicode&.=dot&a=%2F", time.Hour},
+		{"https://example.com", time.Hour},
+		{"https://example.com/a?X-Amz-Date=old&X-Amz-Signature=old&X-Amz-Security-Token=stale", time.Hour},
 	} {
 		key := DeriveKey("", "A/B +%", "secret", "r/1", "s+3")
 		key.Token = "T/+ &"
@@ -405,67 +326,72 @@ func TestSignURLEncoding(t *testing.T) {
 		stamp := when.Format(longFormat)
 		scope := stamp[:8] + "/" + key.Region + "/" + key.Service + "/aws4_request"
 		q := u.Query()
-		q.Add("X-Amz-Algorithm", "AWS4-HMAC-SHA256")
-		q.Add("X-Amz-Credential", key.AccessKey+"/"+scope)
-		q.Add("X-Amz-Date", stamp)
-		q.Add("X-Amz-Expires", strconv.FormatInt(int64(tc.validFor/time.Second), 10))
-		q.Add("X-Amz-Security-Token", key.Token)
-		q.Add("X-Amz-SignedHeaders", "host")
-		query := q.Encode()
-		canonical := "GET\n" + u.EscapedPath() + "\n" + query + "\nhost:" + u.Host + "\n\nhost\nUNSIGNED-PAYLOAD"
+		q.Del("X-Amz-Signature")
+		q.Set("X-Amz-Algorithm", "AWS4-HMAC-SHA256")
+		q.Set("X-Amz-Credential", key.AccessKey+"/"+scope)
+		q.Set("X-Amz-Date", stamp)
+		q.Set("X-Amz-Expires", strconv.FormatInt(int64(tc.validFor/time.Second), 10))
+		q.Set("X-Amz-Security-Token", key.Token)
+		q.Set("X-Amz-SignedHeaders", "host")
+		pairs := strings.Split(strings.ReplaceAll(q.Encode(), "+", "%20"), "&")
+		slices.SortFunc(pairs, func(a, b string) int {
+			aName, _, _ := strings.Cut(a, "=")
+			bName, _, _ := strings.Cut(b, "=")
+			return cmp.Or(strings.Compare(aName, bName), strings.Compare(a, b))
+		})
+		query := strings.Join(pairs, "&")
+		path := u.EscapedPath()
+		if path == "" {
+			path = "/"
+		}
+		canonical := "GET\n" + path + "\n" + query + "\nhost:" + u.Host + "\n\nhost\nUNSIGNED-PAYLOAD"
 		hash := sha256.Sum256([]byte(canonical))
 		toSign := "AWS4-HMAC-SHA256\n" + stamp + "\n" + scope + "\n" + hex.EncodeToString(hash[:])
 		mac := hmac.New(sha256.New, derive(key.Secret, when, key.Region, key.Service))
 		_, err = mac.Write([]byte(toSign))
 		require.NoError(t, err)
-		want := u.Scheme + "://" + u.Host + u.EscapedPath() + "?" + query + "&X-Amz-Signature=" + hex.EncodeToString(mac.Sum(nil))
+		want := u.Scheme + "://" + u.Host + path + "?" + query + "&X-Amz-Signature=" + hex.EncodeToString(mac.Sum(nil))
 		assert.Equal(t, want, got)
+	}
+}
+
+func TestPresignBounds(t *testing.T) {
+	key := DeriveKey("", "access", "secret", "us-east-1", "s3")
+	for _, duration := range []time.Duration{-time.Second, 0, time.Millisecond, 7*24*time.Hour + time.Second} {
+		_, err := key.SignURL("https://example.com/object", duration)
+		assert.Error(t, err)
+	}
+	for _, uri := range []string{"object", "ftp://example.com/object", "https://example.com/object?bad=%ZZ"} {
+		_, err := key.SignURL(uri, time.Hour)
+		assert.Error(t, err)
 	}
 }
 
 func BenchmarkSigning(b *testing.B) {
 	key := DeriveKey("", "bench-access", "bench-secret", "us-east-1", "s3")
-	req, err := http.NewRequest(http.MethodPut, "https://bench-bucket.s3.us-east-1.amazonaws.com/object", nil)
-	if err != nil {
-		b.Fatal(err)
-	}
+	method, path, host := []byte("PUT"), []byte("/object"), []byte("bench-bucket.s3.us-east-1.amazonaws.com")
 	body := []byte("benchmark payload")
 	b.Run("v4", func(b *testing.B) {
+		var storage [512]byte
 		b.ReportAllocs()
 		for range b.N {
-			key.SignV4(req, nil)
+			key.Sign(storage[:0], method, path, nil, host, nil)
 		}
 	})
 	b.Run("v4-parallel", func(b *testing.B) {
-		template, err := http.NewRequest(http.MethodPut, "https://bench-bucket.s3.us-east-1.amazonaws.com/object", nil)
-		if err != nil {
-			b.Fatal(err)
-		}
 		b.ReportAllocs()
 		b.RunParallel(func(pb *testing.PB) {
-			local := template.Clone(template.Context())
+			var storage [512]byte
 			for pb.Next() {
-				key.SignV4(local, nil)
+				key.Sign(storage[:0], method, path, nil, host, nil)
 			}
 		})
 	})
 	b.Run("body", func(b *testing.B) {
-		b.ReportAllocs()
-		for range b.N {
-			key.SignV4(req, body)
-		}
-	})
-	b.Run("v4-raw", func(b *testing.B) {
-		b.ReportAllocs()
-		for range b.N {
-			key.SignV4Raw(http.MethodPut, "/object", "", "bench-bucket.s3.us-east-1.amazonaws.com", nil)
-		}
-	})
-	b.Run("v4-into", func(b *testing.B) {
 		var storage [512]byte
 		b.ReportAllocs()
 		for range b.N {
-			key.SignV4Into(storage[:0], []byte(http.MethodPut), []byte("/object"), nil, []byte("bench-bucket.s3.us-east-1.amazonaws.com"), nil)
+			key.Sign(storage[:0], method, path, nil, host, body)
 		}
 	})
 	b.Run("url", func(b *testing.B) {

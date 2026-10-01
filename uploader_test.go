@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/xml"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -297,6 +298,25 @@ func TestPartSize(t *testing.T) {
 	partSize = calculatePartSize(largeSize)
 	assert.Greater(t, partSize, int64(MinPartSize))
 	assert.LessOrEqual(t, largeSize/partSize, int64(MaxParts))
+	for _, size := range []int64{int64(MinPartSize) * MaxParts, int64(MinPartSize)*MaxParts + 1, 1<<63 - 1} {
+		partSize := calculatePartSize(size)
+		assert.LessOrEqual(t, (size-1)/partSize+1, int64(MaxParts), "size %d", size)
+	}
+}
+
+func TestUploadCleanup(t *testing.T) {
+	for _, length := range []int{0, MinPartSize} {
+		t.Run(fmt.Sprint(length), func(t *testing.T) {
+			server := mock.New("test-bucket", "us-east-1")
+			defer server.Close()
+			key := aws.DeriveKey(server.URL(), "access", "secret", "us-east-1", "s3")
+			bucket := NewBucket(key, "test-bucket")
+			err := bucket.WriteFrom(context.Background(), "object", bytes.NewReader(make([]byte, length)), MinPartSize+1)
+			assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
+			assert.Empty(t, server.ListMultipartUploads())
+			assert.False(t, server.ObjectExists("object"))
+		})
+	}
 }
 
 // Test multipart upload through mock server directly

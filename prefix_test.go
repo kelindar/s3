@@ -124,7 +124,7 @@ func TestPrefix(t *testing.T) {
 		prefix.dirEOF = true
 		entries, err = prefix.ReadDir(-1)
 		assert.Empty(t, entries)
-		assert.ErrorIs(t, err, io.EOF)
+		assert.NoError(t, err)
 	})
 
 	t.Run("open", func(t *testing.T) {
@@ -424,6 +424,50 @@ func TestPrefix(t *testing.T) {
 		}
 	})
 
+}
+
+func TestSubdirectoryFS(t *testing.T) {
+	server := mock.New("test-bucket", "us-east-1")
+	defer server.Close()
+	key := aws.DeriveKey(server.URL(), "access", "secret", "us-east-1", "s3")
+	server.PutObject("logs/", nil)
+	for i := range 1001 {
+		server.PutObject(fmt.Sprintf("logs/file-%04d", i), []byte("contents"))
+	}
+	sub, err := fs.Sub(NewBucket(key, "test-bucket"), "logs")
+	require.NoError(t, err)
+	t.Run("open file", func(t *testing.T) {
+		data, err := fs.ReadFile(sub, "file-0000")
+		require.NoError(t, err)
+		assert.Equal(t, "contents", string(data))
+	})
+	t.Run("repeat listing", func(t *testing.T) {
+		for range 2 {
+			entries, err := fs.ReadDir(sub, ".")
+			require.NoError(t, err)
+			require.Len(t, entries, 1001)
+			assert.Equal(t, "file-0000", entries[0].Name())
+			assert.Equal(t, "file-1000", entries[1000].Name())
+		}
+	})
+	for _, n := range []int{-1, 0, 1500, 1} {
+		t.Run(fmt.Sprint(n), func(t *testing.T) {
+			p := &Prefix{Key: key, Bucket: "test-bucket", Path: "logs/"}
+			entries, err := p.ReadDir(n)
+			require.NoError(t, err)
+			want := 1001
+			if n == 1 {
+				want = 1
+			}
+			require.Len(t, entries, want)
+			assert.Equal(t, "file-0000", entries[0].Name())
+			if n <= 0 {
+				entries, err = p.ReadDir(n)
+				assert.Empty(t, entries)
+				assert.NoError(t, err)
+			}
+		})
+	}
 }
 
 func TestListQuery(t *testing.T) {

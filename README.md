@@ -84,11 +84,12 @@ func main() {
 
 ### Ambient Credentials (Recommended)
 
-This is the recommended way to use the library, as it automatically discovers credentials from the environment, IAM roles, and other sources. It supports the following sources:
+`AmbientKey` discovers credentials from the following sources:
 - Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`)
-- IAM roles (EC2, ECS, Lambda)
 - AWS credentials file (`~/.aws/credentials`)
 - Web identity tokens
+
+EC2 instance role credentials can be loaded explicitly with `aws.EC2Role`. `AmbientKey` does not query EC2 or ECS metadata.
 
 ```go
 key, err := aws.AmbientKey("s3", "", s3.DeriveForBucket("my-bucket"))

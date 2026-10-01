@@ -173,6 +173,30 @@ func TestCreds(t *testing.T) {
 		assert.Equal(t, "us-east-2", region)
 		assert.Equal(t, "TOKEN", token)
 	})
+	t.Run("file profiles", func(t *testing.T) {
+		for _, profile := range []string{"default", "named"} {
+			t.Run(profile, func(t *testing.T) {
+				dir := t.TempDir()
+				config := filepath.Join(dir, "config")
+				credentials := filepath.Join(dir, "credentials")
+				section := profile
+				if profile != "default" {
+					section = "profile " + profile
+				}
+				require.NoError(t, os.WriteFile(config, []byte("["+section+"]\nregion=us-east-2\n"), 0600))
+				require.NoError(t, os.WriteFile(credentials, []byte("["+profile+"]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\naws_session_token=TOKEN\n"), 0600))
+				t.Setenv("AWS_CONFIG_FILE", config)
+				t.Setenv("AWS_SHARED_CREDENTIALS_FILE", credentials)
+				t.Setenv("AWS_PROFILE", profile)
+				id, secret, region, token, err := AmbientCreds("")
+				require.NoError(t, err)
+				assert.Equal(t, "AKID", id)
+				assert.Equal(t, "SECRET", secret)
+				assert.Equal(t, "us-east-2", region)
+				assert.Equal(t, "TOKEN", token)
+			})
+		}
+	})
 
 	t.Run("load credentials", func(t *testing.T) {
 		dir := t.TempDir()
@@ -180,10 +204,11 @@ func TestCreds(t *testing.T) {
 
 		require.NoError(t, os.WriteFile(path, []byte("[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n"), 0644))
 
-		id, secret, err := loadCredentials(path, "default")
+		id, secret, token, err := loadCredentials(path, "default")
 		require.NoError(t, err)
 		assert.Equal(t, "AKID", id)
 		assert.Equal(t, "SECRET", secret)
+		assert.Empty(t, token)
 	})
 
 	t.Run("check special file", func(t *testing.T) {

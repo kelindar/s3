@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"net/http"
 	"os"
 	"time"
 
@@ -37,18 +36,17 @@ func main() {
 
 func benchSign(b *bench.B) {
 	key := aws.DeriveKey("", "bench-access", "bench-secret", region, "s3")
-	req, err := http.NewRequest(http.MethodPut, "https://bench-bucket.s3.us-east-1.amazonaws.com/object", nil)
-	check(err)
+	method := []byte("PUT")
+	path := []byte("/object")
+	host := []byte("bench-bucket.s3.us-east-1.amazonaws.com")
 	body := []byte("benchmark payload")
-
-	b.Run("sign/v4", func(int) { key.SignV4(req, nil) })
-	b.Run("sign/body", func(int) { key.SignV4(req, body) })
-	b.Run("sign/raw", func(int) {
-		key.SignV4Raw(http.MethodPut, "/object", "", "bench-bucket.s3.us-east-1.amazonaws.com", nil)
-	})
 	var storage [512]byte
-	b.Run("sign/into", func(int) {
-		key.SignV4Into(storage[:0], []byte(http.MethodPut), []byte("/object"), nil, []byte("bench-bucket.s3.us-east-1.amazonaws.com"), nil)
+
+	b.Run("sign/v4", func(int) {
+		key.Sign(storage[:0], method, path, nil, host, nil)
+	})
+	b.Run("sign/body", func(int) {
+		key.Sign(storage[:0], method, path, nil, host, body)
 	})
 	b.Run("sign/url", func(int) {
 		_, err := key.SignURL("https://bench-bucket.s3.us-east-1.amazonaws.com/object", time.Hour)

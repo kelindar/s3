@@ -499,10 +499,10 @@ func parseRange(rangeHeader string, contentLength int64) (start, end int64, err 
 		}
 	}
 
-	if start < 0 || end >= contentLength || start > end {
+	if start < 0 || start >= contentLength || start > end {
 		return 0, 0, fmt.Errorf("range not satisfiable")
 	}
-
+	end = min(end, contentLength-1)
 	return start, end, nil
 }
 
@@ -1349,6 +1349,12 @@ type CompleteMultipartPart struct {
 	ETag       string `xml:"ETag"`
 }
 
+type completePart struct {
+	number    int
+	etag      [md5.Size]byte
+	etagValid bool
+}
+
 // CompleteMultipartUploadResponse represents the XML response for completing multipart upload
 type CompleteMultipartUploadResponse struct {
 	XMLName  xml.Name `xml:"CompleteMultipartUploadResult"`
@@ -1365,12 +1371,12 @@ type multipartFailure struct {
 }
 
 // scanCompleteMultipart recognizes the exact XML emitted by the library's uploader.
-func scanCompleteMultipart(body []byte) ([]int, bool) {
+func scanCompleteMultipart(body []byte) ([]completePart, bool) {
 	data, ok := bytes.CutPrefix(body, []byte(`<CompleteMultipartUpload xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`))
 	if !ok {
 		return nil, false
 	}
-	parts := make([]int, 0, 4)
+	parts := make([]completePart, 0, 4)
 	for !bytes.Equal(data, []byte(`</CompleteMultipartUpload>`)) {
 		data, ok = bytes.CutPrefix(data, []byte(`<Part><PartNumber>`))
 		if !ok {
@@ -1395,9 +1401,29 @@ func scanCompleteMultipart(body []byte) ([]int, bool) {
 				return nil, false
 			}
 		}
-		parts = append(parts, part)
+		var hash [md5.Size]byte
+		if _, err := hex.Decode(hash[:], etag[5:37]); err != nil {
+			return nil, false
+		}
+		parts = append(parts, completePart{number: part, etag: hash, etagValid: true})
 	}
 	return parts, true
+}
+
+func decodeCompleteETag(etag string) ([md5.Size]byte, bool) {
+	var hash [md5.Size]byte
+	if len(etag) != md5.Size*2+2 || etag[0] != '"' || etag[len(etag)-1] != '"' {
+		return hash, false
+	}
+	for _, c := range etag[1 : len(etag)-1] {
+		if !('0' <= c && c <= '9' || 'a' <= c && c <= 'f') {
+			return hash, false
+		}
+	}
+	if _, err := hex.Decode(hash[:], []byte(etag[1:len(etag)-1])); err != nil {
+		return hash, false
+	}
+	return hash, true
 }
 
 func (m *Server) fastCompleteMultipart(ctx *fasthttp.RequestCtx, key, uploadID string) {
@@ -1423,22 +1449,23 @@ func (m *Server) fastCompleteMultipart(ctx *fasthttp.RequestCtx, key, uploadID s
 }
 
 func (m *Server) completeMultipart(uploadID, key string, body []byte) (string, *multipartFailure) {
-	partNumbers, ok := scanCompleteMultipart(body)
+	parts, ok := scanCompleteMultipart(body)
 	if !ok {
 		var request CompleteMultipartUploadRequest
 		if err := xml.NewDecoder(bytes.NewReader(body)).Decode(&request); err != nil {
 			return "", &multipartFailure{code: "MalformedXML", message: "Invalid XML in request body", status: http.StatusBadRequest}
 		}
-		partNumbers = make([]int, len(request.Parts))
+		parts = make([]completePart, len(request.Parts))
 		for i, part := range request.Parts {
-			partNumbers[i] = part.PartNumber
+			etag, valid := decodeCompleteETag(part.ETag)
+			parts[i] = completePart{number: part.PartNumber, etag: etag, etagValid: valid}
 		}
 	}
 	// Validate and assemble parts
-	sort.Ints(partNumbers)
+	slices.SortFunc(parts, func(a, b completePart) int { return cmp.Compare(a.number, b.number) })
 
 	var contents [][]byte
-	partHashes := make([]byte, len(partNumbers)*md5.Size)
+	partHashes := make([]byte, len(parts)*md5.Size)
 	total := 0
 	missing := false
 	missingPart := 0
@@ -1447,8 +1474,9 @@ func (m *Server) completeMultipart(uploadID, key string, body []byte) (string, *
 	m.mutex.RLock()
 	upload, exists := m.uploads[uploadID]
 	if exists {
-		contents = make([][]byte, 0, len(partNumbers))
-		for i, partNum := range partNumbers {
+		contents = make([][]byte, 0, len(parts))
+		for i, requested := range parts {
+			partNum := requested.number
 			partInfo, ok := upload.Parts[partNum]
 			if !ok {
 				missing = true
@@ -1464,7 +1492,8 @@ func (m *Server) completeMultipart(uploadID, key string, body []byte) (string, *
 				badETag = true
 				break
 			}
-			if _, err := hex.Decode(partHashes[i*md5.Size:(i+1)*md5.Size], []byte(etag[1:33])); err != nil {
+			hash := partHashes[i*md5.Size : (i+1)*md5.Size]
+			if _, err := hex.Decode(hash, []byte(etag[1:33])); err != nil || !requested.etagValid || !bytes.Equal(hash, requested.etag[:]) {
 				badETag = true
 				break
 			}
@@ -1487,7 +1516,7 @@ func (m *Server) completeMultipart(uploadID, key string, body []byte) (string, *
 
 	finalObject := &Object{
 		Content:      finalContent,
-		ETag:         fmt.Sprintf(`"%x-%d"`, md5.Sum(partHashes), len(partNumbers)),
+		ETag:         fmt.Sprintf(`"%x-%d"`, md5.Sum(partHashes), len(parts)),
 		LastModified: time.Now().UTC(),
 		ContentType:  detectContentType(key, finalContent),
 	}
