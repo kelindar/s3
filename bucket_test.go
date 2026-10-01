@@ -679,8 +679,36 @@ func TestBucketListPagination(t *testing.T) {
 	}
 	assert.Equal(t, 1001, count)
 	entries, err := NewBucket(key, "test-bucket").ReadDir("logs")
-	assert.NoError(t, err)
+	require.NoError(t, err)
+	require.Len(t, entries, 1001)
+	for i, entry := range entries {
+		assert.Equal(t, fmt.Sprintf("%04d", i), entry.Name())
+		assert.IsType(t, &File{}, entry)
+	}
+
+	mockServer.PutObject("logs/1001", nil)
+	next, err := NewBucket(key, "test-bucket").ReadDir("logs")
+	require.NoError(t, err)
+	assert.Len(t, next, 1002)
 	assert.Len(t, entries, 1001)
+	assert.Equal(t, "0000", entries[0].Name())
+	assert.Equal(t, "1000", entries[1000].Name())
+}
+
+func TestEmptyReadDir(t *testing.T) {
+	server := mock.New("test-bucket", "us-east-1")
+	defer server.Close()
+	bucket := NewBucket(aws.DeriveKey(server.URL(), "test", "test", "us-east-1", "s3"), "test-bucket")
+	entries, err := bucket.ReadDir(".")
+	assert.NoError(t, err)
+	assert.Nil(t, entries)
+	entries, err = bucket.ReadDir("missing")
+	assert.ErrorIs(t, err, fs.ErrNotExist)
+	assert.Nil(t, entries)
+	server.PutObject("empty/", nil)
+	entries, err = bucket.ReadDir("empty")
+	assert.NoError(t, err)
+	assert.Nil(t, entries)
 }
 
 func TestListConcurrent(t *testing.T) {

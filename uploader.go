@@ -22,10 +22,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/url"
 	"sort"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -45,15 +43,6 @@ type uploader struct {
 	ContentType string
 
 	Bucket, Object string
-
-	Scheme string
-
-	// Host, if not the empty string,
-	// is the host of the bucket.
-	// If Host is unset, then "s3.amazonaws.com" is used.
-	//
-	// Requests are always made to <bucket>.host
-	Host string
 
 	// upload ID
 	id string
@@ -185,26 +174,9 @@ func scanMultipartResponse(data []byte) (multipartResponse, bool) {
 }
 
 func (u *uploader) signedRequest(method, query string, body []byte, headers ...[2]string) *fasthttp.Request {
-	path := "/" + almostPathEscape(u.Object)
-	host := u.Bucket + "." + u.Host
-	if u.Key.BaseURI != "" {
-		path = "/" + u.Bucket + path
-		host = u.Host
-	}
-	var uri strings.Builder
-	uri.Grow(len(u.Scheme) + len(host) + len(path) + len(query) + 4)
-	uri.WriteString(u.Scheme)
-	uri.WriteString("://")
-	uri.WriteString(host)
-	uri.WriteString(path)
-	uri.WriteByte('?')
-	uri.WriteString(query)
-
 	req := fasthttp.AcquireRequest()
-	req.SetRequestURI(uri.String())
-	req.URI().DisablePathNormalizing = true
+	setURI(req, u.Key, u.Bucket, u.Object, query)
 	req.Header.SetMethod(method)
-	req.Header.SetHost(host)
 	signRequest(u.Key, req, body, headers...)
 	return req
 }
@@ -215,14 +187,6 @@ func (u *uploader) signedRequest(method, query string, body []byte, headers ...[
 func (u *uploader) Start(ctx context.Context) error {
 	if u.started {
 		panic("multiple calls to uploader.Start()")
-	}
-	if u.Key.BaseURI == "" {
-		u.Scheme = "https"
-		u.Host = "s3." + u.Key.Region + ".amazonaws.com"
-	} else {
-		uu, _ := url.Parse(u.Key.BaseURI)
-		u.Scheme = uu.Scheme
-		u.Host = uu.Host
 	}
 	if u.Bucket == "" || u.Object == "" {
 		return fmt.Errorf("s3.Uploader.Bucket and s3.Uploader.Object must be present")

@@ -318,18 +318,28 @@ func (s *SigningKey) SignV4(req *http.Request, body []byte) {
 // The caller sets the returned headers and X-Amz-Security-Token when set.
 func (s *SigningKey) SignV4Raw(method, path, query, host string, body []byte, extra ...[2]string) (date, payloadHash, authorization string) {
 	var storage [512]byte
-	buf := bytes.NewBuffer(storage[:0])
+	stamp, payloadHash, auth := s.SignV4Into(storage[:0], []byte(method), []byte(path), []byte(query), []byte(host), body, extra...)
+	result := string(stamp[:len(stamp)+len(auth)])
+	return result[:len(stamp)], payloadHash, result[len(stamp):]
+}
+
+// SignV4Into signs the same inputs as SignV4Raw using dst as output storage.
+// It overwrites dst from its beginning and grows it if capacity is insufficient.
+// The returned date and authorization alias that storage and must be copied
+// before it is reused. Inputs and extra header pairs are not retained or changed.
+// dst must not overlap input storage.
+func (s *SigningKey) SignV4Into(dst, method, path, query, host, body []byte, extra ...[2]string) (date []byte, payloadHash string, authorization []byte) {
+	buf := bytes.NewBuffer(dst[:0])
 	now := signtime().UTC()
 	var stampStorage [len(longFormat)]byte
 	stamp := now.AppendFormat(stampStorage[:0], longFormat)
-	path = cmp.Or(path, "/")
 	payloadHash = "UNSIGNED-PAYLOAD"
 	if body == nil {
 		payloadHash = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 	}
 	var headerStorage [16][2]string
 	headers := headerStorage[:3]
-	// Write host and date directly so temporary byte-to-string conversions stay on the stack.
+	// Host and date are emitted directly; these pairs only carry their names.
 	headers[0] = [2]string{"host", ""}
 	headers[1] = [2]string{"x-amz-content-sha256", payloadHash}
 	headers[2] = [2]string{"x-amz-date", ""}
@@ -345,18 +355,22 @@ func (s *SigningKey) SignV4Raw(method, path, query, host string, body []byte, ex
 		slices.SortFunc(headers, func(a, b [2]string) int { return strings.Compare(a[0], b[0]) })
 	}
 
-	buf.WriteString(method)
+	buf.Write(method)
 	buf.WriteByte('\n')
-	buf.WriteString(path)
+	if len(path) == 0 {
+		buf.WriteByte('/')
+	} else {
+		buf.Write(path)
+	}
 	buf.WriteByte('\n')
-	buf.WriteString(query)
+	buf.Write(query)
 	buf.WriteByte('\n')
 	for _, header := range headers {
 		buf.WriteString(header[0])
 		buf.WriteByte(':')
 		switch header[0] {
 		case "host":
-			buf.WriteString(host)
+			buf.Write(host)
 		case "x-amz-date":
 			buf.Write(stamp)
 		default:
@@ -397,7 +411,7 @@ func (s *SigningKey) SignV4Raw(method, path, query, host string, body []byte, ex
 	}
 	buf.WriteString(", Signature=")
 	buf.Write(hexbuf[:])
-	result := buf.String()
+	result := buf.Bytes()
 	return result[:len(stamp)], payloadHash, result[len(stamp):]
 }
 

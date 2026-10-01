@@ -23,7 +23,6 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
-	"net/url"
 	"path"
 	"slices"
 	"strconv"
@@ -33,6 +32,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/kelindar/s3/aws"
+	"github.com/valyala/fasthttp"
 )
 
 // Prefix implements fs.File, fs.ReadDirFile, and fs.DirEntry, and fs.FS.
@@ -325,7 +325,10 @@ func listingXMLIs(name []byte, want string) bool { return bytes.Equal(name, []by
 func (p *listingXML) addObject(ret *listResponse, key, etag []byte) {
 	if p.count == 0 {
 		p.first = len(ret.Contents) - 1
-		p.values.Grow(min(16<<10, min(len(p.ranges), cap(ret.Contents)-p.first)*(len(key)+len(etag))))
+		if p.values.Len() == 0 {
+			size := min(int64(len(p.data)), int64(cap(ret.Contents))*(int64(len(key))+int64(len(etag))))
+			p.values.Grow(int(size))
+		}
 	}
 	part := &p.ranges[p.count]
 	part.keyStart = p.values.Len()
@@ -351,7 +354,6 @@ func (p *listingXML) flushObjects(ret *listResponse) {
 		file.Reader.Path = value[part.keyStart:part.keyEnd]
 		file.ETag = value[part.etagStart:part.etagEnd]
 	}
-	p.values.Reset()
 	p.count = 0
 }
 
@@ -754,28 +756,39 @@ func (p *Prefix) listContext(ctx context.Context, n int, token, seek, prefix str
 	if seek != "" && (seek < prefix || !strings.HasPrefix(seek, prefix)) {
 		return nil, fmt.Errorf("seek %q not compatible with prefix %q", seek, prefix)
 	}
-	var query strings.Builder
-	query.Grow(96 + len(path) + len(token) + len(seek))
-	query.WriteByte('?')
-	if token != "" {
-		query.WriteString("continuation-token=")
-		query.WriteString(url.QueryEscape(token))
-		query.WriteByte('&')
+	switch {
+	case ctx == nil:
+		return nil, fmt.Errorf("executing request: s3 request: nil context")
+	case ctx.Err() != nil:
+		return nil, fmt.Errorf("executing request: %w", ctx.Err())
 	}
-	query.WriteString("delimiter=%2F&list-type=2")
+	req := fasthttp.AcquireRequest()
+	defer fasthttp.ReleaseRequest(req)
+	setURI(req, p.Key, p.Bucket, "", "")
+	uri := req.URI()
+	query := uri.QueryString()[:0]
+	if token != "" {
+		query = append(query, "continuation-token="...)
+		query = appendQueryEscape(query, token)
+		query = append(query, '&')
+	}
+	query = append(query, "delimiter=%2F&list-type=2"...)
 	if n > 0 {
-		query.WriteString("&max-keys=")
-		query.WriteString(strconv.Itoa(n))
+		query = append(query, "&max-keys="...)
+		query = strconv.AppendInt(query, int64(n), 10)
 	}
 	if path != "" {
-		query.WriteString("&prefix=")
-		query.WriteString(queryEscape(path))
+		query = append(query, "&prefix="...)
+		query = appendQueryEscape(query, path)
 	}
 	if seek != "" {
-		query.WriteString("&start-after=")
-		query.WriteString(queryEscape(p.join(seek)))
+		query = append(query, "&start-after="...)
+		query = appendQueryEscape(query, p.join(seek))
 	}
-	res, err := doSigned(ctx, p.Key, "GET", rawURI(p.Key, p.Bucket, query.String()), nil)
+	uri.SetQueryStringBytes(query)
+	req.Header.SetMethod(fasthttp.MethodGet)
+	signRequest(p.Key, req, nil)
+	res, err := flakyFast(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("executing request: %w", err)
 	}

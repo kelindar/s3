@@ -253,19 +253,20 @@ func signRequest(key *aws.SigningKey, req *fasthttp.Request, body []byte, header
 	for _, header := range headers {
 		req.Header.Set(header[0], header[1])
 	}
-	date, hash, auth := key.SignV4Raw(string(req.Header.Method()), string(uri.PathOriginal()), string(uri.QueryString()), string(host), body, headers...)
-	req.Header.Set("X-Amz-Date", date)
+	var storage [512]byte
+	date, hash, auth := key.SignV4Into(storage[:0], req.Header.Method(), uri.PathOriginal(), uri.QueryString(), host, body, headers...)
+	req.Header.SetBytesV("X-Amz-Date", date)
 	req.Header.Set("X-Amz-Content-Sha256", hash)
 	if key.Token != "" {
 		req.Header.Set("X-Amz-Security-Token", key.Token)
 	}
-	req.Header.Set("Authorization", auth)
+	req.Header.SetBytesV("Authorization", auth)
 	if body != nil {
 		req.SetBodyRaw(body)
 	}
 }
 
-func doSigned(ctx context.Context, key *aws.SigningKey, method, uri string, body []byte) (*response, error) {
+func doObject(ctx context.Context, key *aws.SigningKey, method, bucket, object string, body []byte) (*response, error) {
 	switch {
 	case ctx == nil:
 		return nil, errors.New("s3 request: nil context")
@@ -274,7 +275,7 @@ func doSigned(ctx context.Context, key *aws.SigningKey, method, uri string, body
 	}
 	req := fasthttp.AcquireRequest()
 	defer fasthttp.ReleaseRequest(req)
-	req.SetRequestURI(uri)
+	setURI(req, key, bucket, object, "")
 	req.Header.SetMethod(method)
 	signRequest(key, req, body)
 	return flakyFast(ctx, req)

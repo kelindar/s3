@@ -27,6 +27,7 @@ import (
 	"github.com/kelindar/s3/mock"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/valyala/fasthttp"
 )
 
 func TestValidBucket(t *testing.T) {
@@ -181,14 +182,38 @@ func TestURL(t *testing.T) {
 }
 
 func TestPathEscape(t *testing.T) {
-	for value := 0; value < 128; value++ {
-		path := "a/" + string(rune(value)) + "z"
+	for value := 0; value < 256; value++ {
+		path := "a/" + string([]byte{byte(value)}) + "z"
 		want := strings.ReplaceAll(strings.ReplaceAll(url.QueryEscape(path), "+", "%20"), "%2F", "/")
 		assert.Equal(t, want, almostPathEscape(path), "path %q", path)
+		assert.Equal(t, queryEscape(path), string(appendQueryEscape(nil, path)), "query %q", path)
 	}
 	for _, path := range []string{"folder/file.txt", "folder/é😀.txt"} {
 		want := strings.ReplaceAll(strings.ReplaceAll(url.QueryEscape(path), "+", "%20"), "%2F", "/")
 		assert.Equal(t, want, almostPathEscape(path), "path %q", path)
+		assert.Equal(t, queryEscape(path), string(appendQueryEscape(nil, path)), "query %q", path)
+	}
+}
+
+func TestRequestURI(t *testing.T) {
+	var req fasthttp.Request
+	for _, base := range []string{"", "http://localhost:9000", "http://localhost:9000/api%20s3/", "http://[::1]:9000/api"} {
+		for _, bucket := range []string{"bucket", "bucket.name"} {
+			key := aws.DeriveKey(base, "access", "secret", "us-east-1", "s3")
+			for _, object := range []string{"", "folder/file.txt", "a/../b//c", "a b+%&☃?#", strings.Repeat("a b/", 1024)} {
+				req.Reset()
+				const query = "partNumber=1&uploadId=a%2B%2F%3D"
+				want := uri(key, bucket, object) + "?" + query
+				setURI(&req, key, bucket, object, query)
+				assert.Equal(t, want, string(req.URI().FullURI()))
+				parsed, err := url.Parse(want)
+				require.NoError(t, err)
+				assert.Equal(t, parsed.EscapedPath(), string(req.URI().PathOriginal()))
+				assert.Equal(t, query, string(req.URI().QueryString()))
+				signRequest(key, &req, nil)
+				assert.Equal(t, parsed.Host, string(req.Header.Host()))
+			}
+		}
 	}
 }
 

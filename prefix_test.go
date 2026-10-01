@@ -437,7 +437,7 @@ func TestListQuery(t *testing.T) {
 	require.NoError(t, err)
 	requests := server.GetRequestLog()
 	require.Len(t, requests, 1)
-	assert.Equal(t, "continuation-token=next%2B+page&delimiter=%2F&list-type=2&max-keys=7&prefix=dir%2Ffile&start-after=dir%2Ffile%202", requests[0].Query)
+	assert.Equal(t, "continuation-token=next%2B%20page&delimiter=%2F&list-type=2&max-keys=7&prefix=dir%2Ffile&start-after=dir%2Ffile%202", requests[0].Query)
 }
 
 func BenchmarkListXMLDecode(b *testing.B) {
@@ -513,11 +513,25 @@ func TestListResponseOwnership(t *testing.T) {
 	assert.Equal(t, "next", result.NextToken)
 }
 
+func TestListReservation(t *testing.T) {
+	for _, size := range []int{1024, 3 << 20} {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			key := bytes.Repeat([]byte{'k'}, size)
+			p := listingXML{data: make([]byte, size+(32<<10))}
+			page := listResponse{Contents: make([]File, 1, 1000)}
+			require.NotPanics(t, func() { p.addObject(&page, key, []byte("tag")) })
+			p.flushObjects(&page)
+			assert.LessOrEqual(t, p.values.Cap(), 2*len(p.data), "reservation is bounded by the response size, allowing allocator rounding")
+			assert.Equal(t, string(key), page.Contents[0].Reader.Path)
+		})
+	}
+}
+
 func TestListBatchOwnership(t *testing.T) {
 	var body bytes.Buffer
 	body.WriteString("<ListBucketResult>")
-	for i := range 130 {
-		fmt.Fprintf(&body, "<Contents><ETag>&quot;tag-%d&quot;</ETag><Key>dir/file-%04d%s&amp;x</Key><Size>%d</Size></Contents>", i, i, strings.Repeat("x", i%23), i)
+	for i := range 257 {
+		fmt.Fprintf(&body, "<Contents><ETag>&quot;tag-%d-%s&quot;</ETag><Key>dir/file-%04d%s&amp;x</Key><Size>%d</Size></Contents>", i, strings.Repeat("t", i%131), i, strings.Repeat("x", i%257), i)
 	}
 	body.WriteString("</ListBucketResult>")
 	data := body.Bytes()

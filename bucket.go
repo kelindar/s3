@@ -146,7 +146,7 @@ func (b *Bucket) write(ctx context.Context, key string, contents []byte, conditi
 	var err error
 	var ifMatch string
 	if condition == nil {
-		res, err = doSigned(ctx, b.key, http.MethodPut, uri(b.key, b.bkt, key), contents)
+		res, err = doObject(ctx, b.key, http.MethodPut, b.bkt, key, contents)
 	} else {
 		switch {
 		case ctx == nil:
@@ -164,7 +164,7 @@ func (b *Bucket) write(ctx context.Context, key string, contents []byte, conditi
 		ifMatch = header.Get("If-Match")
 		req := fasthttp.AcquireRequest()
 		defer fasthttp.ReleaseRequest(req)
-		req.SetRequestURI(uri(b.key, b.bkt, key))
+		setURI(req, b.key, b.bkt, key, "")
 		req.Header.SetMethod(fasthttp.MethodPut)
 		var storage [8][2]string
 		headers := storage[:0]
@@ -302,7 +302,11 @@ func (b *Bucket) ReadDir(name string) ([]fs.DirEntry, error) {
 		if err != nil && !errors.Is(err, io.EOF) {
 			return nil, &fs.PathError{Op: "readdir", Path: prefix.Path, Err: err}
 		}
-		entries = append(entries, page...)
+		if len(entries) == 0 && len(page) > 0 {
+			entries = page
+		} else {
+			entries = append(entries, page...)
+		}
 		if errors.Is(err, io.EOF) || next == "" {
 			break
 		}
@@ -366,7 +370,7 @@ func (b *Bucket) Delete(ctx context.Context, fullpath string) error {
 	if !fs.ValidPath(fullpath) {
 		return fmt.Errorf("%s: %s", fullpath, fs.ErrInvalid)
 	}
-	res, err := doSigned(ctx, b.key, http.MethodDelete, uri(b.key, b.bkt, fullpath), nil)
+	res, err := doObject(ctx, b.key, http.MethodDelete, b.bkt, fullpath, nil)
 	if err != nil {
 		return err
 	}

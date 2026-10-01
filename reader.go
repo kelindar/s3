@@ -125,6 +125,48 @@ func rawURI(k *aws.SigningKey, bucket string, query string) string {
 	}
 }
 
+// setURI builds directly in the request's reusable header buffer. object is
+// unescaped; query must already be escaped and in canonical order.
+func setURI(req *fasthttp.Request, k *aws.SigningKey, bucket, object, query string) {
+	req.SetRequestURI(cmp.Or(k.BaseURI, "https://"))
+	target := req.Header.RequestURI()
+	switch {
+	case k.BaseURI != "":
+		target = append(target, '/')
+		target = append(target, bucket...)
+	case !strings.Contains(bucket, "."):
+		target = append(target, bucket...)
+		target = append(target, ".s3."...)
+		target = append(target, k.Region...)
+		target = append(target, ".amazonaws.com"...)
+	default:
+		target = append(target, "s3."...)
+		target = append(target, k.Region...)
+		target = append(target, ".amazonaws.com/"...)
+		target = append(target, bucket...)
+	}
+	target = appendPathEscape(append(target, '/'), object)
+	if query != "" {
+		target = append(target, '?')
+		target = append(target, query...)
+	}
+	req.SetRequestURIBytes(target)
+	req.URI().DisablePathNormalizing = true
+}
+
+func appendPathEscape(dst []byte, path string) []byte {
+	const hex = "0123456789ABCDEF"
+	for i := range len(path) {
+		switch c := path[i]; {
+		case c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9', c == '-' || c == '_' || c == '.' || c == '~' || c == '/':
+			dst = append(dst, c)
+		default:
+			dst = append(dst, '%', hex[c>>4], hex[c&15])
+		}
+	}
+	return dst
+}
+
 // perform S3-specific path escaping;
 // all the special characters are turned
 // into their quoted bits, but we turn %2F
@@ -136,7 +178,7 @@ func almostPathEscape(s string) string {
 		case c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9':
 		case c == '-' || c == '_' || c == '.' || c == '~' || c == '/':
 		default:
-			return strings.ReplaceAll(queryEscape(s), "%2F", "/")
+			return string(appendPathEscape(nil, s))
 		}
 	}
 	return s
@@ -144,6 +186,18 @@ func almostPathEscape(s string) string {
 
 func queryEscape(s string) string {
 	return strings.ReplaceAll(url.QueryEscape(s), "+", "%20")
+}
+
+func appendQueryEscape(dst []byte, value string) []byte {
+	for {
+		before, after, found := strings.Cut(value, " ")
+		dst = fasthttp.AppendQuotedArg(dst, []byte(before))
+		if !found {
+			return dst
+		}
+		dst = append(dst, "%20"...)
+		value = after
+	}
 }
 
 // uri produces a URI by path-escaping the object string
@@ -234,7 +288,7 @@ func (r *Reader) openContext(ctx context.Context, k *aws.SigningKey, bucket, obj
 	if contents {
 		method = http.MethodGet
 	}
-	res, err := doSigned(ctx, k, method, uri(k, bucket, object), nil)
+	res, err := doObject(ctx, k, method, bucket, object, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -275,7 +329,7 @@ func (r *Reader) openContext(ctx context.Context, k *aws.SigningKey, bucket, obj
 
 // WriteTo implements io.WriterTo
 func (r *Reader) WriteTo(w io.Writer) (int64, error) {
-	res, err := doSigned(r.requestContext(), r.Key, http.MethodGet, uri(r.Key, r.Bucket, r.Path), nil)
+	res, err := doObject(r.requestContext(), r.Key, http.MethodGet, r.Bucket, r.Path, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -302,7 +356,7 @@ func (r *Reader) requestContext() context.Context {
 func (r *Reader) rangeReaderContext(ctx context.Context, off, width int64) (io.ReadCloser, error) {
 	req := fasthttp.AcquireRequest()
 	defer fasthttp.ReleaseRequest(req)
-	req.SetRequestURI(uri(r.Key, r.Bucket, r.Path))
+	setURI(req, r.Key, r.Bucket, r.Path, "")
 	req.Header.SetMethod(fasthttp.MethodGet)
 	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", off, off+width-1))
 	var headers [1][2]string
@@ -352,7 +406,7 @@ func BucketRegion(k *aws.SigningKey, bucket string) (string, error) {
 	case k.BaseURI != "":
 		return k.Region, nil
 	}
-	res, err := doSigned(context.Background(), k, http.MethodHead, rawURI(k, bucket, ""), nil)
+	res, err := doObject(context.Background(), k, http.MethodHead, bucket, "", nil)
 	if err != nil {
 		return "", err
 	}

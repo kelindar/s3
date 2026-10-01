@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -23,18 +24,55 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
+func doSigned(ctx context.Context, key *aws.SigningKey, method, uri string, body []byte) (*response, error) {
+	switch {
+	case ctx == nil:
+		return nil, errors.New("s3 request: nil context")
+	case ctx.Err() != nil:
+		return nil, ctx.Err()
+	}
+	req := fasthttp.AcquireRequest()
+	defer fasthttp.ReleaseRequest(req)
+	req.SetRequestURI(uri)
+	req.Header.SetMethod(method)
+	signRequest(key, req, body)
+	return flakyFast(ctx, req)
+}
+
+func BenchmarkRequest(b *testing.B) {
+	for _, object := range []string{"object", "folder/a b+%&☃"} {
+		b.Run(object, func(b *testing.B) {
+			key := aws.DeriveKey("", "access", "secret", "us-east-1", "s3")
+			var req fasthttp.Request
+			setURI(&req, key, "bucket", object, "")
+			signRequest(key, &req, nil)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				req.Reset()
+				setURI(&req, key, "bucket", object, "")
+				signRequest(key, &req, nil)
+			}
+		})
+	}
+}
+
 func TestHTTPS(t *testing.T) {
 	for _, test := range []struct {
-		name, method, target string
-		body                 []byte
-		headers              [][2]string
-		untrusted            bool
+		name, method, target            string
+		bucket, object, endpoint, query string
+		body                            []byte
+		headers                         [][2]string
+		untrusted                       bool
 	}{
 		{name: "empty", method: http.MethodGet, target: "/"},
 		{name: "payload", method: http.MethodPut, target: "/a/../b%2Fc%2B%26%E2%98%83?partNumber=1&uploadId=id%2B%2F%3D", body: []byte("payload")},
 		{name: "conditional", method: http.MethodPut, target: "/bucket/object", body: []byte("payload"), headers: [][2]string{{"if-match", `"etag"`}, {"if-unmodified-since", "Tue, 15 Nov 1994 08:12:31 GMT"}}},
 		{name: "copy", method: http.MethodPut, target: "/bucket/object?partNumber=1&uploadId=id%2B%2F%3D", headers: [][2]string{{"x-amz-copy-source", "/bucket/a%20b%25"}, {"x-amz-copy-source-if-match", `"etag"`}, {"x-amz-copy-source-range", "bytes=1-5242880"}}},
 		{name: "header whitespace", method: http.MethodPut, target: "/bucket/object", headers: [][2]string{{"if-unmodified-since", "  Tue,  15\tNov 1994 08:12:31 GMT  "}}},
+		{name: "native object", method: http.MethodPut, target: "/bucket/folder/a%20b%2B%25%26%E2%98%83", bucket: "bucket", object: "folder/a b+%&☃", body: []byte("payload")},
+		{name: "native endpoint", method: http.MethodPut, target: "/gateway/s3/bucket/a/../b//c%20d", bucket: "bucket", object: "a/../b//c d", endpoint: "/gateway/s3", body: []byte("payload")},
+		{name: "native multipart", method: http.MethodPut, target: "/gateway/s3/bucket.name/folder/a%2Bb?partNumber=1&uploadId=id%2B%2F%3D", bucket: "bucket.name", object: "folder/a+b", endpoint: "/gateway/s3", query: "partNumber=1&uploadId=id%2B%2F%3D", body: []byte("part payload")},
 		{name: "untrusted", method: http.MethodGet, target: "/", untrusted: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -103,13 +141,24 @@ func TestHTTPS(t *testing.T) {
 				client.CloseIdleConnections()
 				defaultClient = original
 			})
-			key := aws.DeriveKey(server.URL, "test-access", "test-secret", "us-east-1", "s3")
+			key := aws.DeriveKey(server.URL+test.endpoint, "test-access", "test-secret", "us-east-1", "s3")
 			key.Token = "session-token"
-			req := fasthttp.AcquireRequest()
+			var req *fasthttp.Request
+			switch {
+			case test.query != "":
+				u := uploader{Key: key, Bucket: test.bucket, Object: test.object}
+				req = u.signedRequest(test.method, test.query, test.body, test.headers...)
+			default:
+				req = fasthttp.AcquireRequest()
+				if test.bucket != "" {
+					setURI(req, key, test.bucket, test.object, "")
+				} else {
+					req.SetRequestURI(server.URL + test.target)
+				}
+				req.Header.SetMethod(test.method)
+				signRequest(key, req, test.body, test.headers...)
+			}
 			defer fasthttp.ReleaseRequest(req)
-			req.SetRequestURI(server.URL + test.target)
-			req.Header.SetMethod(test.method)
-			signRequest(key, req, test.body, test.headers...)
 			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 			defer cancel()
 			res, err := flakyFast(ctx, req)
@@ -195,7 +244,7 @@ func TestClient(t *testing.T) {
 		}))
 		defer server.Close()
 		key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
-		u := &uploader{Key: key, Bucket: "bucket", Object: "object", Scheme: "http", Host: strings.TrimPrefix(server.URL, "http://"), id: "id+/=", started: true}
+		u := &uploader{Key: key, Bucket: "bucket", Object: "object", id: "id+/=", started: true}
 		require.NoError(t, u.CopyFrom(context.Background(), 1, &Reader{Bucket: "bucket", Path: "a b%", ETag: "match", Size: MinPartSize + 1}, 1, MinPartSize+1))
 		u.bg.Wait()
 		require.NoError(t, u.asyncerr)
@@ -214,7 +263,7 @@ func TestClient(t *testing.T) {
 		}))
 		defer server.Close()
 		key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
-		u := &uploader{Key: key, Bucket: "bucket", Object: "object", Scheme: "http", Host: strings.TrimPrefix(server.URL, "http://"), id: "id+/=", started: true}
+		u := &uploader{Key: key, Bucket: "bucket", Object: "object", id: "id+/=", started: true}
 		assert.Error(t, u.Abort(context.Background()))
 		assert.EqualValues(t, 1, attempts.Load())
 		assert.True(t, u.started)
@@ -472,13 +521,13 @@ func TestClient(t *testing.T) {
 	})
 
 	t.Run("signed cancellation", func(t *testing.T) {
-		key := aws.DeriveKey("", "access", "secret", "us-east-1", "s3")
+		key := aws.DeriveKey("http://127.0.0.1:1", "access", "secret", "us-east-1", "s3")
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		res, err := doSigned(ctx, key, http.MethodGet, "http://127.0.0.1:1", nil)
+		res, err := doObject(ctx, key, http.MethodGet, "bucket", "object", nil)
 		assert.Nil(t, res)
 		assert.ErrorIs(t, err, context.Canceled)
-		res, err = doSigned(nil, key, http.MethodGet, "http://127.0.0.1:1", nil)
+		res, err = doObject(nil, key, http.MethodGet, "bucket", "object", nil)
 		assert.Nil(t, res)
 		assert.Error(t, err)
 	})
@@ -568,7 +617,7 @@ func TestClient(t *testing.T) {
 		res, err := doFastRequest(ctx, req)
 		assert.Nil(t, res)
 		require.Error(t, err)
-		assert.ErrorIs(t, ctx.Err(), context.DeadlineExceeded)
+		assert.ErrorIs(t, err, context.DeadlineExceeded)
 	})
 
 	t.Run("cancelled body", func(t *testing.T) {

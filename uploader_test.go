@@ -54,20 +54,25 @@ func TestUploadBuffers(t *testing.T) {
 
 func TestSignedRequest(t *testing.T) {
 	for _, test := range []struct {
-		name, baseURI, scheme, host string
+		name, baseURI, bucket, scheme, host string
 	}{
-		{"aws", "", "https", "s3.us-east-1.amazonaws.com"},
-		{"custom", "http://127.0.0.1:9000", "http", "127.0.0.1:9000"},
+		{"aws", "", "bucket", "https", "s3.us-east-1.amazonaws.com"},
+		{"dotted bucket", "", "bucket.name", "https", "s3.us-east-1.amazonaws.com"},
+		{"custom", "http://127.0.0.1:9000", "bucket", "http", "127.0.0.1:9000"},
+		{"endpoint path", "http://127.0.0.1:9000/s3", "bucket", "http", "127.0.0.1:9000"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			key := aws.DeriveKey(test.baseURI, "access", "secret", "us-east-1", "s3")
 			key.Token = "session-token"
-			u := &uploader{Key: key, Bucket: "bucket", Object: "folder/a b+%&☃", Scheme: test.scheme, Host: test.host}
+			u := &uploader{Key: key, Bucket: test.bucket, Object: "folder/a b+%&☃"}
 			query := "partNumber=1&uploadId=id"
 			host := test.host
-			path := "/bucket/folder/a%20b%2B%25%26%E2%98%83"
-			if test.baseURI == "" {
-				host = "bucket." + host
+			path := "/" + test.bucket + "/folder/a%20b%2B%25%26%E2%98%83"
+			if test.name == "endpoint path" {
+				path = "/s3" + path
+			}
+			if test.baseURI == "" && !strings.Contains(test.bucket, ".") {
+				host = test.bucket + "." + host
 				path = "/folder/a%20b%2B%25%26%E2%98%83"
 			}
 			got := u.signedRequest(fasthttp.MethodPut, query, []byte("contents"))
@@ -99,7 +104,7 @@ func TestMultipartQueries(t *testing.T) {
 			}))
 			defer server.Close()
 			key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
-			u := &uploader{Key: key, Bucket: "bucket", Object: "object", Scheme: "http", Host: strings.TrimPrefix(server.URL, "http://"), id: uploadID, started: true}
+			u := &uploader{Key: key, Bucket: "bucket", Object: "object", id: uploadID, started: true}
 			var err error
 			switch operation {
 			case "part":

@@ -24,6 +24,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -197,6 +198,8 @@ func TestSignV4Raw(t *testing.T) {
 		{name: "copy", uri: "https://bucket.example.com/object?partNumber=1&uploadId=id", token: "session-token", headers: [][2]string{{"x-amz-copy-source-range", "bytes=0-5242879"}, {"x-amz-copy-source", "/bucket/a%20b%25"}, {"x-amz-copy-source-if-match", `"etag"`}}},
 		{name: "many conditions", uri: "https://bucket.example.com/object", headers: many},
 		{name: "empty condition", uri: "https://bucket.example.com/object", headers: [][2]string{{"if-match", ""}}},
+		{name: "long path", uri: "https://bucket.example.com/" + strings.Repeat("a", 2048)},
+		{name: "long credential", uri: "https://bucket.example.com/object", token: strings.Repeat("token", 256)},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			key := DeriveKey("", "access", "secret", "us-east-1", "s3")
@@ -212,6 +215,16 @@ func TestSignV4Raw(t *testing.T) {
 			assert.Equal(t, req.Header.Get("X-Amz-Date"), date)
 			assert.Equal(t, req.Header.Get("X-Amz-Content-Sha256"), hash)
 			assert.Equal(t, req.Header.Get("Authorization"), auth)
+			for _, capacity := range []int{0, 16, 512, 4096} {
+				storage := bytes.Repeat([]byte{'x'}, capacity)
+				gotDate, gotHash, gotAuth := key.SignV4Into(storage, []byte(req.Method), []byte(req.URL.EscapedPath()), []byte(req.URL.RawQuery), []byte(req.Host), test.body, test.headers...)
+				assert.Equal(t, date, string(gotDate))
+				assert.Equal(t, hash, gotHash)
+				assert.Equal(t, auth, string(gotAuth))
+				clear(gotDate[:cap(gotDate)])
+				assert.Equal(t, req.Header.Get("X-Amz-Date"), date, "raw date owns its storage")
+				assert.Equal(t, req.Header.Get("Authorization"), auth, "owned raw outputs survive reuse of caller storage")
+			}
 			assert.Equal(t, retained, test.headers, "signing must not modify caller-owned header pairs")
 		})
 	}
@@ -446,6 +459,13 @@ func BenchmarkSigning(b *testing.B) {
 		b.ReportAllocs()
 		for range b.N {
 			key.SignV4Raw(http.MethodPut, "/object", "", "bench-bucket.s3.us-east-1.amazonaws.com", nil)
+		}
+	})
+	b.Run("v4-into", func(b *testing.B) {
+		var storage [512]byte
+		b.ReportAllocs()
+		for range b.N {
+			key.SignV4Into(storage[:0], []byte(http.MethodPut), []byte("/object"), nil, []byte("bench-bucket.s3.us-east-1.amazonaws.com"), nil)
 		}
 	})
 	b.Run("url", func(b *testing.B) {

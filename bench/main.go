@@ -46,6 +46,10 @@ func benchSign(b *bench.B) {
 	b.Run("sign/raw", func(int) {
 		key.SignV4Raw(http.MethodPut, "/object", "", "bench-bucket.s3.us-east-1.amazonaws.com", nil)
 	})
+	var storage [512]byte
+	b.Run("sign/into", func(int) {
+		key.SignV4Into(storage[:0], []byte(http.MethodPut), []byte("/object"), nil, []byte("bench-bucket.s3.us-east-1.amazonaws.com"), nil)
+	})
 	b.Run("sign/url", func(int) {
 		_, err := key.SignURL("https://bench-bucket.s3.us-east-1.amazonaws.com/object", time.Hour)
 		check(err)
