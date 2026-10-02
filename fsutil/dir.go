@@ -141,7 +141,7 @@ type VisitDirFn func(d DirEntry) error
 // then calls fn for each matching entry.
 func VisitDir(f fs.FS, name, seek, pattern string, fn VisitDirFn) error {
 	err := visitDir(f, name, seek, pattern, fn)
-	if err == fs.SkipAll {
+	if err == fs.SkipDir || err == fs.SkipAll {
 		err = nil
 	}
 	return err
@@ -391,9 +391,7 @@ func walkInto(f fs.FS, name, seek, pattern string, d DirEntry, fn WalkDirFn) err
 		// already passed the seek point
 		seek1 = ""
 	}
-	// VisitDir will hide fs.SkipAll returned by
-	// fn so we should detect that ourselves and
-	// return fs.SkipAll to the caller
+	// Preserve SkipAll from child walks across this directory listing.
 	skipAll := false
 	outer := func(d DirEntry) error {
 		if skipAll {
@@ -409,7 +407,10 @@ func walkInto(f fs.FS, name, seek, pattern string, d DirEntry, fn WalkDirFn) err
 		}
 		return err
 	}
-	err := VisitDir(f, name, seek1, pattern1, outer)
+	err := visitDir(f, name, seek1, pattern1, outer)
+	if err == fs.SkipAll {
+		err = nil
+	}
 	if err != nil {
 		// report err to caller
 		err = fn(name, d, err)

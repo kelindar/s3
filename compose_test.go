@@ -2,7 +2,12 @@ package s3
 
 import (
 	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/kelindar/s3/aws"
 	"github.com/kelindar/s3/mock"
@@ -10,7 +15,84 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestComposeConcurrency(t *testing.T) {
+	previous := defaultClient
+	client := newClient(previous.Dial)
+	client.MaxConnsPerHost = 64
+	defaultClient = client
+	defer func() { client.CloseIdleConnections(); defaultClient = previous }()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && r.URL.Query().Has("uploads"):
+			_, _ = io.WriteString(w, `<InitiateMultipartUploadResult><Bucket>test-bucket</Bucket><Key>out</Key><UploadId>id</UploadId></InitiateMultipartUploadResult>`)
+		case r.Method == http.MethodPut:
+			time.Sleep(100 * time.Millisecond)
+			_, _ = io.WriteString(w, `<CopyPartResult><ETag>etag</ETag></CopyPartResult>`)
+		case r.Method == http.MethodGet:
+			_, _ = io.WriteString(w, "warm")
+		case r.Method == http.MethodDelete:
+			w.WriteHeader(http.StatusNoContent)
+		default:
+			_, _ = io.WriteString(w, `<CompleteMultipartUploadResult><ETag>final</ETag></CompleteMultipartUploadResult>`)
+		}
+	}))
+	defer server.Close()
+	key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
+
+	// Establish the pool sequentially to avoid the Windows TCP accept backlog.
+	warm := make([]*response, client.MaxConnsPerHost)
+	for i := range warm {
+		var err error
+		warm[i], err = doObject(context.Background(), key, http.MethodGet, "test-bucket", "warm", nil)
+		require.NoError(t, err)
+		t.Cleanup(func() { _ = warm[i].Body.Close() })
+	}
+	for _, res := range warm {
+		_, err := io.Copy(io.Discard, res.Body)
+		require.NoError(t, err)
+		require.NoError(t, res.Body.Close())
+	}
+	parts := make([]CopyPart, 128)
+	for i := range parts {
+		parts[i] = CopyPart{SourceKey: "source", ETag: "etag", Size: MinPartSize}
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	etag, err := NewBucket(key, "test-bucket").Compose(ctx, "out", parts)
+	assert.NoError(t, err)
+	assert.Equal(t, "final", etag)
+}
+
 func TestCompose(t *testing.T) {
+	t.Run("cancelled copies abort", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		var aborted atomic.Bool
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch {
+			case r.Method == http.MethodPost && r.URL.Query().Has("uploads"):
+				_, _ = io.WriteString(w, `<InitiateMultipartUploadResult><Bucket>test-bucket</Bucket><Key>out</Key><UploadId>id</UploadId></InitiateMultipartUploadResult>`)
+			case r.Method == http.MethodPut:
+				cancel()
+				<-r.Context().Done()
+			case r.Method == http.MethodDelete:
+				aborted.Store(true)
+				w.WriteHeader(http.StatusNoContent)
+			default:
+				assert.Fail(t, "cancelled upload must not complete")
+			}
+		}))
+		defer server.Close()
+		key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
+		parts := make([]CopyPart, 128)
+		for i := range parts {
+			parts[i] = CopyPart{SourceKey: "source", ETag: "etag", Size: MinPartSize}
+		}
+		_, err := NewBucket(key, "test-bucket").Compose(ctx, "out", parts)
+		assert.ErrorIs(t, err, context.Canceled)
+		assert.True(t, aborted.Load())
+	})
+
 	t.Run("escaped source key", func(t *testing.T) {
 		server := mock.New("test-bucket", "us-east-1")
 		defer server.Close()

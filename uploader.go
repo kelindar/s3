@@ -62,10 +62,6 @@ type uploader struct {
 	lock    sync.Mutex
 	parts   []tagpart
 	maxpart int64
-
-	// background uploads
-	bg       sync.WaitGroup
-	asyncerr error
 }
 
 type tagpart struct {
@@ -305,11 +301,6 @@ func (u *uploader) uploadWithContext(ctx context.Context, num int64, contents []
 // simultaneously. However, calls to CopyFrom must be
 // synchronized to occur strictly after a call to Start
 // and strictly before a call to Close.
-//
-// As an optimization, most of the work for CopyFrom is
-// performed asynchronously. Callers must call Close and
-// check its return value in order to correctly handle
-// errors from CopyFrom.
 func (u *uploader) CopyFrom(ctx context.Context, num int64, source *Reader, start int64, end int64) error {
 	if !u.started {
 		panic("s3.uploader.CopyFrom before Start()")
@@ -328,28 +319,6 @@ func (u *uploader) CopyFrom(ctx context.Context, num int64, source *Reader, star
 		return fmt.Errorf("CopyFrom size %d below min part size %d", size, MinPartSize)
 	}
 
-	// update the max part before launching anything
-	// so that Close can perform an upload at the same time
-	// as the copy-part operation is still happening
-	u.lock.Lock()
-	u.maxpart = max(u.maxpart, num)
-	u.lock.Unlock()
-
-	u.bg.Add(1)
-	go u.copy(ctx, num, source, start, end)
-	return nil
-}
-
-func (u *uploader) noteErr(err error) {
-	u.lock.Lock()
-	defer u.lock.Unlock()
-	if u.asyncerr == nil {
-		u.asyncerr = err
-	}
-}
-
-func (u *uploader) copy(ctx context.Context, num int64, source *Reader, start int64, end int64) {
-	defer u.bg.Done()
 	headers := [3][2]string{
 		{"x-amz-copy-source", "/" + source.Bucket + "/" + almostPathEscape(source.Path)},
 		{"x-amz-copy-source-if-match", source.ETag},
@@ -363,25 +332,24 @@ func (u *uploader) copy(ctx context.Context, num int64, source *Reader, start in
 	defer fasthttp.ReleaseRequest(req)
 	res, err := flakyFast(ctx, req)
 	if err != nil {
-		u.noteErr(err)
-		return
+		return err
 	}
 	defer res.Body.Close()
 	if res.StatusCode != 200 {
-		u.noteErr(fmt.Errorf("CopyFrom: %s %q", res.status(), extractMessage(res.Body)))
-		return
+		return fmt.Errorf("CopyFrom: %s %q", res.status(), extractMessage(res.Body))
 	}
 	rt, err := decodeMultipartResponse(res.Body)
 	if err != nil || rt.ETag == "" {
-		u.noteErr(fmt.Errorf("s3.Uploader.CopyFrom: response missing ETag?"))
-		return
+		return fmt.Errorf("s3.Uploader.CopyFrom: response missing ETag?")
 	}
 	u.lock.Lock()
+	u.maxpart = max(u.maxpart, num)
 	u.parts = append(u.parts, tagpart{
 		Num:  num,
 		ETag: rt.ETag,
 	})
 	u.lock.Unlock()
+	return nil
 }
 
 // Close uploads the final part of the multi-part upload
@@ -408,13 +376,6 @@ func (u *uploader) Close(ctx context.Context, final []byte) error {
 			return err
 		}
 	}
-	// wait for any/all CopyFrom operations to finish;
-	// after this we know u.parts will be fully up-to-date
-	u.bg.Wait()
-	if u.asyncerr != nil {
-		return u.asyncerr
-	}
-
 	// the S3 API barfs if parts are not in ascending order
 	sort.Slice(u.parts, func(i, j int) bool {
 		return u.parts[i].Num < u.parts[j].Num
@@ -482,7 +443,6 @@ func (u *uploader) Abort(ctx context.Context) error {
 	if !u.started || u.finished {
 		return nil
 	}
-	u.bg.Wait()
 	req := u.signedRequest(fasthttp.MethodDelete, "uploadId="+queryEscape(u.id), nil)
 	defer fasthttp.ReleaseRequest(req)
 	res, err := doFastRequest(ctx, req)

@@ -50,17 +50,18 @@ const (
 	shortFormat = "20060102"
 )
 
+// canonicalValue preserves embedded tabs, matching the SDK's space-only folding.
 func canonicalValue(dst *bytes.Buffer, value string) {
 	value = strings.TrimSpace(value)
 	for {
-		at := strings.IndexAny(value, " \t")
+		at := strings.IndexByte(value, ' ')
 		if at < 0 {
 			dst.WriteString(value)
 			return
 		}
 		dst.WriteString(value[:at])
 		dst.WriteByte(' ')
-		value = strings.TrimLeft(value[at:], " \t")
+		value = strings.TrimLeft(value[at:], " ")
 	}
 }
 

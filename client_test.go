@@ -112,7 +112,8 @@ func TestHTTPS(t *testing.T) {
 					if name == "host" {
 						value = req.Host
 					}
-					fmt.Fprintf(&canonical, "%s:%s\n", name, strings.Join(strings.Fields(value), " "))
+					value = strings.Join(strings.FieldsFunc(strings.TrimSpace(value), func(r rune) bool { return r == ' ' }), " ")
+					fmt.Fprintf(&canonical, "%s:%s\n", name, value)
 				}
 				fmt.Fprintf(&canonical, "\n%s\n%s", signed, payload)
 				scope := stamp[:8] + "/us-east-1/s3/aws4_request"
@@ -179,6 +180,65 @@ func TestHTTPS(t *testing.T) {
 }
 
 func TestClient(t *testing.T) {
+	t.Run("lost conditional response", func(t *testing.T) {
+		for name, condition := range map[string]Condition{"create": IfNoneMatch("*"), "replace": IfMatch("old")} {
+			t.Run(name, func(t *testing.T) {
+				var attempts atomic.Int32
+				var stored atomic.Value
+				stored.Store("")
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					body, err := io.ReadAll(r.Body)
+					if !assert.NoError(t, err) {
+						return
+					}
+					if attempts.Add(1) == 1 {
+						stored.Store(string(body))
+						conn, _, err := w.(http.Hijacker).Hijack()
+						if assert.NoError(t, err) {
+							_ = conn.Close()
+						}
+						return
+					}
+					w.WriteHeader(http.StatusPreconditionFailed)
+				}))
+				defer server.Close()
+				key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
+				_, applied, err := NewBucket(key, "bucket").WriteIf(context.Background(), "object", []byte("written"), condition)
+				assert.Equal(t, "written", stored.Load())
+				assert.Error(t, err, "the outcome is uncertain after a committed write loses its response")
+				assert.False(t, applied)
+				assert.EqualValues(t, 1, attempts.Load())
+			})
+		}
+	})
+
+	t.Run("write snapshot headers", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "match", r.Header.Get("If-Match"))
+			assert.Contains(t, r.Header.Get("Authorization"), "SignedHeaders=host;if-match;x-amz-content-sha256;x-amz-date")
+			w.WriteHeader(http.StatusPreconditionFailed)
+		}))
+		defer server.Close()
+		key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
+		reader := &Reader{Key: key, Bucket: "bucket", Path: "object", ETag: "match"}
+		n, err := reader.WriteTo(io.Discard)
+		assert.ErrorIs(t, err, ErrETagChanged)
+		assert.Zero(t, n)
+	})
+	t.Run("full copy rejects partial response", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Empty(t, r.Header.Get("Range"))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = io.WriteString(w, "partial")
+		}))
+		defer server.Close()
+		key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
+		reader := &Reader{Key: key, Bucket: "bucket", Path: "object"}
+		n, err := reader.WriteTo(io.Discard)
+		assert.Error(t, err)
+		assert.Zero(t, n)
+	})
+
 	t.Run("exact body reuse", func(t *testing.T) {
 		var connections atomic.Int32
 		server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
@@ -205,7 +265,7 @@ func TestClient(t *testing.T) {
 		}
 		assert.EqualValues(t, 1, connections.Load())
 	})
-	t.Run("conditional retry", func(t *testing.T) {
+	t.Run("conditional failure does not retry", func(t *testing.T) {
 		var attempts atomic.Int32
 		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			assert.Equal(t, "match", r.Header.Get("If-Match"))
@@ -214,12 +274,8 @@ func TestClient(t *testing.T) {
 			body, err := io.ReadAll(r.Body)
 			assert.NoError(t, err)
 			assert.Equal(t, "payload", string(body))
-			if attempts.Add(1) == 1 {
-				w.WriteHeader(http.StatusServiceUnavailable)
-				_, _ = io.WriteString(w, "retry")
-				return
-			}
-			w.Header().Set("ETag", "updated")
+			attempts.Add(1)
+			w.WriteHeader(http.StatusServiceUnavailable)
 		}))
 		defer server.Close()
 		key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
@@ -228,10 +284,10 @@ func TestClient(t *testing.T) {
 			header.Set("If-Unmodified-Since", "Tue, 15 Nov 1994 08:12:31 GMT")
 			return nil
 		})
-		require.NoError(t, err)
-		assert.True(t, applied)
-		assert.Equal(t, "updated", etag)
-		assert.EqualValues(t, 2, attempts.Load())
+		assert.Error(t, err)
+		assert.False(t, applied)
+		assert.Empty(t, etag)
+		assert.EqualValues(t, 1, attempts.Load())
 	})
 
 	t.Run("range headers", func(t *testing.T) {
@@ -272,8 +328,6 @@ func TestClient(t *testing.T) {
 		key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
 		u := &uploader{Key: key, Bucket: "bucket", Object: "object", id: "id+/=", started: true}
 		require.NoError(t, u.CopyFrom(context.Background(), 1, &Reader{Bucket: "bucket", Path: "a b%", ETag: "match", Size: MinPartSize + 1}, 1, MinPartSize+1))
-		u.bg.Wait()
-		require.NoError(t, u.asyncerr)
 		require.Len(t, u.parts, 1)
 		assert.Equal(t, "copied", u.parts[0].ETag)
 		assert.EqualValues(t, 2, attempts.Load())

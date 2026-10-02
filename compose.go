@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io/fs"
 	"path"
+
+	"golang.org/x/sync/errgroup"
 )
 
 // CopyPart describes an immutable byte range to copy into a composed object.
@@ -46,12 +48,23 @@ func (b *Bucket) Compose(ctx context.Context, key string, parts []CopyPart) (str
 		}
 	}()
 
+	g, copyCtx := errgroup.WithContext(ctx)
+	g.SetLimit(40)
 	for i, part := range parts {
+		if copyCtx.Err() != nil {
+			break
+		}
 		part.SourceKey = path.Clean(part.SourceKey)
 		source := &Reader{Key: b.key, Bucket: b.bkt, Path: part.SourceKey, ETag: part.ETag, Size: part.Offset + part.Size}
-		if err := u.CopyFrom(ctx, int64(i+1), source, part.Offset, part.Offset+part.Size); err != nil {
-			return "", fmt.Errorf("s3 Compose: part %d: %w", i+1, err)
-		}
+		g.Go(func() error {
+			if err := u.CopyFrom(copyCtx, int64(i+1), source, part.Offset, part.Offset+part.Size); err != nil {
+				return fmt.Errorf("s3 Compose: part %d: %w", i+1, err)
+			}
+			return nil
+		})
+	}
+	if err := g.Wait(); err != nil {
+		return "", err
 	}
 	if err := u.Close(ctx, nil); err != nil {
 		return "", fmt.Errorf("s3 Compose: %w", err)

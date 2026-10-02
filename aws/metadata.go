@@ -86,15 +86,14 @@ func MetadataString(path string) (string, error) {
 	return string(buf), err
 }
 
-// when we are running on EC2,
-// we can guess the region thusly:
+// ec2Region reads the region from EC2 metadata.
 func ec2Region() (string, error) {
-	str, err := MetadataString("placement/availability-zone")
+	str, err := MetadataString("placement/region")
 	switch {
 	case err != nil:
 		return "", err
-	case len(str) == 0 || str[len(str)-1] < 'a' || str[len(str)-1] > 'z':
-		return "", fmt.Errorf("unexpected AZ string %q", str)
+	case len(str) == 0:
+		return "", fmt.Errorf("unexpected region string %q", str)
 	}
-	return str[:len(str)-1], nil
+	return str, nil
 }

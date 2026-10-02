@@ -83,22 +83,46 @@ func TestMetadata(t *testing.T) {
 	})
 
 	t.Run("ec2 region", func(t *testing.T) {
-		handler := func(w http.ResponseWriter, r *http.Request) {
-			switch r.URL.Path {
-			case "/latest/api/token":
-				w.Write([]byte("tok"))
-			case "/latest/meta-data/placement/availability-zone":
-				w.Write([]byte("us-east-2a"))
-			default:
-				http.NotFound(w, r)
-			}
+		cases := []struct {
+			name, region, zone string
+			status             int
+			wantErr            bool
+		}{
+			{"standard", "us-east-2", "us-east-2a", http.StatusOK, false},
+			{"local zone", "us-west-2", "us-west-2-lax-1a", http.StatusOK, false},
+			{"read error", "", "us-west-2-lax-1a", http.StatusServiceUnavailable, true},
+			{"empty region", "", "us-west-2-lax-1a", http.StatusOK, true},
 		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				handler := func(w http.ResponseWriter, r *http.Request) {
+					switch r.URL.Path {
+					case "/latest/api/token":
+						w.Write([]byte("tok"))
+					case "/latest/meta-data/placement/region":
+						if tc.status != http.StatusOK {
+							http.Error(w, "unavailable", tc.status)
+							return
+						}
+						w.Write([]byte(tc.region))
+					case "/latest/meta-data/placement/availability-zone":
+						w.Write([]byte(tc.zone))
+					default:
+						http.NotFound(w, r)
+					}
+				}
 
-		withMetadataServer(t, handler, func() {
-			region, err := ec2Region()
-			assert.NoError(t, err)
-			assert.Equal(t, "us-east-2", region)
-		})
+				withMetadataServer(t, handler, func() {
+					region, err := ec2Region()
+					if tc.wantErr {
+						assert.Error(t, err)
+						return
+					}
+					assert.NoError(t, err)
+					assert.Equal(t, tc.region, region)
+				})
+			})
+		}
 	})
 
 	t.Run("s3 endpoint", func(t *testing.T) {

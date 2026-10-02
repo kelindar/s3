@@ -329,15 +329,12 @@ func (r *Reader) openContext(ctx context.Context, k *aws.SigningKey, bucket, obj
 
 // WriteTo implements io.WriterTo
 func (r *Reader) WriteTo(w io.Writer) (int64, error) {
-	res, err := doObject(r.requestContext(), r.Key, http.MethodGet, r.Bucket, r.Path, nil)
+	body, err := r.getContext(r.requestContext(), "")
 	if err != nil {
 		return 0, err
 	}
-	defer res.Body.Close()
-	if res.StatusCode != 200 {
-		return 0, fmt.Errorf("s3.Reader.WriteTo: status %s %q", res.status(), extractMessage(res.Body))
-	}
-	return io.Copy(w, res.Body)
+	defer body.Close()
+	return io.Copy(w, body)
 }
 
 // RangeReader produces an io.ReadCloser that reads
@@ -360,11 +357,17 @@ func (r *Reader) rangeReaderContext(ctx context.Context, off, width int64) (io.R
 	case width == 0:
 		return http.NoBody, nil
 	}
+	return r.getContext(ctx, fmt.Sprintf("bytes=%d-%d", off, off+width-1))
+}
+
+func (r *Reader) getContext(ctx context.Context, byteRange string) (io.ReadCloser, error) {
 	req := fasthttp.AcquireRequest()
 	defer fasthttp.ReleaseRequest(req)
 	setURI(req, r.Key, r.Bucket, r.Path, "")
 	req.Header.SetMethod(fasthttp.MethodGet)
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", off, off+width-1))
+	if byteRange != "" {
+		req.Header.Set("Range", byteRange)
+	}
 	var headers [1][2]string
 	count := 0
 	if r.ETag != "" {
@@ -378,17 +381,22 @@ func (r *Reader) rangeReaderContext(ctx context.Context, off, width int64) (io.R
 		return nil, err
 	}
 	switch res.StatusCode {
-	default:
-		defer res.Body.Close()
-		return nil, fmt.Errorf("s3.Reader.RangeReader: status %s %q", res.status(), extractMessage(res.Body))
 	case http.StatusPreconditionFailed:
 		res.Body.Close()
 		return nil, ErrETagChanged
 	case http.StatusNotFound:
 		res.Body.Close()
 		return nil, &fs.PathError{Op: "read", Path: r.Path, Err: fs.ErrNotExist}
-	case http.StatusPartialContent, http.StatusOK:
-		// okay; fallthrough
+	case http.StatusOK:
+		// Full responses are also accepted when a server ignores Range.
+	case http.StatusPartialContent:
+		if byteRange != "" {
+			break
+		}
+		fallthrough
+	default:
+		defer res.Body.Close()
+		return nil, fmt.Errorf("s3.Reader: GET status %s %q", res.status(), extractMessage(res.Body))
 	}
 	return res.Body, nil
 }
@@ -422,7 +430,7 @@ func BucketRegion(k *aws.SigningKey, bucket string) (string, error) {
 	switch {
 	case !ValidBucket(bucket):
 		return "", badBucket(bucket)
-	case k.BaseURI != "":
+	case k.BaseURI != "" && k.BaseURI != fmt.Sprintf("https://s3.%s.amazonaws.com", k.Region):
 		return k.Region, nil
 	}
 	res, err := doObject(context.Background(), k, http.MethodHead, bucket, "", nil)
@@ -431,9 +439,7 @@ func BucketRegion(k *aws.SigningKey, bucket string) (string, error) {
 	}
 	defer res.Body.Close()
 	switch res.StatusCode {
-	case 403:
-		return k.Region, nil
-	case 200, 301:
+	case 200, 301, 403:
 		// ok
 	default:
 		return "", fmt.Errorf("s3.BucketRegion: %s %q", res.status(), extractMessage(res.Body))
@@ -462,6 +468,9 @@ func DeriveForBucket(bucket string) aws.DeriveFn {
 			return nil, err
 		case bregion == region:
 			return k, nil
+		}
+		if baseURI == fmt.Sprintf("https://s3.%s.amazonaws.com", region) {
+			baseURI = fmt.Sprintf("https://s3.%s.amazonaws.com", bregion)
 		}
 		k = aws.DeriveKey(baseURI, id, secret, bregion, service)
 		k.Token = token

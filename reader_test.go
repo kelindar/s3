@@ -17,8 +17,11 @@ package s3
 
 import (
 	"bytes"
+	"crypto/tls"
+	"crypto/x509"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -33,6 +36,69 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/valyala/fasthttp"
 )
+
+func TestReaderSnapshot(t *testing.T) {
+	for _, original := range []string{"old", ""} {
+		t.Run(fmt.Sprintf("original=%q", original), func(t *testing.T) {
+			server := mock.New("test-bucket", "us-east-1")
+			defer server.Close()
+			server.PutObject("object", []byte(original))
+			key := aws.DeriveKey(server.URL(), "access", "secret", "us-east-1", "s3")
+			reader, err := Stat(key, "test-bucket", "object")
+			require.NoError(t, err)
+			server.PutObject("object", []byte("new"))
+			var out bytes.Buffer
+			n, err := reader.WriteTo(&out)
+			assert.ErrorIs(t, err, ErrETagChanged)
+			assert.Zero(t, n)
+			assert.Empty(t, out.String())
+		})
+	}
+}
+
+func TestRegionDiscovery(t *testing.T) {
+	for _, status := range []int{http.StatusOK, http.StatusMovedPermanently, http.StatusForbidden} {
+		t.Run(http.StatusText(status), func(t *testing.T) {
+			var requests atomic.Int32
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				requests.Add(1)
+				assert.Equal(t, http.MethodHead, r.Method)
+				assert.Equal(t, "session", r.Header.Get("X-Amz-Security-Token"))
+				w.Header().Set("X-Amz-Bucket-Region", "us-west-2")
+				w.WriteHeader(status)
+			}))
+			defer server.Close()
+			previous := defaultClient
+			client := newClient(func(string) (net.Conn, error) { return net.Dial("tcp", server.Listener.Addr().String()) })
+			roots := x509.NewCertPool()
+			roots.AddCert(server.Certificate())
+			client.TLSConfig = &tls.Config{RootCAs: roots, ServerName: "example.com"}
+			defaultClient = client
+			defer func() { client.CloseIdleConnections(); defaultClient = previous }()
+
+			t.Setenv("AWS_ACCESS_KEY_ID", "access")
+			t.Setenv("AWS_SECRET_ACCESS_KEY", "secret")
+			t.Setenv("AWS_REGION", "us-east-1")
+			t.Setenv("AWS_SESSION_TOKEN", "session")
+			t.Setenv("AWS_ROLE_ARN", "")
+			t.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", "")
+			t.Setenv("S3_ENDPOINT", "")
+			key, err := aws.AmbientKey("s3", "", DeriveForBucket("test-bucket"))
+			require.NoError(t, err)
+			assert.Equal(t, "us-west-2", key.Region)
+			assert.Equal(t, "https://s3.us-west-2.amazonaws.com", key.BaseURI)
+			assert.Equal(t, "session", key.Token)
+			assert.EqualValues(t, 1, requests.Load())
+
+			key = aws.DeriveKey("", "access", "secret", "us-east-1", "s3")
+			key.Token = "session"
+			region, err := BucketRegion(key, "test-bucket")
+			require.NoError(t, err)
+			assert.Equal(t, "us-west-2", region)
+			assert.EqualValues(t, 2, requests.Load())
+		})
+	}
+}
 
 func TestValidBucket(t *testing.T) {
 	tests := map[string]bool{
@@ -287,12 +353,6 @@ func TestBucketRegion(t *testing.T) {
 		region, err := BucketRegion(key, bucket)
 		assert.NoError(t, err)
 		assert.Equal(t, "us-east-1", region)
-	})
-
-	t.Run("default aws", func(t *testing.T) {
-		// Outcome depends on network access to AWS, so only the code path is exercised.
-		defaultKey := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
-		_, _ = BucketRegion(defaultKey, bucket)
 	})
 
 	t.Run("invalid bucket", func(t *testing.T) {

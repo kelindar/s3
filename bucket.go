@@ -124,7 +124,9 @@ func IfNoneMatch(etag string) Condition {
 }
 
 // WriteIf performs a PutObject only when condition's HTTP preconditions hold.
-// It reports applied=false when S3 rejects the precondition.
+// It returns applied=false and nil error when S3 rejects the precondition.
+// Conditional requests are not retried; after a transport error the write may
+// have committed, so callers must resolve its outcome before retrying.
 func (b *Bucket) WriteIf(ctx context.Context, key string, contents []byte, condition Condition) (etag string, applied bool, err error) {
 	if condition == nil {
 		return "", false, errors.New("s3 PUT: missing condition")
@@ -173,7 +175,10 @@ func (b *Bucket) write(ctx context.Context, key string, contents []byte, conditi
 			headers = append(headers, [2]string{strings.ToLower(name), values[0]})
 		}
 		signRequest(b.key, req, contents, headers...)
-		res, err = flakyFast(ctx, req)
+
+		// A lost response may follow a committed write. Retrying can turn that
+		// uncertainty into a false precondition failure.
+		res, err = doFastRequest(ctx, req)
 	}
 	if err != nil {
 		return "", false, err

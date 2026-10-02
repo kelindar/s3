@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/url"
 	"path"
 	"slices"
 	"strconv"
@@ -796,7 +797,7 @@ func (p *Prefix) listContext(ctx context.Context, n int, token, seek, prefix str
 		query = appendQueryEscape(query, token)
 		query = append(query, '&')
 	}
-	query = append(query, "delimiter=%2F&list-type=2"...)
+	query = append(query, "delimiter=%2F&encoding-type=url&list-type=2"...)
 	if n > 0 {
 		query = append(query, "&max-keys="...)
 		query = strconv.AppendInt(query, int64(n), 10)
@@ -846,6 +847,20 @@ func (p *Prefix) listContext(ctx context.Context, n int, token, seek, prefix str
 	ret, err := decodeListResponse(body.Bytes())
 	if err != nil {
 		return nil, fmt.Errorf("xml decoding response: %w", err)
+	}
+	if ret.EncodingType == "url" {
+		for i := range ret.Contents {
+			ret.Contents[i].Reader.Path, err = url.PathUnescape(ret.Contents[i].Reader.Path)
+			if err != nil {
+				return nil, fmt.Errorf("decoding object key: %w", err)
+			}
+		}
+		for i := range ret.CommonPrefixes {
+			ret.CommonPrefixes[i].Path, err = url.PathUnescape(ret.CommonPrefixes[i].Path)
+			if err != nil {
+				return nil, fmt.Errorf("decoding prefix: %w", err)
+			}
+		}
 	}
 	return &ret, nil
 }

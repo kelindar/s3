@@ -29,6 +29,7 @@ import (
 	"slices"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestVisitDir(t *testing.T) {
@@ -87,6 +88,89 @@ func TestVisitDir(t *testing.T) {
 			assert.Equal(t, want, got, "walk(%q, %q) mismatch", seek, pattern)
 		})
 	}
+}
+
+func TestVisitDirSkip(t *testing.T) {
+	tmp := t.TempDir()
+	for _, name := range []string{"a", "b"} {
+		require.NoError(t, os.WriteFile(filepath.Join(tmp, name), nil, 0640))
+	}
+	base := fs.FS(os.DirFS(tmp))
+	modes := []struct {
+		name string
+		f    fs.FS
+	}{
+		{"fallback", base},
+		{"optimized", directVisitFS{base}},
+	}
+	stop := errors.New("stop")
+	cases := []struct {
+		name string
+		ret  error
+		want error
+	}{
+		{"skip dir", fs.SkipDir, nil},
+		{"skip all", fs.SkipAll, nil},
+		{"callback error", stop, stop},
+	}
+	for _, mode := range modes {
+		for _, tc := range cases {
+			t.Run(mode.name+"/"+tc.name, func(t *testing.T) {
+				calls := 0
+				err := VisitDir(mode.f, ".", "", "", func(DirEntry) error {
+					calls++
+					return tc.ret
+				})
+				assert.Equal(t, 1, calls)
+				if tc.want == nil {
+					assert.NoError(t, err)
+				} else {
+					assert.ErrorIs(t, err, tc.want)
+				}
+			})
+		}
+	}
+}
+
+func TestWalkDirSkip(t *testing.T) {
+	tmp := t.TempDir()
+	for _, name := range []string{"a", "b"} {
+		require.NoError(t, os.WriteFile(filepath.Join(tmp, name), nil, 0640))
+	}
+	var got []string
+	err := WalkDir(directVisitFS{os.DirFS(tmp)}, ".", "", "", func(name string, _ DirEntry, err error) error {
+		got = append(got, name)
+		if name == "a" && err == nil {
+			return fs.SkipDir
+		}
+		if name == "." {
+			assert.Equal(t, fs.SkipDir, err)
+			return fs.SkipDir
+		}
+		return nil
+	})
+	assert.NoError(t, err)
+	assert.Equal(t, []string{"a", "."}, got)
+}
+
+type directVisitFS struct {
+	fs.FS
+}
+
+func (f directVisitFS) VisitDir(name, seek, pattern string, fn VisitDirFn) error {
+	list, err := fs.ReadDir(f.FS, name)
+	if err != nil {
+		return err
+	}
+	for _, entry := range list {
+		if entry.Name() <= seek || !match(pattern, entry.Name()) {
+			continue
+		}
+		if err := fn(entry); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // trivialWalkDir trivially implements the

@@ -20,6 +20,9 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -30,6 +33,47 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestListEncoding(t *testing.T) {
+	t.Run("escaped paths and opaque token", func(t *testing.T) {
+		object := "control\x01 +%☃.txt"
+		directory := "dir\x02 +%☃/"
+		token := "opaque%2B+token"
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "url", r.URL.Query().Get("encoding-type"))
+			key, prefix, encoding := object, directory, ""
+			if r.URL.Query().Get("encoding-type") == "url" {
+				key, prefix, encoding = url.PathEscape(object), url.PathEscape(directory), "url"
+			}
+			_, _ = fmt.Fprintf(w, `<ListBucketResult><EncodingType>%s</EncodingType><Contents><Key>%s</Key><ETag>etag%%2B</ETag><Size>0</Size></Contents><CommonPrefixes><Prefix>%s</Prefix></CommonPrefixes><NextContinuationToken>%s</NextContinuationToken></ListBucketResult>`, encoding, key, prefix, token)
+		}))
+		defer server.Close()
+		key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
+		prefix := &Prefix{Key: key, Bucket: "test-bucket", Path: "."}
+		result, err := prefix.list(0, "", "", "")
+		require.NoError(t, err)
+		require.Len(t, result.Contents, 1)
+		require.Len(t, result.CommonPrefixes, 1)
+		assert.Equal(t, object, result.Contents[0].Path())
+		assert.Equal(t, directory, result.CommonPrefixes[0].Path)
+		assert.Equal(t, "etag%2B", result.Contents[0].ETag)
+		assert.Equal(t, token, result.NextToken)
+	})
+
+	t.Run("invalid percent encoding", func(t *testing.T) {
+		for _, content := range []string{`<Contents><Key>bad%xy</Key></Contents>`, `<CommonPrefixes><Prefix>bad%xy/</Prefix></CommonPrefixes>`} {
+			t.Run(content, func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					_, _ = fmt.Fprintf(w, `<ListBucketResult><EncodingType>url</EncodingType>%s</ListBucketResult>`, content)
+				}))
+				defer server.Close()
+				key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
+				_, err := (&Prefix{Key: key, Bucket: "test-bucket", Path: "."}).list(0, "", "", "")
+				assert.Error(t, err)
+			})
+		}
+	})
+}
 
 func TestPrefix(t *testing.T) {
 	t.Run("basic properties", func(t *testing.T) {
@@ -481,7 +525,7 @@ func TestListQuery(t *testing.T) {
 	require.NoError(t, err)
 	requests := server.GetRequestLog()
 	require.Len(t, requests, 1)
-	assert.Equal(t, "continuation-token=next%2B%20page&delimiter=%2F&list-type=2&max-keys=7&prefix=dir%2Ffile&start-after=dir%2Ffile%202", requests[0].Query)
+	assert.Equal(t, "continuation-token=next%2B%20page&delimiter=%2F&encoding-type=url&list-type=2&max-keys=7&prefix=dir%2Ffile&start-after=dir%2Ffile%202", requests[0].Query)
 }
 
 func BenchmarkListXMLDecode(b *testing.B) {

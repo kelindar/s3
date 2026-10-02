@@ -115,7 +115,8 @@ func TestSign(t *testing.T) {
 			canonical.WriteString("PUT\n" + cmp.Or(u.EscapedPath(), "/") + "\n" + u.RawQuery + "\n")
 			var names []string
 			for _, header := range headers {
-				canonical.WriteString(header[0] + ":" + strings.Join(strings.Fields(header[1]), " ") + "\n")
+				value := strings.Join(strings.FieldsFunc(strings.TrimSpace(header[1]), func(r rune) bool { return r == ' ' }), " ")
+				canonical.WriteString(header[0] + ":" + value + "\n")
 				names = append(names, header[0])
 			}
 			signed := strings.Join(names, ";")
@@ -147,6 +148,20 @@ func TestSign(t *testing.T) {
 				}
 				assert.Equal(t, retained, test.headers, "signing must not modify caller-owned header pairs")
 			}
+		})
+	}
+}
+
+func TestCanonicalValue(t *testing.T) {
+	for value, want := range map[string]string{
+		"  a  b  ":      "a b",
+		"0\t0":          "0\t0",
+		"\t a  \t b \t": "a \t b",
+	} {
+		t.Run(value, func(t *testing.T) {
+			var out bytes.Buffer
+			canonicalValue(&out, value)
+			assert.Equal(t, want, out.String())
 		})
 	}
 }
