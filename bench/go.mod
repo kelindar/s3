@@ -7,7 +7,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/credentials v1.20.6
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.114.0
 	github.com/aws/smithy-go v1.28.1
-	github.com/kelindar/bench v0.4.1
+	github.com/kelindar/bench v0.4.2
 	github.com/kelindar/s3 v0.0.0
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/sync v0.15.0
