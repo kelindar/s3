@@ -3,7 +3,6 @@
 <br>
 <img src="https://img.shields.io/github/go-mod/go-version/kelindar/s3" alt="Go Version">
 <a href="https://pkg.go.dev/github.com/kelindar/s3"><img src="https://pkg.go.dev/badge/github.com/kelindar/s3" alt="PkgGoDev"></a>
-<a href="https://goreportcard.com/report/github.com/kelindar/s3"><img src="https://goreportcard.com/badge/github.com/kelindar/s3" alt="Go Report Card"></a>
 <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-blue.svg" alt="License"></a>
 <a href="https://coveralls.io/github/kelindar/s3"><img src="https://coveralls.io/repos/github/kelindar/s3/badge.svg" alt="Coverage"></a>
 </p>
@@ -45,7 +44,6 @@ import (
     "context"
     "fmt"
     "io"
-    "io/fs"
     
     "github.com/kelindar/s3"
     "github.com/kelindar/s3/aws"
@@ -53,7 +51,7 @@ import (
 
 func main() {
     // Create signing key from ambient credentials
-    key, err := aws.AmbientKey("s3", s3.DeriveForBucket("my-bucket"))
+    key, err := aws.AmbientKey("s3", "", s3.DeriveForBucket("my-bucket"))
     if err != nil {
         panic(err)
     }
@@ -85,14 +83,15 @@ func main() {
 
 ### Ambient Credentials (Recommended)
 
-This is the recommended way to use the library, as it automatically discovers credentials from the environment, IAM roles, and other sources. It supports the following sources:
+`AmbientKey` discovers credentials from the following sources:
 - Environment variables (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`)
-- IAM roles (EC2, ECS, Lambda)
 - AWS credentials file (`~/.aws/credentials`)
 - Web identity tokens
 
+EC2 instance role credentials can be loaded explicitly with `aws.EC2Role`. `AmbientKey` does not query EC2 or ECS metadata.
+
 ```go
-key, err := aws.AmbientKey("s3", s3.DeriveForBucket("my-bucket"))
+key, err := aws.AmbientKey("s3", "", s3.DeriveForBucket("my-bucket"))
 ```
 
 ### Manual Credentials
@@ -115,7 +114,6 @@ You can customize the behavior of the bucket by setting options:
 
 ```go
 bucket := s3.NewBucket(key, "my-bucket")
-bucket.Client = httpClient   // Optional: Custom HTTP client
 bucket.Lazy = true           // Optional: Use HEAD instead of GET for Open()
 ```
 
@@ -200,7 +198,7 @@ data, err := io.ReadAll(reader)
 
 ### Multi-part Upload
 
-For large files, you can use the `WriteFrom` method which automatically handles multipart uploads. This method is more convenient than manually managing upload parts:
+`WriteFrom` accepts an `io.ReaderAt` and the object size. It uses a single PUT below `s3.MinPartSize` and multipart upload at or above that size:
 
 ```go
 // Open a large file
@@ -216,7 +214,7 @@ if err != nil {
     panic(err)
 }
 
-// Upload using multipart upload (automatically used for files > 5MB)
+// Upload with WriteFrom; this file uses multipart upload.
 err = bucket.WriteFrom(context.Background(), "large-file.dat", file, stat.Size())
 if err != nil {
     panic(err)
@@ -229,6 +227,29 @@ The `WriteFrom` method automatically:
 - Handles multipart upload initialization and completion
 - Respects context cancellation for upload control
 
+### Compose Objects
+
+`Compose` joins byte ranges from existing objects with server-side copy. Each `s3.CopyPart` names the source key, its ETag, the offset, and the size. Every part must be at least `s3.MinPartSize`; `Compose` returns the new object's ETag.
+
+```go
+ctx := context.Background()
+part := make([]byte, s3.MinPartSize)
+sourceETag, err := bucket.Write(ctx, "part-1", part)
+if err != nil {
+    panic(err)
+}
+
+etag, err := bucket.Compose(ctx, "combined", []s3.CopyPart{{
+    SourceKey: "part-1",
+    ETag:      sourceETag,
+    Offset:    0,
+    Size:      int64(len(part)),
+}})
+if err != nil {
+    panic(err)
+}
+fmt.Printf("Composed with ETag: %s\n", etag)
+```
 
 ### Working with Subdirectories
 

@@ -17,12 +17,187 @@ package s3
 import (
 	"bytes"
 	"context"
+	"encoding/xml"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/kelindar/s3/aws"
 	"github.com/kelindar/s3/mock"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/valyala/fasthttp"
 )
+
+func TestUploadBuffers(t *testing.T) {
+	server := mock.New("test-bucket", "us-east-1")
+	defer server.Close()
+	server.SetRequestLogging(false)
+	key := aws.DeriveKey(server.URL(), "access", "secret", "us-east-1", "s3")
+	bucket := NewBucket(key, "test-bucket")
+
+	for _, value := range []byte{1, 2} {
+		contents := bytes.Repeat([]byte{value}, 2*MinPartSize+17)
+		require.NoError(t, bucket.WriteFrom(context.Background(), "object", bytes.NewReader(contents), int64(len(contents))))
+		stored, found := server.ObjectContent("object")
+		require.True(t, found)
+		assert.Equal(t, contents, stored)
+	}
+
+	// A short read must not upload bytes left in a buffer by a previous request.
+	err := bucket.WriteFrom(context.Background(), "short", bytes.NewReader([]byte("short")), MinPartSize)
+	assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
+	assert.False(t, server.ObjectExists("short"))
+}
+
+func TestSignedRequest(t *testing.T) {
+	for _, test := range []struct {
+		name, baseURI, bucket, scheme, host string
+	}{
+		{"aws", "", "bucket", "https", "s3.us-east-1.amazonaws.com"},
+		{"dotted bucket", "", "bucket.name", "https", "s3.us-east-1.amazonaws.com"},
+		{"custom", "http://127.0.0.1:9000", "bucket", "http", "127.0.0.1:9000"},
+		{"endpoint path", "http://127.0.0.1:9000/s3", "bucket", "http", "127.0.0.1:9000"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			key := aws.DeriveKey(test.baseURI, "access", "secret", "us-east-1", "s3")
+			key.Token = "session-token"
+			u := &uploader{Key: key, Bucket: test.bucket, Object: "folder/a b+%&☃"}
+			query := "partNumber=1&uploadId=id"
+			host := test.host
+			path := "/" + test.bucket + "/folder/a%20b%2B%25%26%E2%98%83"
+			if test.name == "endpoint path" {
+				path = "/s3" + path
+			}
+			if test.baseURI == "" && !strings.Contains(test.bucket, ".") {
+				host = test.bucket + "." + host
+				path = "/folder/a%20b%2B%25%26%E2%98%83"
+			}
+			got := u.signedRequest(fasthttp.MethodPut, query, []byte("contents"))
+			defer fasthttp.ReleaseRequest(got)
+			assert.Equal(t, test.scheme+"://"+host+path+"?"+query, string(got.URI().FullURI()))
+			assert.Equal(t, host, string(got.Header.Host()))
+			assert.Equal(t, query, string(got.URI().QueryString()))
+			assert.Equal(t, "session-token", string(got.Header.Peek("X-Amz-Security-Token")))
+		})
+	}
+}
+
+func TestMultipartQueries(t *testing.T) {
+	for _, operation := range []string{"part", "complete", "abort"} {
+		t.Run(operation, func(t *testing.T) {
+			const uploadID = "id+/="
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				assert.Equal(t, uploadID, r.URL.Query().Get("uploadId"))
+				assert.NotContains(t, r.URL.RawQuery, "+")
+				_, _ = io.Copy(io.Discard, r.Body)
+				switch r.Method {
+				case http.MethodPut:
+					w.Header().Set("ETag", `"part"`)
+				case http.MethodPost:
+					_, _ = io.WriteString(w, `<CompleteMultipartUploadResult><ETag>complete</ETag></CompleteMultipartUploadResult>`)
+				case http.MethodDelete:
+					w.WriteHeader(http.StatusNoContent)
+				}
+			}))
+			defer server.Close()
+			key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
+			u := &uploader{Key: key, Bucket: "bucket", Object: "object", id: uploadID, started: true}
+			var err error
+			switch operation {
+			case "part":
+				err = u.upload(context.Background(), 1, []byte("contents"))
+			case "complete":
+				err = u.Close(context.Background(), nil)
+			case "abort":
+				err = u.Abort(context.Background())
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestCompleteXML(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		parts []tagpart
+	}{
+		{name: "empty"},
+		{name: "one", parts: []tagpart{{Num: 1, ETag: `"abc"`}}},
+		{name: "escaped", parts: []tagpart{{Num: 1, ETag: `"a&b"`}, {Num: 10000, ETag: "'x<y>\t\r\n"}}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			want, err := xml.Marshal(&struct {
+				XMLName xml.Name  `xml:"CompleteMultipartUpload"`
+				NS      string    `xml:"xmlns,attr"`
+				Parts   []tagpart `xml:"Part"`
+			}{NS: "http://s3.amazonaws.com/doc/2006-03-01/", Parts: test.parts})
+			require.NoError(t, err)
+			got, err := encodeCompleteMultipart(test.parts)
+			require.NoError(t, err)
+			assert.Equal(t, string(want), string(got))
+		})
+	}
+}
+
+func TestMultipartResponseDecode(t *testing.T) {
+	for _, input := range []string{
+		`<InitiateMultipartUploadResult><Bucket>test</Bucket><Key>a&amp;b</Key><UploadId>id-1</UploadId></InitiateMultipartUploadResult>`,
+		`<?xml version="1.0"?><CopyPartResult><ETag>&quot;abc&quot;</ETag></CopyPartResult>`,
+		`<CompleteMultipartUploadResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Location>here</Location><Bucket>test</Bucket><Key>key</Key><ETag>etag</ETag></CompleteMultipartUploadResult>`,
+		`<Error><Code>InvalidPart</Code><Message>bad &lt;part&gt;</Message></Error>`,
+		`<Error><Ignored><Code>wrong</Code></Ignored><Code>right</Code></Error>`,
+		`<Error><Message><![CDATA[unsupported fast path]]></Message></Error>`,
+		`<Error><Message>a]]>b</Message></Error>`,
+		`<Error><Message>a]]&gt;b</Message></Error>`,
+		`<Error><Message>broken`,
+	} {
+		t.Run(input, func(t *testing.T) {
+			var want multipartResponse
+			wantErr := xml.NewDecoder(bytes.NewBufferString(input)).Decode(&want)
+			got, err := decodeMultipartResponse(bytes.NewBufferString(input))
+			require.Equal(t, wantErr == nil, err == nil)
+			if err == nil {
+				want.XMLName.Space = "" // Callers only use the local root name.
+				assert.Equal(t, want, got)
+			}
+		})
+	}
+
+	input := []byte(`<CopyPartResult><ETag>retained</ETag></CopyPartResult>`)
+	got, err := decodeMultipartResponse(bytes.NewReader(input))
+	require.NoError(t, err)
+	clear(input)
+	assert.Equal(t, "retained", got.ETag)
+}
+
+func FuzzMultipartResponseDecode(f *testing.F) {
+	f.Add([]byte(`<Error><Message>a]]>b</Message></Error>`))
+	for _, input := range []string{
+		`<InitiateMultipartUploadResult><Bucket>b</Bucket><Key>k&amp;v</Key><UploadId>id</UploadId></InitiateMultipartUploadResult>`,
+		`<CopyPartResult><ETag>&quot;abc&quot;</ETag></CopyPartResult>`,
+		`<CompleteMultipartUploadResult><ETag>abc</ETag></CompleteMultipartUploadResult>`,
+		`<Error><Code>InvalidPart</Code><Message>bad</Message></Error>`,
+	} {
+		f.Add([]byte(input))
+	}
+	f.Fuzz(func(t *testing.T, data []byte) {
+		var want multipartResponse
+		wantErr := xml.NewDecoder(bytes.NewReader(data)).Decode(&want)
+		got, gotErr := decodeMultipartResponse(bytes.NewReader(data))
+		switch {
+		case (wantErr == nil) != (gotErr == nil):
+			t.Fatalf("decode disagreement for %q: stdlib=%v fast=%v", data, wantErr, gotErr)
+		case gotErr == nil:
+			want.XMLName.Space = ""
+			assert.Equal(t, want, got)
+		}
+	})
+}
 
 // Test the public API through Bucket.WriteFrom
 func TestWriteFrom(t *testing.T) {
@@ -30,6 +205,7 @@ func TestWriteFrom(t *testing.T) {
 		bucket := "test-bucket"
 		mockServer := mock.New(bucket, "us-east-1")
 		defer mockServer.Close()
+		mockServer.SetRequestLogging(false)
 
 		key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
 		key.BaseURI = mockServer.URL()
@@ -123,6 +299,79 @@ func TestPartSize(t *testing.T) {
 	partSize = calculatePartSize(largeSize)
 	assert.Greater(t, partSize, int64(MinPartSize))
 	assert.LessOrEqual(t, largeSize/partSize, int64(MaxParts))
+	for _, size := range []int64{int64(MinPartSize) * MaxParts, int64(MinPartSize)*MaxParts + 1, 1<<63 - 1} {
+		partSize := calculatePartSize(size)
+		assert.LessOrEqual(t, (size-1)/partSize+1, int64(MaxParts), "size %d", size)
+	}
+}
+
+func TestCleanupTimeout(t *testing.T) {
+	for _, name := range []string{"upload", "compose"} {
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			aborted := make(chan struct{})
+			release := make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method {
+				case http.MethodPost:
+					_, _ = io.WriteString(w, `<InitiateMultipartUploadResult><Bucket>test-bucket</Bucket><Key>out</Key><UploadId>id</UploadId></InitiateMultipartUploadResult>`)
+				case http.MethodPut:
+					cancel()
+					w.WriteHeader(http.StatusPreconditionFailed)
+				case http.MethodDelete:
+					close(aborted)
+					if name == "compose" {
+						w.Header().Set("Content-Length", "4")
+						w.WriteHeader(http.StatusInternalServerError)
+						w.(http.Flusher).Flush()
+					}
+					<-release
+				}
+			}))
+			defer server.Close()
+			defer close(release)
+			key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
+			bucket := NewBucket(key, "test-bucket")
+			finished := make(chan error, 1)
+			go func() {
+				var err error
+				switch name {
+				case "upload":
+					err = bucket.WriteFrom(ctx, "out", bytes.NewReader(make([]byte, MinPartSize)), MinPartSize)
+				case "compose":
+					_, err = bucket.Compose(ctx, "out", []CopyPart{{SourceKey: "source", ETag: "etag", Size: MinPartSize}})
+				}
+				finished <- err
+			}()
+			select {
+			case <-aborted:
+			case <-time.After(time.Second):
+				t.Fatal("cancelled multipart operation did not attempt cleanup")
+			}
+			select {
+			case err := <-finished:
+				assert.ErrorIs(t, err, context.Canceled)
+			case <-time.After(6 * time.Second):
+				t.Fatal("multipart cleanup did not time out")
+			}
+		})
+	}
+}
+
+func TestUploadCleanup(t *testing.T) {
+	for _, length := range []int{0, MinPartSize} {
+		t.Run(fmt.Sprint(length), func(t *testing.T) {
+			server := mock.New("test-bucket", "us-east-1")
+			defer server.Close()
+			key := aws.DeriveKey(server.URL(), "access", "secret", "us-east-1", "s3")
+			bucket := NewBucket(key, "test-bucket")
+			err := bucket.WriteFrom(context.Background(), "object", bytes.NewReader(make([]byte, length)), MinPartSize+1)
+			assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
+			assert.Empty(t, server.ListMultipartUploads())
+			assert.False(t, server.ObjectExists("object"))
+		})
+	}
 }
 
 // Test multipart upload through mock server directly
@@ -220,7 +469,7 @@ func TestUploader(t *testing.T) {
 		// Test Upload before Start
 		data := make([]byte, MinPartSize)
 		assert.Panics(t, func() {
-			u.Upload(1, data)
+			u.uploadWithContext(context.Background(), 1, data)
 		})
 
 		// Start uploader
@@ -228,12 +477,12 @@ func TestUploader(t *testing.T) {
 
 		// Test Upload with data too small
 		smallData := make([]byte, MinPartSize-1)
-		err := u.Upload(1, smallData)
+		err := u.uploadWithContext(context.Background(), 1, smallData)
 		assert.Error(t, err)
 		assert.Contains(t, err.Error(), "below min part size")
 
 		// Test valid Upload
-		assert.NoError(t, u.Upload(1, data))
+		assert.NoError(t, u.uploadWithContext(context.Background(), 1, data))
 	})
 
 	t.Run("close validation", func(t *testing.T) {
@@ -259,7 +508,7 @@ func TestUploader(t *testing.T) {
 		assert.NoError(t, uploader.Start(context.Background()))
 
 		data := make([]byte, MinPartSize)
-		assert.NoError(t, uploader.Upload(1, data))
+		assert.NoError(t, uploader.uploadWithContext(context.Background(), 1, data))
 
 		// Test valid Close
 		assert.NoError(t, uploader.Close(context.Background(), []byte("final data")))
@@ -289,7 +538,7 @@ func TestUploader(t *testing.T) {
 
 		// Start uploader
 		assert.NoError(t, u.Start(context.Background()))
-		uploadID := u.ID()
+		uploadID := u.id
 
 		// Verify upload exists
 		_, exists := mockServer.GetMultipartUpload(uploadID)
@@ -297,7 +546,7 @@ func TestUploader(t *testing.T) {
 
 		// Upload a part
 		data := make([]byte, MinPartSize)
-		assert.NoError(t, u.Upload(1, data))
+		assert.NoError(t, u.uploadWithContext(context.Background(), 1, data))
 
 		// Test Abort
 		assert.NoError(t, u.Abort(context.Background()))
@@ -313,7 +562,7 @@ func TestUploader(t *testing.T) {
 			Object: "test/abort-test2.bin",
 		}
 		assert.NoError(t, u2.Start(context.Background()))
-		assert.NoError(t, u2.Upload(1, data))
+		assert.NoError(t, u2.uploadWithContext(context.Background(), 1, data))
 		assert.NoError(t, u2.Close(context.Background(), nil))
 
 		// Abort should do nothing after successful close
@@ -476,7 +725,7 @@ func TestUploader(t *testing.T) {
 
 		// Upload a part
 		data := make([]byte, MinPartSize)
-		assert.NoError(t, uploader.Upload(1, data))
+		assert.NoError(t, uploader.uploadWithContext(context.Background(), 1, data))
 
 		// Close uploader
 		assert.NoError(t, uploader.Close(context.Background(), nil))
@@ -522,9 +771,9 @@ func TestUploader(t *testing.T) {
 		}
 
 		// Upload in order: 3, 1, 2
-		assert.NoError(t, uploader.Upload(3, data3))
-		assert.NoError(t, uploader.Upload(1, data1))
-		assert.NoError(t, uploader.Upload(2, data2))
+		assert.NoError(t, uploader.uploadWithContext(context.Background(), 3, data3))
+		assert.NoError(t, uploader.uploadWithContext(context.Background(), 1, data1))
+		assert.NoError(t, uploader.uploadWithContext(context.Background(), 2, data2))
 
 		// Close uploader
 		assert.NoError(t, uploader.Close(context.Background(), nil))
@@ -564,29 +813,11 @@ func TestUploader(t *testing.T) {
 		assert.NoError(t, u.Start(context.Background()))
 
 		data := make([]byte, MinPartSize)
-		assert.NoError(t, u.Upload(1, data))
+		assert.NoError(t, u.uploadWithContext(context.Background(), 1, data))
 
 		// Close with empty final part
 		assert.NoError(t, u.Close(context.Background(), nil))
 		assert.True(t, mockServer.ObjectExists("test/empty-final.bin"))
 
-		// Test Size() before Close
-		u2 := &uploader{
-			Key:    key,
-			Bucket: bucket,
-			Object: "test/size-before-close.bin",
-		}
-
-		assert.NoError(t, u2.Start(context.Background()))
-
-		// Size should be 0 before Close
-		assert.Equal(t, int64(0), u2.Size())
-
-		assert.NoError(t, u2.Upload(1, data))
-
-		// Size should still be 0 before Close
-		assert.Equal(t, int64(0), u2.Size())
-		assert.NoError(t, u2.Close(context.Background(), nil))
-		assert.Equal(t, int64(len(data)), u2.Size())
 	})
 }

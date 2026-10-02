@@ -15,24 +15,26 @@
 package mock
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/md5"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/xml"
 	"fmt"
 	"io"
 	"math/rand"
+	"net"
 	"net/http"
-	"net/http/httptest"
 	"net/url"
 	"path"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/valyala/fasthttp"
+	"github.com/valyala/fasthttp/fasthttpadaptor"
 )
 
 var (
@@ -45,15 +47,20 @@ var (
 // for testing purposes. It implements all S3 operations used by the client library
 // including object operations, multipart uploads, list operations, and S3 Select.
 type Server struct {
-	server   *httptest.Server
-	objects  map[string]*Object
-	uploads  map[string]*Multipart
-	mutex    sync.RWMutex
-	bucket   string
-	region   string
-	requests []RequestLog
-	errors   *ErrorSimulation
-	baseURL  string
+	server        *fasthttp.Server
+	objects       map[string]*Object
+	listedObjects []ObjectInfo
+	uploads       map[string]*Multipart
+	mutex         sync.RWMutex
+	bucket        string
+	region        string
+	requests      []RequestLog
+	errors        *ErrorSimulation
+	baseURL       string
+	noLogging     atomic.Bool
+	conns         map[net.Conn]struct{}
+	connsMu       sync.Mutex
+	closed        bool
 }
 
 // Object represents an S3 object stored in the mock server
@@ -110,10 +117,21 @@ func New(bucket, region string) *Server {
 		bucket:  bucket,
 		region:  region,
 		errors:  &ErrorSimulation{},
+		conns:   make(map[net.Conn]struct{}),
 	}
 
-	mock.server = httptest.NewServer(http.HandlerFunc(mock.ServeHTTP))
-	mock.baseURL = mock.server.URL
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		panic(fmt.Errorf("mock: listen: %w", err))
+	}
+	mock.server = &fasthttp.Server{
+		Handler:            mock.fastHandler(),
+		MaxRequestBodySize: int(^uint(0) >> 1),
+		StreamRequestBody:  true,
+		ConnState:          mock.trackConn,
+	}
+	mock.baseURL = "http://" + listener.Addr().String()
+	go mock.server.Serve(listener)
 
 	return mock
 }
@@ -123,10 +141,39 @@ func (m *Server) URL() string {
 	return m.baseURL
 }
 
+// SetRequestLogging enables or disables recording future requests. Logging is enabled by default.
+func (m *Server) SetRequestLogging(enabled bool) {
+	m.noLogging.Store(!enabled)
+}
+
 // Close shuts down the mock server and cleans up resources
 func (m *Server) Close() {
-	if m.server != nil {
-		m.server.Close()
+	if m.server == nil {
+		return
+	}
+	m.connsMu.Lock()
+	m.closed = true
+	for conn := range m.conns {
+		_ = conn.Close()
+	}
+	m.connsMu.Unlock()
+	_ = m.server.Shutdown()
+}
+
+func (m *Server) trackConn(conn net.Conn, state fasthttp.ConnState) {
+	switch state {
+	case fasthttp.StateNew:
+		m.connsMu.Lock()
+		if m.closed {
+			_ = conn.Close()
+		} else {
+			m.conns[conn] = struct{}{}
+		}
+		m.connsMu.Unlock()
+	case fasthttp.StateClosed, fasthttp.StateHijacked:
+		m.connsMu.Lock()
+		delete(m.conns, conn)
+		m.connsMu.Unlock()
 	}
 }
 
@@ -136,6 +183,7 @@ func (m *Server) Clear() {
 	defer m.mutex.Unlock()
 
 	m.objects = make(map[string]*Object)
+	m.listedObjects = nil
 	m.uploads = make(map[string]*Multipart)
 	m.requests = nil
 }
@@ -153,6 +201,7 @@ func (m *Server) PutObjectWithMetadata(key string, content []byte, metadata map[
 	etag := generateETag(content)
 	contentType := detectContentType(key, content)
 
+	m.listedObjects = nil
 	m.objects[key] = &Object{
 		Content:      content,
 		ETag:         etag,
@@ -181,6 +230,7 @@ func (m *Server) DeleteObject(key string) bool {
 	_, exists := m.objects[key]
 	if exists {
 		delete(m.objects, key)
+		m.listedObjects = nil
 	}
 	return exists
 }
@@ -245,65 +295,60 @@ func (m *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Parse the request path
-	pathParts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	bucketPath, rawKey, hasKey := strings.Cut(strings.Trim(r.URL.Path, "/"), "/")
 	switch {
-	case len(pathParts) < 1:
+	case bucketPath == "":
 		m.writeErrorResponse(w, "InvalidRequest", "Invalid request path", http.StatusBadRequest)
 		return
-	case pathParts[0] != m.bucket:
+	case bucketPath != m.bucket:
 		m.writeErrorResponse(w, "NoSuchBucket", "The specified bucket does not exist", http.StatusNotFound)
 		return
 	}
 
 	// Extract key
 	var key string
-	if len(pathParts) > 1 {
-		key = strings.Join(pathParts[1:], "/")
+	if hasKey {
+		key = strings.Clone(rawKey)
 	}
 
 	// Route based on method and query parameters
-	query := r.URL.Query()
+	var query url.Values
+	if r.URL.RawQuery != "" {
+		query = r.URL.Query()
+	}
 
-	switch r.Method {
-	case http.MethodGet:
-		if key == "" {
-			// List objects
-			m.handleListObjects(w, r, query)
-		} else {
-			// Get object
-			m.handleGetObject(w, r, key)
-		}
-	case http.MethodHead:
+	switch {
+	case r.Method == http.MethodGet && key == "":
+		// List objects
+		m.handleListObjects(w, r, query)
+	case r.Method == http.MethodGet:
+		// Get object
+		m.handleGetObject(w, r, key)
+	case r.Method == http.MethodHead:
 		m.handleHeadObject(w, r, key)
-	case http.MethodPut:
-		if query.Has("partNumber") && query.Has("uploadId") {
-			// Upload part
-			m.handleUploadPart(w, r, key, query)
-		} else {
-			// Put object
-			m.handlePutObject(w, r, key)
-		}
-	case http.MethodPost:
-		if query.Has("uploads") {
-			// Initiate multipart upload
-			m.handleInitiateMultipartUpload(w, r, key)
-		} else if query.Has("uploadId") {
-			// Complete multipart upload
-			m.handleCompleteMultipartUpload(w, r, key, query)
-		} else if query.Has("select") {
-			// S3 Select
-			m.handleS3Select(w, r, key)
-		} else {
-			m.writeErrorResponse(w, "InvalidRequest", "Invalid POST request", http.StatusBadRequest)
-		}
-	case http.MethodDelete:
-		if query.Has("uploadId") {
-			// Abort multipart upload
-			m.handleAbortMultipartUpload(w, r, key, query)
-		} else {
-			// Delete object
-			m.handleDeleteObject(w, r, key)
-		}
+	case r.Method == http.MethodPut && query.Has("partNumber") && query.Has("uploadId"):
+		// Upload part
+		m.handleUploadPart(w, r, key, query)
+	case r.Method == http.MethodPut:
+		// Put object
+		m.handlePutObject(w, r, key)
+	case r.Method == http.MethodPost && query.Has("uploads"):
+		// Initiate multipart upload
+		m.handleInitiateMultipartUpload(w, r, key)
+	case r.Method == http.MethodPost && query.Has("uploadId"):
+		// Complete multipart upload
+		m.handleCompleteMultipartUpload(w, r, key, query)
+	case r.Method == http.MethodPost && query.Has("select"):
+		// S3 Select
+		m.handleS3Select(w, r, key)
+	case r.Method == http.MethodPost:
+		m.writeErrorResponse(w, "InvalidRequest", "Invalid POST request", http.StatusBadRequest)
+	case r.Method == http.MethodDelete && query.Has("uploadId"):
+		// Abort multipart upload
+		m.handleAbortMultipartUpload(w, r, key, query)
+	case r.Method == http.MethodDelete:
+		// Delete object
+		m.handleDeleteObject(w, r, key)
 	default:
 		m.writeErrorResponse(w, "MethodNotAllowed", "Method not allowed", http.StatusMethodNotAllowed)
 	}
@@ -311,13 +356,14 @@ func (m *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // logRequest logs details about an HTTP request
 func (m *Server) logRequest(r *http.Request) {
-	m.mutex.Lock()
-	defer m.mutex.Unlock()
+	if m.noLogging.Load() {
+		return
+	}
 
 	headers := make(map[string]string)
 	for name, values := range r.Header {
 		if len(values) > 0 {
-			headers[name] = values[0]
+			headers[strings.Clone(name)] = strings.Clone(values[0])
 		}
 	}
 
@@ -327,14 +373,17 @@ func (m *Server) logRequest(r *http.Request) {
 		r.Body = io.NopCloser(bytes.NewReader(body))
 	}
 
-	m.requests = append(m.requests, RequestLog{
-		Method:    r.Method,
-		Path:      r.URL.Path,
-		Query:     r.URL.RawQuery,
+	log := RequestLog{
+		Method:    strings.Clone(r.Method),
+		Path:      strings.Clone(r.URL.Path),
+		Query:     strings.Clone(r.URL.RawQuery),
 		Headers:   headers,
 		Body:      body,
 		Timestamp: time.Now(),
-	})
+	}
+	m.mutex.Lock()
+	m.requests = append(m.requests, log)
+	m.mutex.Unlock()
 }
 
 // shouldSimulateError determines if an error should be simulated
@@ -374,7 +423,10 @@ func (m *Server) writeErrorResponse(w http.ResponseWriter, code, message string,
 // generateETag generates an ETag for the given content
 func generateETag(content []byte) string {
 	hash := md5.Sum(content)
-	return fmt.Sprintf(`"%s"`, hex.EncodeToString(hash[:]))
+	var etag [2 + 2*md5.Size]byte
+	etag[0], etag[len(etag)-1] = '"', '"'
+	hex.Encode(etag[1:len(etag)-1], hash[:])
+	return string(etag[:])
 }
 
 // detectContentType detects the content type based on file extension and content
@@ -405,637 +457,176 @@ func detectContentType(key string, content []byte) string {
 	}
 }
 
-// parseRange parses an HTTP Range header
-func parseRange(rangeHeader string, contentLength int64) (start, end int64, err error) {
-	if !strings.HasPrefix(rangeHeader, "bytes=") {
-		return 0, 0, fmt.Errorf("invalid range header")
-	}
+var xmlWriters = sync.Pool{New: func() any {
+	return bufio.NewWriterSize(io.Discard, 32<<10)
+}}
 
-	rangeSpec := strings.TrimPrefix(rangeHeader, "bytes=")
-	parts := strings.Split(rangeSpec, "-")
-	if len(parts) != 2 {
-		return 0, 0, fmt.Errorf("invalid range format")
-	}
-
-	if parts[0] == "" {
-		// Suffix range: -500
-		if parts[1] == "" {
-			return 0, 0, fmt.Errorf("invalid range format")
-		}
-		suffixLength, err := strconv.ParseInt(parts[1], 10, 64)
-		if err != nil {
-			return 0, 0, err
-		}
-		start = contentLength - suffixLength
-		if start < 0 {
-			start = 0
-		}
-		end = contentLength - 1
-	} else {
-		// Regular range: 0-499 or 0-
-		start, err = strconv.ParseInt(parts[0], 10, 64)
-		if err != nil {
-			return 0, 0, err
-		}
-
-		if parts[1] == "" {
-			// Open-ended range: 0-
-			end = contentLength - 1
-		} else {
-			end, err = strconv.ParseInt(parts[1], 10, 64)
-			if err != nil {
-				return 0, 0, err
+func writeXMLString(writer *bufio.Writer, value string) {
+	start := 0
+	for i := 0; i < len(value); i++ {
+		var escaped string
+		switch value[i] {
+		case '"':
+			escaped = "&#34;"
+		case '\'':
+			escaped = "&#39;"
+		case '&':
+			escaped = "&amp;"
+		case '<':
+			escaped = "&lt;"
+		case '>':
+			escaped = "&gt;"
+		case '\t':
+			escaped = "&#x9;"
+		case '\n':
+			escaped = "&#xA;"
+		case '\r':
+			escaped = "&#xD;"
+		default:
+			if value[i] < 0x20 || value[i] >= 0x80 {
+				writer.WriteString(value[start:i])
+				xml.EscapeText(writer, []byte(value[i:]))
+				return
 			}
+			continue
 		}
+		writer.WriteString(value[start:i])
+		writer.WriteString(escaped)
+		start = i + 1
 	}
-
-	if start < 0 || end >= contentLength || start > end {
-		return 0, 0, fmt.Errorf("range not satisfiable")
-	}
-
-	return start, end, nil
+	writer.WriteString(value[start:])
 }
 
-// generateUploadID generates a unique upload ID for multipart uploads
-func generateUploadID() string {
-	return fmt.Sprintf("upload-%d-%d", time.Now().UnixNano(), uploadSequence.Add(1))
+func writeXMLFields(w io.Writer, root string, fields ...string) error {
+	writer := xmlWriters.Get().(*bufio.Writer)
+	writer.Reset(w)
+	writer.WriteByte('<')
+	writer.WriteString(root)
+	writer.WriteByte('>')
+	for i := 0; i < len(fields); i += 2 {
+		writer.WriteByte('<')
+		writer.WriteString(fields[i])
+		writer.WriteByte('>')
+		writeXMLString(writer, fields[i+1])
+		writer.WriteString("</")
+		writer.WriteString(fields[i])
+		writer.WriteByte('>')
+	}
+	writer.WriteString("</")
+	writer.WriteString(root)
+	writer.WriteByte('>')
+	err := writer.Flush()
+	writer.Reset(io.Discard)
+	xmlWriters.Put(writer)
+	return err
 }
 
-// handleGetObject handles GET requests for objects
-func (m *Server) handleGetObject(w http.ResponseWriter, r *http.Request, key string) {
-	m.mutex.RLock()
-	obj, exists := m.objects[key]
-	m.mutex.RUnlock()
-
-	if !exists {
-		m.writeErrorResponse(w, "NoSuchKey", "The specified key does not exist", http.StatusNotFound)
-		return
-	}
-	if match := r.Header.Get("If-Match"); match != "" && match != obj.ETag {
-		w.WriteHeader(http.StatusPreconditionFailed)
-		return
-	}
-
-	// Handle range requests
-	rangeHeader := r.Header.Get("Range")
-	if rangeHeader != "" {
-		start, end, err := parseRange(rangeHeader, int64(len(obj.Content)))
-		if err != nil {
-			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+func (m *Server) fastHandler() fasthttp.RequestHandler {
+	fallback := fasthttpadaptor.NewFastHTTPHandler(m)
+	return func(ctx *fasthttp.RequestCtx) {
+		if !m.noLogging.Load() {
+			fallback(ctx)
 			return
 		}
-
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(obj.Content)))
-		w.Header().Set("Content-Length", strconv.FormatInt(end-start+1, 10))
-		w.Header().Set("Content-Type", obj.ContentType)
-		w.Header().Set("ETag", obj.ETag)
-		w.Header().Set("Last-Modified", obj.LastModified.Format(http.TimeFormat))
-		w.WriteHeader(http.StatusPartialContent)
-		w.Write(obj.Content[start : end+1])
-	} else {
-		// Full object
-		w.Header().Set("Content-Length", strconv.Itoa(len(obj.Content)))
-		w.Header().Set("Content-Type", obj.ContentType)
-		w.Header().Set("ETag", obj.ETag)
-		w.Header().Set("Last-Modified", obj.LastModified.Format(http.TimeFormat))
-		w.WriteHeader(http.StatusOK)
-		w.Write(obj.Content)
-	}
-}
-
-// handleHeadObject handles HEAD requests for objects
-func (m *Server) handleHeadObject(w http.ResponseWriter, r *http.Request, key string) {
-	m.mutex.RLock()
-	obj, exists := m.objects[key]
-	m.mutex.RUnlock()
-
-	if !exists {
-		m.writeErrorResponse(w, "NoSuchKey", "The specified key does not exist", http.StatusNotFound)
-		return
-	}
-
-	w.Header().Set("Content-Length", strconv.Itoa(len(obj.Content)))
-	w.Header().Set("Content-Type", obj.ContentType)
-	w.Header().Set("ETag", obj.ETag)
-	w.Header().Set("Last-Modified", obj.LastModified.Format(http.TimeFormat))
-	w.WriteHeader(http.StatusOK)
-}
-
-// handlePutObject handles PUT requests for objects
-func (m *Server) handlePutObject(w http.ResponseWriter, r *http.Request, key string) {
-	content, err := io.ReadAll(r.Body)
-	if err != nil {
-		m.writeErrorResponse(w, "InvalidRequest", "Failed to read request body", http.StatusBadRequest)
-		return
-	}
-
-	m.mutex.Lock()
-	current, exists := m.objects[key]
-	if match := r.Header.Get("If-None-Match"); match != "" && match != "*" {
-		m.mutex.Unlock()
-		m.writeErrorResponse(w, "InvalidRequest", "If-None-Match must be *", http.StatusBadRequest)
-		return
-	}
-	if r.Header.Get("If-None-Match") == "*" && exists {
-		m.mutex.Unlock()
-		w.WriteHeader(http.StatusPreconditionFailed)
-		return
-	}
-	if match := r.Header.Get("If-Match"); match != "" {
+		bucket, key, hasKey := bytes.Cut(bytes.Trim(ctx.URI().PathOriginal(), "/"), []byte{'/'})
+		if string(bucket) != m.bucket {
+			fallback(ctx)
+			return
+		}
+		decodedKey, err := url.PathUnescape(string(key))
+		if err != nil {
+			fallback(ctx)
+			return
+		}
+		query := ctx.QueryArgs()
 		switch {
-		case !exists:
-			m.mutex.Unlock()
-			m.writeErrorResponse(w, "NoSuchKey", "The specified key does not exist", http.StatusNotFound)
-			return
-		case current.ETag != match:
-			m.mutex.Unlock()
-			m.writeErrorResponse(w, "PreconditionFailed", "If-Match condition failed", http.StatusPreconditionFailed)
-			return
-		}
-	}
-	etag := generateETag(content)
-	m.objects[key] = &Object{
-		Content:      content,
-		ETag:         etag,
-		LastModified: time.Now().UTC(),
-		ContentType:  detectContentType(key, content),
-	}
-	m.mutex.Unlock()
-
-	w.Header().Set("ETag", etag)
-	w.WriteHeader(http.StatusOK)
-}
-
-// handleDeleteObject handles DELETE requests for objects
-func (m *Server) handleDeleteObject(w http.ResponseWriter, r *http.Request, key string) {
-	deleted := m.DeleteObject(key)
-	if deleted {
-		w.WriteHeader(http.StatusNoContent)
-	} else {
-		w.WriteHeader(http.StatusNotFound)
-	}
-}
-
-// ListObjectsV2Response represents the XML response for ListObjectsV2
-type ListObjectsV2Response struct {
-	XMLName               xml.Name       `xml:"ListBucketResult"`
-	Name                  string         `xml:"Name"`
-	Prefix                string         `xml:"Prefix"`
-	Delimiter             string         `xml:"Delimiter"`
-	MaxKeys               int            `xml:"MaxKeys"`
-	IsTruncated           bool           `xml:"IsTruncated"`
-	Contents              []ObjectInfo   `xml:"Contents"`
-	CommonPrefixes        []CommonPrefix `xml:"CommonPrefixes"`
-	NextContinuationToken string         `xml:"NextContinuationToken,omitempty"`
-}
-
-// ObjectInfo represents an object in the list response
-type ObjectInfo struct {
-	Key          string    `xml:"Key"`
-	LastModified time.Time `xml:"LastModified"`
-	ETag         string    `xml:"ETag"`
-	Size         int64     `xml:"Size"`
-}
-
-// CommonPrefix represents a common prefix in the list response
-type CommonPrefix struct {
-	Prefix string `xml:"Prefix"`
-}
-
-// handleListObjects handles GET requests for listing objects
-func (m *Server) handleListObjects(w http.ResponseWriter, r *http.Request, query url.Values) {
-	prefix := query.Get("prefix")
-	delimiter := query.Get("delimiter")
-	maxKeysStr := query.Get("max-keys")
-	continuationToken := query.Get("continuation-token")
-	startAfter := query.Get("start-after")
-
-	maxKeys := 1000 // Default
-	if maxKeysStr != "" {
-		if parsed, err := strconv.Atoi(maxKeysStr); err == nil && parsed > 0 {
-			maxKeys = parsed
-		}
-	}
-
-	m.mutex.RLock()
-	defer m.mutex.RUnlock()
-
-	var allKeys []string
-	for key := range m.objects {
-		if prefix == "" || strings.HasPrefix(key, prefix) {
-			allKeys = append(allKeys, key)
-		}
-	}
-	sort.Strings(allKeys)
-
-	// Handle continuation token and start-after
-	startIndex := 0
-	startKey := ""
-	if continuationToken != "" {
-		startKey = continuationToken
-	} else if startAfter != "" {
-		startKey = startAfter
-	}
-
-	if startKey != "" {
-		for i, key := range allKeys {
-			if key > startKey {
-				startIndex = i
-				break
+		case ctx.IsGet() && !hasKey:
+			if m.shouldSimulateError() {
+				m.fastError(ctx, "InternalError", "Simulated error", http.StatusInternalServerError)
+				return
 			}
-		}
-	}
-
-	var contents []ObjectInfo
-	var commonPrefixes []CommonPrefix
-	prefixSet := make(map[string]bool)
-
-	// Process keys and build response
-	count := 0
-	lastKey := ""
-
-	for i := startIndex; i < len(allKeys) && count < maxKeys; i++ {
-		key := allKeys[i]
-		lastKey = key
-
-		if delimiter != "" {
-			// Check if this key should be grouped under a common prefix
-			relativePath := key
-			if prefix != "" {
-				relativePath = strings.TrimPrefix(key, prefix)
+			response := m.listResponse(
+				string(query.Peek("prefix")),
+				string(query.Peek("delimiter")),
+				string(query.Peek("max-keys")),
+				string(query.Peek("continuation-token")),
+				string(query.Peek("start-after")),
+			)
+			ctx.SetContentType("application/xml")
+			response.writeTo(ctx)
+		case ctx.IsGet() && hasKey:
+			if m.shouldSimulateError() {
+				m.fastError(ctx, "InternalError", "Simulated error", http.StatusInternalServerError)
+				return
 			}
-
-			if delimiterIndex := strings.Index(relativePath, delimiter); delimiterIndex != -1 {
-				commonPrefix := prefix + relativePath[:delimiterIndex+1]
-				if !prefixSet[commonPrefix] {
-					commonPrefixes = append(commonPrefixes, CommonPrefix{Prefix: commonPrefix})
-					prefixSet[commonPrefix] = true
-					count++
-				}
-				continue
+			m.fastObject(ctx, decodedKey, false)
+		case ctx.IsHead() && hasKey:
+			if m.shouldSimulateError() {
+				m.fastError(ctx, "InternalError", "Simulated error", http.StatusInternalServerError)
+				return
 			}
+			m.fastObject(ctx, decodedKey, true)
+		case ctx.IsPut() && hasKey && query.Has("partNumber") && query.Has("uploadId") &&
+			len(ctx.Request.Header.Peek("x-amz-copy-source")) == 0:
+			if m.shouldSimulateError() {
+				m.fastError(ctx, "InternalError", "Simulated error", http.StatusInternalServerError)
+				return
+			}
+			m.fastPart(ctx)
+		case ctx.IsPut() && hasKey && len(query.QueryString()) == 0 &&
+			len(ctx.Request.Header.Peek("x-amz-copy-source")) == 0:
+			if m.shouldSimulateError() {
+				m.fastError(ctx, "InternalError", "Simulated error", http.StatusInternalServerError)
+				return
+			}
+			m.fastPut(ctx, decodedKey)
+		case ctx.IsPost() && query.Has("uploads"):
+			if m.shouldSimulateError() {
+				m.fastError(ctx, "InternalError", "Simulated error", http.StatusInternalServerError)
+				return
+			}
+			uploadID := m.initiateMultipart(decodedKey)
+			ctx.SetStatusCode(http.StatusOK)
+			ctx.SetContentType("application/xml")
+			writeXMLFields(ctx, "InitiateMultipartUploadResult", "Bucket", m.bucket, "Key", decodedKey, "UploadId", uploadID)
+		case ctx.IsPost() && query.Has("uploadId"):
+			if m.shouldSimulateError() {
+				m.fastError(ctx, "InternalError", "Simulated error", http.StatusInternalServerError)
+				return
+			}
+			m.fastCompleteMultipart(ctx, decodedKey, string(query.Peek("uploadId")))
+		case ctx.IsDelete() && query.Has("uploadId"):
+			if m.shouldSimulateError() {
+				m.fastError(ctx, "InternalError", "Simulated error", http.StatusInternalServerError)
+				return
+			}
+			if !m.abortMultipart(string(query.Peek("uploadId"))) {
+				m.fastError(ctx, "NoSuchUpload", "The specified upload does not exist", http.StatusNotFound)
+				return
+			}
+			ctx.SetStatusCode(http.StatusNoContent)
+		case ctx.IsDelete() && hasKey && len(query.QueryString()) == 0:
+			if m.shouldSimulateError() {
+				m.fastError(ctx, "InternalError", "Simulated error", http.StatusInternalServerError)
+				return
+			}
+			status := http.StatusNotFound
+			if m.DeleteObject(decodedKey) {
+				status = http.StatusNoContent
+			}
+			ctx.SetStatusCode(status)
+		default:
+			fallback(ctx)
 		}
-
-		obj := m.objects[key]
-		contents = append(contents, ObjectInfo{
-			Key:          key,
-			LastModified: obj.LastModified,
-			ETag:         obj.ETag,
-			Size:         int64(len(obj.Content)),
-		})
-		count++
-	}
-
-	// Determine if truncated and next token
-	isTruncated := false
-	var nextToken string
-
-	if count >= maxKeys && startIndex+count < len(allKeys) {
-		isTruncated = true
-		nextToken = lastKey
-	}
-
-	response := ListObjectsV2Response{
-		Name:                  m.bucket,
-		Prefix:                prefix,
-		Delimiter:             delimiter,
-		MaxKeys:               maxKeys,
-		IsTruncated:           isTruncated,
-		Contents:              contents,
-		CommonPrefixes:        commonPrefixes,
-		NextContinuationToken: nextToken,
-	}
-
-	w.Header().Set("Content-Type", "application/xml")
-	w.WriteHeader(http.StatusOK)
-	xml.NewEncoder(w).Encode(response)
-}
-
-// InitiateMultipartUploadResponse represents the XML response for initiating multipart upload
-type InitiateMultipartUploadResponse struct {
-	XMLName  xml.Name `xml:"InitiateMultipartUploadResult"`
-	Bucket   string   `xml:"Bucket"`
-	Key      string   `xml:"Key"`
-	UploadId string   `xml:"UploadId"`
-}
-
-// handleInitiateMultipartUpload handles POST requests to initiate multipart uploads
-func (m *Server) handleInitiateMultipartUpload(w http.ResponseWriter, r *http.Request, key string) {
-	uploadID := generateUploadID()
-
-	m.mutex.Lock()
-	m.uploads[uploadID] = &Multipart{
-		ID:       uploadID,
-		Bucket:   m.bucket,
-		Key:      key,
-		Parts:    make(map[int]*PartInfo),
-		Created:  time.Now().UTC(),
-		Metadata: make(map[string]string),
-	}
-	m.mutex.Unlock()
-
-	response := InitiateMultipartUploadResponse{
-		Bucket:   m.bucket,
-		Key:      key,
-		UploadId: uploadID,
-	}
-
-	w.Header().Set("Content-Type", "application/xml")
-	w.WriteHeader(http.StatusOK)
-	xml.NewEncoder(w).Encode(response)
-}
-
-// handleUploadPart handles PUT requests for uploading parts
-func (m *Server) handleUploadPart(w http.ResponseWriter, r *http.Request, key string, query url.Values) {
-	uploadID := query.Get("uploadId")
-	partNumberStr := query.Get("partNumber")
-
-	partNumber, err := strconv.Atoi(partNumberStr)
-	if err != nil || partNumber < 1 {
-		m.writeErrorResponse(w, "InvalidPartNumber", "Invalid part number", http.StatusBadRequest)
-		return
-	}
-
-	m.mutex.RLock()
-	upload, exists := m.uploads[uploadID]
-	m.mutex.RUnlock()
-
-	if !exists {
-		m.writeErrorResponse(w, "NoSuchUpload", "The specified upload does not exist", http.StatusNotFound)
-		return
-	}
-
-	// Check if this is a copy part operation
-	copySource := r.Header.Get("x-amz-copy-source")
-	if copySource != "" {
-		m.handleCopyPart(w, r, upload, partNumber, copySource)
-		return
-	}
-
-	// Regular upload part
-	content, err := io.ReadAll(r.Body)
-	if err != nil {
-		m.writeErrorResponse(w, "InvalidRequest", "Failed to read request body", http.StatusBadRequest)
-		return
-	}
-
-	etag := generateETag(content)
-
-	m.mutex.Lock()
-	upload.Parts[partNumber] = &PartInfo{
-		PartNumber: partNumber,
-		ETag:       etag,
-		Size:       int64(len(content)),
-		Content:    content,
-	}
-	m.mutex.Unlock()
-
-	w.Header().Set("ETag", etag)
-	w.WriteHeader(http.StatusOK)
-}
-
-// handleCopyPart handles copy part operations for multipart uploads
-func (m *Server) handleCopyPart(w http.ResponseWriter, r *http.Request, upload *Multipart, partNumber int, copySource string) {
-	// Parse copy source: /bucket/key
-	if !strings.HasPrefix(copySource, "/") {
-		m.writeErrorResponse(w, "InvalidRequest", "Invalid copy source format", http.StatusBadRequest)
-		return
-	}
-
-	parts := strings.SplitN(copySource[1:], "/", 2)
-	switch {
-	case len(parts) != 2:
-		m.writeErrorResponse(w, "InvalidRequest", "Invalid copy source format", http.StatusBadRequest)
-		return
-	case parts[0] != m.bucket:
-		// For simplicity, we only support copying from the same bucket in the mock
-		m.writeErrorResponse(w, "NoSuchBucket", "Source bucket not found", http.StatusNotFound)
-		return
-	}
-
-	sourceKey := parts[1]
-
-	// Get the source object
-	m.mutex.RLock()
-	sourceObj, exists := m.objects[sourceKey]
-	m.mutex.RUnlock()
-
-	ifMatch := r.Header.Get("x-amz-copy-source-if-match")
-	switch {
-	case !exists:
-		m.writeErrorResponse(w, "NoSuchKey", "Source object not found", http.StatusNotFound)
-		return
-	case ifMatch != "" && ifMatch != sourceObj.ETag:
-		m.writeErrorResponse(w, "PreconditionFailed", "Copy source if-match condition failed", http.StatusPreconditionFailed)
-		return
-	}
-
-	// Handle range if specified
-	var content []byte
-	rangeHeader := r.Header.Get("x-amz-copy-source-range")
-	if rangeHeader != "" {
-		// Parse range: bytes=start-end
-		if !strings.HasPrefix(rangeHeader, "bytes=") {
-			m.writeErrorResponse(w, "InvalidRequest", "Invalid range format", http.StatusBadRequest)
-			return
-		}
-		rangeSpec := rangeHeader[6:] // Remove "bytes="
-		rangeParts := strings.Split(rangeSpec, "-")
-		if len(rangeParts) != 2 {
-			m.writeErrorResponse(w, "InvalidRequest", "Invalid range format", http.StatusBadRequest)
-			return
-		}
-
-		start, err := strconv.ParseInt(rangeParts[0], 10, 64)
-		if err != nil {
-			m.writeErrorResponse(w, "InvalidRequest", "Invalid range start", http.StatusBadRequest)
-			return
-		}
-
-		end, err := strconv.ParseInt(rangeParts[1], 10, 64)
-		if err != nil {
-			m.writeErrorResponse(w, "InvalidRequest", "Invalid range end", http.StatusBadRequest)
-			return
-		}
-
-		if start < 0 || end >= int64(len(sourceObj.Content)) || start > end {
-			m.writeErrorResponse(w, "InvalidRange", "Invalid range", http.StatusRequestedRangeNotSatisfiable)
-			return
-		}
-
-		content = sourceObj.Content[start : end+1]
-	} else {
-		content = sourceObj.Content
-	}
-
-	etag := generateETag(content)
-
-	m.mutex.Lock()
-	upload.Parts[partNumber] = &PartInfo{
-		PartNumber: partNumber,
-		ETag:       etag,
-		Size:       int64(len(content)),
-		Content:    content,
-	}
-	m.mutex.Unlock()
-
-	// Return copy part result XML
-	response := fmt.Sprintf(`<CopyPartResult><ETag>%s</ETag></CopyPartResult>`, etag)
-	w.Header().Set("Content-Type", "application/xml")
-	w.Header().Set("ETag", etag)
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(response))
-}
-
-// CompleteMultipartUploadRequest represents the XML request for completing multipart upload
-type CompleteMultipartUploadRequest struct {
-	XMLName xml.Name                `xml:"CompleteMultipartUpload"`
-	Parts   []CompleteMultipartPart `xml:"Part"`
-}
-
-// CompleteMultipartPart represents a part in the complete request
-type CompleteMultipartPart struct {
-	PartNumber int    `xml:"PartNumber"`
-	ETag       string `xml:"ETag"`
-}
-
-// CompleteMultipartUploadResponse represents the XML response for completing multipart upload
-type CompleteMultipartUploadResponse struct {
-	XMLName  xml.Name `xml:"CompleteMultipartUploadResult"`
-	Location string   `xml:"Location"`
-	Bucket   string   `xml:"Bucket"`
-	Key      string   `xml:"Key"`
-	ETag     string   `xml:"ETag"`
-}
-
-// handleCompleteMultipartUpload handles POST requests to complete multipart uploads
-func (m *Server) handleCompleteMultipartUpload(w http.ResponseWriter, r *http.Request, key string, query url.Values) {
-	uploadID := query.Get("uploadId")
-
-	m.mutex.RLock()
-	upload, exists := m.uploads[uploadID]
-	m.mutex.RUnlock()
-
-	if !exists {
-		m.writeErrorResponse(w, "NoSuchUpload", "The specified upload does not exist", http.StatusNotFound)
-		return
-	}
-
-	var request CompleteMultipartUploadRequest
-	if err := xml.NewDecoder(r.Body).Decode(&request); err != nil {
-		m.writeErrorResponse(w, "MalformedXML", "Invalid XML in request body", http.StatusBadRequest)
-		return
-	}
-
-	// Validate and assemble parts
-	var finalContent []byte
-	var partNumbers []int
-	for _, part := range request.Parts {
-		partNumbers = append(partNumbers, part.PartNumber)
-	}
-	sort.Ints(partNumbers)
-
-	for _, partNum := range partNumbers {
-		partInfo, exists := upload.Parts[partNum]
-		if !exists {
-			m.writeErrorResponse(w, "InvalidPart", fmt.Sprintf("Part %d not found", partNum), http.StatusBadRequest)
-			return
-		}
-		finalContent = append(finalContent, partInfo.Content...)
-	}
-
-	// Create the final object
-	finalETag := m.PutObject(key, finalContent)
-
-	// Clean up the upload
-	m.mutex.Lock()
-	delete(m.uploads, uploadID)
-	m.mutex.Unlock()
-
-	response := CompleteMultipartUploadResponse{
-		Location: fmt.Sprintf("https://%s.s3.amazonaws.com/%s", m.bucket, key),
-		Bucket:   m.bucket,
-		Key:      key,
-		ETag:     finalETag,
-	}
-
-	w.Header().Set("Content-Type", "application/xml")
-	w.WriteHeader(http.StatusOK)
-	xml.NewEncoder(w).Encode(response)
-}
-
-// handleAbortMultipartUpload handles DELETE requests to abort multipart uploads
-func (m *Server) handleAbortMultipartUpload(w http.ResponseWriter, r *http.Request, key string, query url.Values) {
-	uploadID := query.Get("uploadId")
-
-	m.mutex.Lock()
-	_, exists := m.uploads[uploadID]
-	if exists {
-		delete(m.uploads, uploadID)
-	}
-	m.mutex.Unlock()
-
-	if exists {
-		w.WriteHeader(http.StatusNoContent)
-	} else {
-		m.writeErrorResponse(w, "NoSuchUpload", "The specified upload does not exist", http.StatusNotFound)
 	}
 }
 
-// handleS3Select handles POST requests for S3 Select operations
-func (m *Server) handleS3Select(w http.ResponseWriter, r *http.Request, key string) {
-	m.mutex.RLock()
-	_, exists := m.objects[key]
-	m.mutex.RUnlock()
-
-	if !exists {
-		m.writeErrorResponse(w, "NoSuchKey", "The specified key does not exist", http.StatusNotFound)
-		return
+func (m *Server) fastError(ctx *fasthttp.RequestCtx, code, message string, status int) {
+	ctx.SetStatusCode(status)
+	ctx.SetContentType("application/xml")
+	if !ctx.IsHead() {
+		writeXMLFields(ctx, "Error", "Code", code, "Message", message)
 	}
-
-	// For simplicity, we'll simulate S3 Select by returning a basic JSON response
-	// In a real implementation, this would parse the SQL query and process the Parquet file
-	simulatedResults := `{"id": 1, "name": "test", "value": 123}
-{"id": 2, "name": "example", "value": 456}
-`
-
-	// S3 Select uses a special streaming format with binary frames
-	// For testing purposes, we'll simulate this with a simplified response
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.WriteHeader(http.StatusOK)
-
-	// Write a simplified S3 Select response frame
-	m.writeS3SelectFrame(w, simulatedResults)
-	m.writeS3SelectEndFrame(w)
-}
-
-// writeS3SelectFrame writes a simulated S3 Select data frame
-func (m *Server) writeS3SelectFrame(w http.ResponseWriter, data string) {
-	// Simplified S3 Select frame format
-	// In reality, this would be much more complex with proper binary encoding
-	payload := []byte(data)
-
-	// Write frame header (simplified)
-	frameHeader := make([]byte, 12)
-	binary.BigEndian.PutUint32(frameHeader[0:4], uint32(len(payload)+16)) // total length
-	binary.BigEndian.PutUint32(frameHeader[4:8], 0)                       // header length
-	binary.BigEndian.PutUint32(frameHeader[8:12], 0)                      // CRC
-
-	w.Write(frameHeader)
-	w.Write(payload)
-
-	// Write frame footer (CRC)
-	footer := make([]byte, 4)
-	w.Write(footer)
-}
-
-// writeS3SelectEndFrame writes the end frame for S3 Select
-func (m *Server) writeS3SelectEndFrame(w http.ResponseWriter) {
-	// Write end frame
-	endFrame := make([]byte, 16)
-	binary.BigEndian.PutUint32(endFrame[0:4], 16) // total length
-	binary.BigEndian.PutUint32(endFrame[4:8], 0)  // header length
-	w.Write(endFrame)
 }
 
 // Testing utility functions

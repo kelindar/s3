@@ -16,60 +16,37 @@
 package s3
 
 import (
+	"bytes"
 	"context"
 	"encoding/xml"
 	"errors"
 	"fmt"
 	"io"
-	"net/http"
-	"net/url"
 	"sort"
+	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/kelindar/s3/aws"
+	"github.com/valyala/fasthttp"
 	"golang.org/x/sync/errgroup"
 )
 
 // uploader wraps the state of a multi-part upload.
-// This is now an internal implementation detail.
-// Use Bucket.Upload() for the public API.
+// Bucket.WriteFrom and Bucket.Compose own its lifecycle.
 type uploader struct {
 	// Key is the key used to sign requests.
 	// It cannot be nil.
 	Key *aws.SigningKey
-	// Client is the http client used to
-	// make requests. If it is nil, then
-	// DefaultClient will be used.
-	Client *http.Client
-
 	// ContentType, if not an empty string,
 	// will be the Content-Type of the new object.
 	ContentType string
 
 	Bucket, Object string
 
-	Scheme string
-
-	// Host, if not the empty string,
-	// is the host of the bucket.
-	// If Host is unset, then "s3.amazonaws.com" is used.
-	//
-	// Requests are always made to <bucket>.host
-	Host string
-
-	// Mbbs, if non-zero, is the expected
-	// link speed in Mbps. This number is
-	// used to determine the optimal parallelism
-	// for uploads.
-	// (For example, use Mbps = 25000 on a 25Gbps link, etc.)
-	Mbps int
-
 	// upload ID
 	id string
-
-	// next part
-	part int64
 
 	// ETag of the final result;
 	// just the empty string until Close is called
@@ -86,42 +63,118 @@ type uploader struct {
 	lock    sync.Mutex
 	parts   []tagpart
 	maxpart int64
-
-	// background uploads
-	bg       sync.WaitGroup
-	asyncerr error
-}
-
-// MinPartSize returns the minimum part size
-// for the uploader.
-//
-// (The return value of MinPartSize is always s3.MinPartSize.)
-func (u *uploader) MinPartSize() int {
-	return MinPartSize
 }
 
 type tagpart struct {
 	Num  int64  `xml:"PartNumber"`
 	ETag string `xml:"ETag"`
-	size int64  `xml:"-"`
 }
 
-func (u *uploader) req(ctx context.Context, method, uri, query string) *http.Request {
-	obj := url.URL{
-		Scheme:   u.Scheme,
-		RawQuery: query,
+func encodeCompleteMultipart(parts []tagpart) ([]byte, error) {
+	var body bytes.Buffer
+	body.Grow(110 + len(parts)*96)
+	body.WriteString(`<CompleteMultipartUpload xmlns="http://s3.amazonaws.com/doc/2006-03-01/">`)
+	var digits [20]byte
+	for _, part := range parts {
+		body.WriteString("<Part><PartNumber>")
+		body.Write(strconv.AppendInt(digits[:0], part.Num, 10))
+		body.WriteString("</PartNumber><ETag>")
+		if err := xml.EscapeText(&body, []byte(part.ETag)); err != nil {
+			return nil, err
+		}
+		body.WriteString("</ETag></Part>")
 	}
-	if u.Key.BaseURI == "" {
-		obj.Path = "/" + uri                      // fully decoded path
-		obj.RawPath = "/" + almostPathEscape(uri) // escaped path
-		obj.Host = u.Bucket + "." + u.Host
-	} else {
-		obj.Path = "/" + u.Bucket + "/" + uri                      // fully decoded path
-		obj.RawPath = "/" + u.Bucket + "/" + almostPathEscape(uri) // escaped path
-		obj.Host = u.Host
+	body.WriteString("</CompleteMultipartUpload>")
+	return body.Bytes(), nil
+}
 
+type multipartResponse struct {
+	XMLName xml.Name
+	Bucket  string `xml:"Bucket"`
+	Key     string `xml:"Key"`
+	ID      string `xml:"UploadId"`
+	ETag    string `xml:"ETag"`
+	Code    string `xml:"Code"`
+	Message string `xml:"Message"`
+}
+
+func decodeMultipartResponse(r io.Reader) (multipartResponse, error) {
+	body := xmlBodies.Get().(*bytes.Buffer)
+	body.Reset()
+	defer func() {
+		if body.Cap() <= 256<<10 {
+			body.Reset()
+			xmlBodies.Put(body)
+		}
+	}()
+	if _, err := body.ReadFrom(r); err != nil {
+		return multipartResponse{}, err
 	}
-	req, _ := http.NewRequestWithContext(ctx, method, obj.String(), nil)
+	if response, ok := scanMultipartResponse(body.Bytes()); ok {
+		return response, nil
+	}
+	var response multipartResponse
+	err := xml.NewDecoder(bytes.NewReader(body.Bytes())).Decode(&response)
+	return response, err
+}
+
+func scanMultipartResponse(data []byte) (multipartResponse, bool) {
+	p := listingXML{data: data}
+	if bytes.HasPrefix(data, []byte{0xef, 0xbb, 0xbf}) {
+		p.pos = 3
+	}
+	root, end, ok := p.next()
+	if !ok || end || root.name == nil {
+		return multipartResponse{}, false
+	}
+	response := multipartResponse{XMLName: xml.Name{Local: string(root.name)}}
+	if !root.self {
+		for {
+			tag, end, ok := p.next()
+			if !ok || tag.name == nil {
+				return multipartResponse{}, false
+			}
+			if end {
+				if !bytes.Equal(tag.name, root.name) {
+					return multipartResponse{}, false
+				}
+				break
+			}
+			var field *string
+			switch {
+			case listingXMLIs(tag.name, "Bucket"):
+				field = &response.Bucket
+			case listingXMLIs(tag.name, "Key"):
+				field = &response.Key
+			case listingXMLIs(tag.name, "UploadId"):
+				field = &response.ID
+			case listingXMLIs(tag.name, "ETag"):
+				field = &response.ETag
+			case listingXMLIs(tag.name, "Code"):
+				field = &response.Code
+			case listingXMLIs(tag.name, "Message"):
+				field = &response.Message
+			}
+			switch {
+			case field == nil:
+				ok = p.skip(tag)
+			default:
+				*field, ok = p.text(tag)
+			}
+			if !ok {
+				return multipartResponse{}, false
+			}
+		}
+	}
+	trailing, end, ok := p.next()
+	return response, ok && !end && trailing.name == nil
+}
+
+func (u *uploader) signedRequest(method, query string, body []byte, headers ...[2]string) *fasthttp.Request {
+	req := fasthttp.AcquireRequest()
+	setURI(req, u.Key, u.Bucket, u.Object, query)
+	req.Header.SetMethod(method)
+	signRequest(u.Key, req, body, headers...)
 	return req
 }
 
@@ -132,39 +185,23 @@ func (u *uploader) Start(ctx context.Context) error {
 	if u.started {
 		panic("multiple calls to uploader.Start()")
 	}
-	if u.Key.BaseURI == "" {
-		u.Scheme = "https"
-		u.Host = "s3." + u.Key.Region + ".amazonaws.com"
-	} else {
-		uu, _ := url.Parse(u.Key.BaseURI)
-		u.Scheme = uu.Scheme
-		u.Host = uu.Host
-	}
-	if u.Client == nil {
-		u.Client = &DefaultClient
-	}
 	if u.Bucket == "" || u.Object == "" {
 		return fmt.Errorf("s3.Uploader.Bucket and s3.Uploader.Object must be present")
 	}
-	req := u.req(ctx, "POST", u.Object, "uploads=")
+	req := u.signedRequest(fasthttp.MethodPost, "uploads=", nil)
+	defer fasthttp.ReleaseRequest(req)
 	if u.ContentType != "" {
-		req.Header.Set("Content-Type", u.ContentType)
+		req.Header.SetContentType(u.ContentType)
 	}
-	u.Key.SignV4(req, nil)
-	res, err := u.Client.Do(req)
+	res, err := doFastRequest(ctx, req)
 	if err != nil {
 		return err
 	}
 	defer res.Body.Close()
 	if res.StatusCode != 200 {
-		return fmt.Errorf("s3.Uploader.Start: %s %q", res.Status, extractMessage(res.Body))
+		return fmt.Errorf("s3.Uploader.Start: %s %q", res.status(), extractMessage(res.Body))
 	}
-	rt := struct {
-		Bucket string `xml:"Bucket"`
-		Key    string `xml:"Key"`
-		ID     string `xml:"UploadId"`
-	}{}
-	err = xml.NewDecoder(res.Body).Decode(&rt)
+	rt, err := decodeMultipartResponse(res.Body)
 	if err != nil {
 		return err
 	}
@@ -179,21 +216,6 @@ func (u *uploader) Start(ctx context.Context) error {
 	return nil
 }
 
-// NextPart atomically increments the internal
-// part counter inside the uploader and returns
-// the next available part number.
-// Note that AWS multipart uploads have 1-based
-// part numbers (i.e. the first part is part 1).
-//
-// If the data to be uploaded is intrinsically un-ordered,
-// then NextPart() can be used to greedily assign part numbers.
-//
-// Note that currently the maximum part number
-// allowed by AWS is 10000.
-func (u *uploader) NextPart() int64 {
-	return atomic.AddInt64(&u.part, 1)
-}
-
 // MinPartSize is the minimum size for
 // all of the parts of a multi-part upload
 // except for the final part.
@@ -204,11 +226,14 @@ const (
 	MaxParts    = 10000 // AWS limit
 )
 
+// Retain at most 10 MiB of idle part buffers, independent of upload concurrency.
+var uploadBuffers = make(chan *[MinPartSize]byte, 2)
+
 // calculatePartSize determines the optimal part size for a given total size
 func calculatePartSize(totalSize int64) int64 {
 	partSize := int64(MinPartSize)
 	if totalSize > 0 { // Keep doubling until we have ≤10,000 parts
-		for totalSize/partSize > MaxParts {
+		for (totalSize-1)/partSize >= MaxParts {
 			partSize *= 2
 		}
 	}
@@ -233,48 +258,27 @@ func extractMessage(r io.Reader) string {
 	return message
 }
 
-// Upload uploads the part number num from
-// the ReadCloser r, which must return exactly size bytes of data.
-// S3 prohibits multi-part upload parts smaller than 5MB (except
-// for the final bytes), so size must be at least 5MB.
-//
-// It is safe to call Upload from multiple goroutines
-// simultaneously. However, calls to Upload must be
-// synchronized to occur strictly after a call to Start
-// and strictly before a call to Close.
-func (u *uploader) Upload(num int64, contents []byte) error {
-	switch {
-	case !u.started:
-		panic("s3.uploader.UploadPart before Start()")
-	case len(contents) < MinPartSize:
-		return fmt.Errorf("UploadPart size %d below min part size %d", len(contents), MinPartSize)
-	}
-	return u.upload(context.Background(), num, contents)
-}
-
 func (u *uploader) upload(ctx context.Context, num int64, contents []byte) error {
-	req := u.req(ctx, "PUT", u.Object, fmt.Sprintf("partNumber=%d&uploadId=%s", num, u.id))
-	u.Key.SignV4(req, contents)
-	res, err := flakyDo(u.Client, req)
+	query := fmt.Sprintf("partNumber=%d&uploadId=%s", num, queryEscape(u.id))
+	req := u.signedRequest(fasthttp.MethodPut, query, contents)
+	defer fasthttp.ReleaseRequest(req)
+	res, err := flakyFast(ctx, req)
 	if err != nil {
 		return err
 	}
 	defer res.Body.Close()
 	if res.StatusCode != 200 {
-		return fmt.Errorf("UploadPart: %s %q", res.Status, extractMessage(res.Body))
+		return fmt.Errorf("UploadPart: %s %q", res.status(), extractMessage(res.Body))
 	}
 	etag := res.Header.Get("ETag")
 	if etag == "" {
 		return fmt.Errorf("s3.Uploader.UploadPart: response missing ETag?")
 	}
 	u.lock.Lock()
-	if num > u.maxpart {
-		u.maxpart = num
-	}
+	u.maxpart = max(u.maxpart, num)
 	u.parts = append(u.parts, tagpart{
 		Num:  num,
 		ETag: etag,
-		size: int64(len(contents)),
 	})
 	u.lock.Unlock()
 	return nil
@@ -298,11 +302,6 @@ func (u *uploader) uploadWithContext(ctx context.Context, num int64, contents []
 // simultaneously. However, calls to CopyFrom must be
 // synchronized to occur strictly after a call to Start
 // and strictly before a call to Close.
-//
-// As an optimization, most of the work for CopyFrom is
-// performed asynchronously. Callers must call Close and
-// check its return value in order to correctly handle
-// errors from CopyFrom.
 func (u *uploader) CopyFrom(ctx context.Context, num int64, source *Reader, start int64, end int64) error {
 	if !u.started {
 		panic("s3.uploader.CopyFrom before Start()")
@@ -321,102 +320,37 @@ func (u *uploader) CopyFrom(ctx context.Context, num int64, source *Reader, star
 		return fmt.Errorf("CopyFrom size %d below min part size %d", size, MinPartSize)
 	}
 
-	// update the max part before launching anything
-	// so that Close can perform an upload at the same time
-	// as the copy-part operation is still happening
-	u.lock.Lock()
-	if num > u.maxpart {
-		u.maxpart = num
+	headers := [3][2]string{
+		{"x-amz-copy-source", "/" + source.Bucket + "/" + almostPathEscape(source.Path)},
+		{"x-amz-copy-source-if-match", source.ETag},
 	}
-	u.lock.Unlock()
-
-	u.bg.Add(1)
-	go u.copy(ctx, num, source, start, end)
-	return nil
-}
-
-func (u *uploader) noteErr(err error) {
-	u.lock.Lock()
-	defer u.lock.Unlock()
-	if u.asyncerr == nil {
-		u.asyncerr = err
-	}
-}
-
-func (u *uploader) copy(ctx context.Context, num int64, source *Reader, start int64, end int64) {
-	defer u.bg.Done()
-	req := u.req(ctx, "PUT", u.Object, fmt.Sprintf("partNumber=%d&uploadId=%s", num, u.id))
-	req.Header.Add("x-amz-copy-source", fmt.Sprintf("/%s/%s", source.Bucket, source.Path))
-	req.Header.Add("x-amz-copy-source-if-match", source.ETag)
-	size := source.Size
+	count := 2
 	if start != 0 || end != 0 {
-		size = end - start
-		req.Header.Add("x-amz-copy-source-range", fmt.Sprintf("bytes=%d-%d", start, end-1))
+		headers[2] = [2]string{"x-amz-copy-source-range", fmt.Sprintf("bytes=%d-%d", start, end-1)}
+		count++
 	}
-	u.Key.SignV4(req, nil)
-	res, err := flakyDo(u.Client, req)
+	req := u.signedRequest(fasthttp.MethodPut, fmt.Sprintf("partNumber=%d&uploadId=%s", num, queryEscape(u.id)), nil, headers[:count]...)
+	defer fasthttp.ReleaseRequest(req)
+	res, err := flakyFast(ctx, req)
 	if err != nil {
-		u.noteErr(err)
-		return
+		return err
 	}
 	defer res.Body.Close()
 	if res.StatusCode != 200 {
-		u.noteErr(fmt.Errorf("CopyFrom: %s %q", res.Status, extractMessage(res.Body)))
-		return
+		return fmt.Errorf("CopyFrom: %s %q", res.status(), extractMessage(res.Body))
 	}
-	var etag string
-	rt := struct {
-		ETag string `xml:"ETag"`
-	}{}
-	if xml.NewDecoder(res.Body).Decode(&rt) == nil {
-		etag = rt.ETag
-	}
-	if etag == "" {
-		u.noteErr(fmt.Errorf("s3.Uploader.CopyFrom: response missing ETag?"))
-		return
+	rt, err := decodeMultipartResponse(res.Body)
+	if err != nil || rt.ETag == "" {
+		return fmt.Errorf("s3.Uploader.CopyFrom: response missing ETag?")
 	}
 	u.lock.Lock()
+	u.maxpart = max(u.maxpart, num)
 	u.parts = append(u.parts, tagpart{
 		Num:  num,
-		ETag: etag,
-		size: size,
+		ETag: rt.ETag,
 	})
 	u.lock.Unlock()
-}
-
-// CompletedParts returns the number of parts
-// that have been successfully uploaded.
-//
-// It is safe to call CompletedParts from multiple
-// goroutines that may also be calling UploadPart,
-// but be wary of logical races involving the number
-// of uploaded parts.
-func (u *uploader) CompletedParts() int {
-	u.lock.Lock()
-	defer u.lock.Unlock()
-	return len(u.parts)
-}
-
-// Closed returns whether or not Close
-// has been called on u.
-func (u *uploader) Closed() bool { return u.finished }
-
-// ID returns the "Upload ID" of this upload.
-// The return value of ID is only valid after
-// Start has been called.
-func (u *uploader) ID() string { return u.id }
-
-func (u *uploader) Size() int64 {
-	u.lock.Lock()
-	defer u.lock.Unlock()
-	if !u.finished {
-		return 0
-	}
-	out := int64(0)
-	for i := range u.parts {
-		out += u.parts[i].size
-	}
-	return out
+	return nil
 }
 
 // Close uploads the final part of the multi-part upload
@@ -443,40 +377,25 @@ func (u *uploader) Close(ctx context.Context, final []byte) error {
 			return err
 		}
 	}
-	// wait for any/all CopyFrom operations to finish;
-	// after this we know u.parts will be fully up-to-date
-	u.bg.Wait()
-	if u.asyncerr != nil {
-		return u.asyncerr
-	}
-
 	// the S3 API barfs if parts are not in ascending order
 	sort.Slice(u.parts, func(i, j int) bool {
 		return u.parts[i].Num < u.parts[j].Num
 	})
 
-	req := u.req(ctx, "POST", u.Object, fmt.Sprintf("uploadId=%s", u.id))
-	req.Header.Set("Content-Type", "application/xml")
-	buf, err := xml.Marshal(&struct {
-		XMLName xml.Name  `xml:"CompleteMultipartUpload"`
-		NS      string    `xml:"xmlns,attr"`
-		Parts   []tagpart `xml:"Part"`
-	}{
-		NS:    "http://s3.amazonaws.com/doc/2006-03-01/",
-		Parts: u.parts,
-	})
+	buf, err := encodeCompleteMultipart(u.parts)
 	if err != nil {
 		return err
 	}
-	u.Key.SignV4(req, buf)
-
-	res, err := flakyDo(u.Client, req)
+	req := u.signedRequest(fasthttp.MethodPost, "uploadId="+queryEscape(u.id), buf)
+	defer fasthttp.ReleaseRequest(req)
+	req.Header.SetContentType("application/xml")
+	res, err := flakyFast(ctx, req)
 	if err != nil {
 		return fmt.Errorf("s3.Uploader.Close: %w", err)
 	}
 	defer res.Body.Close()
 	if res.StatusCode != 200 {
-		return fmt.Errorf("s3.Uploader.Close: %s %q", res.Status, extractMessage(res.Body))
+		return fmt.Errorf("s3.Uploader.Close: %s %q", res.status(), extractMessage(res.Body))
 	}
 
 	// This is a bit nasty:
@@ -484,18 +403,7 @@ func (u *uploader) Close(ctx context.Context, final []byte) error {
 	// get a response with <Error/>, so we have
 	// to examine the xml name of the returned value
 	// in order to determine if we got the write thing
-	rt := struct {
-		XMLName  xml.Name
-		Location string `xml:"Location"`
-		Bucket   string `xml:"Bucket"`
-		Key      string `xml:"Key"`
-		ETag     string `xml:"ETag"`
-
-		// error fields:
-		Code    string `xml:"Code"`
-		Message string `xml:"Message"`
-	}{}
-	err = xml.NewDecoder(res.Body).Decode(&rt)
+	rt, err := decodeMultipartResponse(res.Body)
 	if err != nil {
 		return fmt.Errorf("s3.Uploader.Close: decoding response: %w", err)
 	}
@@ -519,24 +427,8 @@ func (u *uploader) ETag() string {
 	return u.finalETag
 }
 
-func (u *uploader) idealParallel(parts int64) int {
-	const max = 40
-	res := max
-	if u.Mbps != 0 {
-		// guess 640Mbps = 80MB/s per connection
-		// (S3 guidelines say 85-90MB/s)
-		res = u.Mbps / 800
-	}
-	if parts < int64(res) && parts > 0 {
-		return int(parts)
-	}
-	if res <= 0 {
-		return 1
-	}
-	return res
-}
-
 // Abort aborts a multi-part upload.
+// It waits at most five seconds, or less if ctx expires sooner.
 //
 // Abort is *not* safe to call concurrently
 // with Start, Close, or UploadPart.
@@ -553,21 +445,21 @@ func (u *uploader) Abort(ctx context.Context) error {
 	if !u.started || u.finished {
 		return nil
 	}
-	u.bg.Wait()
-	req := u.req(ctx, "DELETE", u.Object, fmt.Sprintf("uploadId=%s", u.id))
-	u.Key.SignV4(req, nil)
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
 
-	res, err := u.Client.Do(req)
+	req := u.signedRequest(fasthttp.MethodDelete, "uploadId="+queryEscape(u.id), nil)
+	defer fasthttp.ReleaseRequest(req)
+	res, err := doFastRequest(ctx, req)
 	if err != nil {
 		return fmt.Errorf("s3.Uploader.Abort: %w", err)
 	}
 	defer res.Body.Close()
 	if res.StatusCode != 204 {
-		return fmt.Errorf("s3.Uploader.Abort: %s %s", res.Status, extractMessage(res.Body))
+		return fmt.Errorf("s3.Uploader.Abort: %s %s", res.status(), extractMessage(res.Body))
 	}
 
 	// reset internal state
-	u.part = 0
 	u.started = false
 	u.finished = false
 	u.id = ""
@@ -588,14 +480,38 @@ func (u *uploader) UploadFrom(ctx context.Context, r io.ReaderAt, size int64) er
 	nonfinal := size / partSize
 	endparts := nonfinal * partSize
 	offset := int64(0)
-	parallel := u.idealParallel(nonfinal)
+	partCount := int(nonfinal)
+	if size > endparts {
+		partCount++
+	}
+	if len(u.parts) == 0 && cap(u.parts) < partCount {
+		u.parts = make([]tagpart, 0, partCount)
+	}
+	parallel := int(min(max(nonfinal, 0), 40))
 
 	g, uploadCtx := errgroup.WithContext(ctx)
 	g.SetLimit(parallel)
 
 	for i := 0; i < parallel; i++ {
 		g.Go(func() error {
-			buf := make([]byte, partSize)
+			var buf []byte
+			if partSize == MinPartSize {
+				var storage *[MinPartSize]byte
+				select {
+				case storage = <-uploadBuffers:
+				default:
+					storage = new([MinPartSize]byte)
+				}
+				defer func() {
+					select {
+					case uploadBuffers <- storage:
+					default:
+					}
+				}()
+				buf = storage[:]
+			} else {
+				buf = make([]byte, partSize)
+			}
 			for {
 				loff := atomic.AddInt64(&offset, partSize) - partSize
 				if loff >= endparts {

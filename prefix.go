@@ -16,26 +16,30 @@
 package s3
 
 import (
+	"bytes"
+	"cmp"
 	"context"
 	"encoding/xml"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
-	"net/http"
 	"net/url"
 	"path"
 	"slices"
-	"sort"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/kelindar/s3/aws"
+	"github.com/valyala/fasthttp"
 )
 
 // Prefix implements fs.File, fs.ReadDirFile, and fs.DirEntry, and fs.FS.
 type Prefix struct {
 	Key    *aws.SigningKey `xml:"-"`      // Key is the signing key used to sign requests.
-	Client *http.Client    `xml:"-"`      // Client is the HTTP client used to make requests. If it is nil, then DefaultClient will be used.
 	Bucket string          `xml:"-"`      // Bucket is the bucket at the root of the "filesystem"
 	Path   string          `xml:"Prefix"` // Path is the path of this prefix, should always be a valid path  (see fs.ValidPath) plus a trailing forward slash to indicate that this is a pseudo-directory prefix.
 	token  string          `xml:"-"`      // listing token; "" means start from the beginning
@@ -53,7 +57,6 @@ func (p *Prefix) join(extra string) string {
 func (p *Prefix) sub(name string) *Prefix {
 	return &Prefix{
 		Key:    p.Key,
-		Client: p.Client,
 		Bucket: p.Bucket,
 		Path:   p.join(name),
 		ctx:    p.ctx,
@@ -62,6 +65,7 @@ func (p *Prefix) sub(name string) *Prefix {
 
 // Open opens the object or pseudo-directory
 // at the provided path.
+// If both exist, Open prefers the pseudo-directory.
 // The returned fs.File will be a *File if
 // the combined Prefix and path lead to an object;
 // if the combind prefix and path produce another
@@ -72,13 +76,19 @@ func (p *Prefix) sub(name string) *Prefix {
 // fs.ErrNotExist is returned.
 func (p *Prefix) Open(file string) (fs.File, error) {
 	file = path.Clean(file)
-	if file == "." {
-		return p, nil
-	}
-	if !fs.ValidPath(file) {
+	switch {
+	case file == ".":
+		dir := *p
+		dir.token, dir.dirEOF = "", false
+		return &dir, nil
+	case !fs.ValidPath(file):
 		return nil, badpath("open", file)
 	}
-	return p.sub(file).openDir()
+	dir, err := p.sub(file).openDir()
+	if err == nil || !errors.Is(err, fs.ErrNotExist) {
+		return dir, err
+	}
+	return openContext(p.requestContext(), p.Key, p.Bucket, p.join(file), true)
 }
 
 func (p *Prefix) openDir() (fs.File, error) {
@@ -91,31 +101,26 @@ func (p *Prefix) openDirContext(ctx context.Context) (fs.File, error) {
 		return p, nil
 	}
 	ret, err := p.listContext(ctx, 1, "", "", "")
-	if err != nil {
+	switch {
+	case err != nil:
 		return nil, err
-	}
 	// if we got anything at all, it exists
-	if len(ret.Contents) == 0 && len(ret.CommonPrefixes) == 0 {
+	case len(ret.Contents) == 0 && len(ret.CommonPrefixes) == 0:
 		return nil, &fs.PathError{Op: "open", Path: p.Path, Err: fs.ErrNotExist}
-	}
-	if strings.HasSuffix(p.Path, "/") {
+	case strings.HasSuffix(p.Path, "/"):
 		return p, nil
 	}
 	path := p.Path + "/"
 	return &Prefix{
 		Key:    p.Key,
 		Bucket: p.Bucket,
-		Client: p.Client,
 		Path:   path,
 		ctx:    ctx,
 	}, nil
 }
 
 func (p *Prefix) requestContext() context.Context {
-	if p.ctx != nil {
-		return p.ctx
-	}
-	return context.Background()
+	return cmp.Or(p.ctx, context.Background())
 }
 
 // Name implements fs.DirEntry.Name
@@ -181,23 +186,39 @@ func (p *Prefix) ReadDir(n int) ([]fs.DirEntry, error) {
 }
 
 func (p *Prefix) readDirContext(ctx context.Context, n int) ([]fs.DirEntry, error) {
-	if p.dirEOF {
+	switch {
+	case p.dirEOF && n > 0:
 		return nil, io.EOF
+	case p.dirEOF:
+		return nil, nil
 	}
-	d, next, err := p.readDirAtContext(ctx, n, p.token, "", "")
-	if err == io.EOF {
-		p.dirEOF = true
-		if len(d) > 0 || n < 0 {
-			// the spec for fs.ReadDirFile says
-			// ReadDir(-1) shouldn't produce an explicit EOF
-			err = nil
+	var entries []fs.DirEntry
+	for {
+		limit := n
+		if n > 0 {
+			limit -= len(entries)
+		}
+		page, next, err := p.readDirAtContext(ctx, limit, p.token, "", "")
+		if err != nil && err != io.EOF {
+			return entries, &fs.PathError{Op: "readdir", Path: p.Path, Err: err}
+		}
+		if len(entries) == 0 {
+			entries = page
+		} else {
+			entries = append(entries, page...)
+		}
+		p.token = next
+		if err == io.EOF || next == "" {
+			p.dirEOF = true
+			if n > 0 && len(entries) == 0 {
+				return entries, io.EOF
+			}
+			return entries, nil
+		}
+		if n > 0 && len(entries) >= n {
+			return entries, nil
 		}
 	}
-	if err != nil {
-		return nil, &fs.PathError{Op: "readdir", Path: p.Path, Err: err}
-	}
-	p.token = next
-	return d, nil
 }
 
 type listResponse struct {
@@ -208,6 +229,528 @@ type listResponse struct {
 	NextToken      string   `xml:"NextContinuationToken"`
 }
 
+type standardListResponse listResponse
+
+var xmlBodies = sync.Pool{New: func() any {
+	buffer := new(bytes.Buffer)
+	buffer.Grow(32 << 10)
+	return buffer
+}}
+
+type listingXMLTag struct {
+	name []byte
+	self bool
+}
+
+type listingXML struct {
+	data     []byte
+	pos      int
+	rootSeen bool
+	stack    [][]byte
+	values   strings.Builder
+	ranges   [64]listingXMLRange
+	first    int
+	count    int
+}
+
+type listingXMLRange struct {
+	keyStart, keyEnd   int
+	etagStart, etagEnd int
+}
+
+func decodeListResponse(data []byte) (listResponse, error) {
+	if ret, ok := scanListXML(data); ok {
+		return ret, nil
+	}
+	var ret standardListResponse
+	err := xml.NewDecoder(bytes.NewReader(data)).Decode(&ret)
+	return listResponse(ret), err
+}
+
+func scanListXML(data []byte) (listResponse, bool) {
+	p := listingXML{data: data}
+	if bytes.HasPrefix(data, []byte{0xef, 0xbb, 0xbf}) {
+		p.pos = 3
+	}
+	root, end, ok := p.next()
+	if !ok || end || root.name == nil {
+		return listResponse{}, false
+	}
+	var ret listResponse
+	if !root.self {
+		for {
+			tag, end, ok := p.next()
+			if !ok || tag.name == nil {
+				return listResponse{}, false
+			}
+			if end {
+				if !bytes.Equal(tag.name, root.name) {
+					return listResponse{}, false
+				}
+				break
+			}
+			switch {
+			case listingXMLIs(tag.name, "IsTruncated"):
+				text, ok := p.plainText(tag)
+				if !ok {
+					return listResponse{}, false
+				}
+				value, err := strconv.ParseBool(string(bytes.TrimSpace(text)))
+				if err != nil {
+					return listResponse{}, false
+				}
+				ret.IsTruncated = value
+			case listingXMLIs(tag.name, "Contents"):
+				if ret.Contents == nil {
+					ret.Contents = make([]File, 0, min(bytes.Count(data, []byte("<Contents>")), 1000))
+				}
+				var file File
+				key, etag, ok := p.object(tag, &file)
+				if !ok {
+					return listResponse{}, false
+				}
+				ret.Contents = append(ret.Contents, file)
+				p.addObject(&ret, key, etag)
+			case listingXMLIs(tag.name, "CommonPrefixes"):
+				if ret.CommonPrefixes == nil {
+					ret.CommonPrefixes = make([]Prefix, 0, min(bytes.Count(data, []byte("<CommonPrefixes>")), 1000))
+				}
+				var prefix Prefix
+				if !p.commonPrefix(tag, &prefix) {
+					return listResponse{}, false
+				}
+				ret.CommonPrefixes = append(ret.CommonPrefixes, prefix)
+			case listingXMLIs(tag.name, "EncodingType"):
+				ret.EncodingType, ok = p.text(tag)
+				if !ok {
+					return listResponse{}, false
+				}
+			case listingXMLIs(tag.name, "NextContinuationToken"):
+				ret.NextToken, ok = p.text(tag)
+				if !ok {
+					return listResponse{}, false
+				}
+			default:
+				if !p.skip(tag) {
+					return listResponse{}, false
+				}
+			}
+		}
+	}
+	trailing, end, ok := p.next()
+	if !ok || end || trailing.name != nil {
+		return listResponse{}, false
+	}
+	p.flushObjects(&ret)
+	return ret, true
+}
+
+func listingXMLIs(name []byte, want string) bool { return bytes.Equal(name, []byte(want)) }
+
+func (p *listingXML) addObject(ret *listResponse, key, etag []byte) {
+	if p.count == 0 {
+		p.first = len(ret.Contents) - 1
+		if p.values.Len() == 0 {
+			size := min(int64(len(p.data)), int64(cap(ret.Contents))*(int64(len(key))+int64(len(etag))))
+			p.values.Grow(int(size))
+		}
+	}
+	part := &p.ranges[p.count]
+	part.keyStart = p.values.Len()
+	appendListingXMLText(&p.values, key)
+	part.keyEnd = p.values.Len()
+	part.etagStart = p.values.Len()
+	appendListingXMLText(&p.values, etag)
+	part.etagEnd = p.values.Len()
+	p.count++
+	if p.count == len(p.ranges) {
+		p.flushObjects(ret)
+	}
+}
+
+func (p *listingXML) flushObjects(ret *listResponse) {
+	if p.count == 0 {
+		return
+	}
+	value := p.values.String()
+	for i := range p.count {
+		part := p.ranges[i]
+		file := &ret.Contents[p.first+i]
+		file.Reader.Path = value[part.keyStart:part.keyEnd]
+		file.ETag = value[part.etagStart:part.etagEnd]
+	}
+	p.count = 0
+}
+
+func (p *listingXML) object(tag listingXMLTag, file *File) ([]byte, []byte, bool) {
+	if tag.self {
+		return nil, nil, true
+	}
+	var key, etag []byte
+	for {
+		child, end, ok := p.next()
+		switch {
+		case !ok || child.name == nil:
+			return nil, nil, false
+		case end:
+			if !bytes.Equal(child.name, tag.name) || bytes.IndexByte(key, '\r') >= 0 || bytes.IndexByte(etag, '\r') >= 0 || !validListingXMLText(key) || !validListingXMLText(etag) {
+				return nil, nil, false
+			}
+			return key, etag, true
+		}
+		switch {
+		case listingXMLIs(child.name, "Key"):
+			key, ok = p.textRaw(child)
+		case listingXMLIs(child.name, "ETag"):
+			etag, ok = p.textRaw(child)
+		case listingXMLIs(child.name, "LastModified"):
+			var value []byte
+			value, ok = p.plainText(child)
+			if ok {
+				file.LastModified, _ = time.Parse(time.RFC3339Nano, string(value))
+				ok = !file.LastModified.IsZero()
+			}
+		case listingXMLIs(child.name, "Size"):
+			var value []byte
+			value, ok = p.plainText(child)
+			if ok {
+				var err error
+				file.Reader.Size, err = strconv.ParseInt(string(bytes.TrimSpace(value)), 10, 64)
+				ok = err == nil
+			}
+		default:
+			ok = p.skip(child)
+		}
+		if !ok {
+			return nil, nil, false
+		}
+	}
+}
+
+func (p *listingXML) commonPrefix(tag listingXMLTag, prefix *Prefix) bool {
+	if tag.self {
+		return true
+	}
+	for {
+		child, end, ok := p.next()
+		switch {
+		case !ok || child.name == nil:
+			return false
+		case end:
+			return bytes.Equal(child.name, tag.name)
+		case listingXMLIs(child.name, "Prefix"):
+			prefix.Path, ok = p.text(child)
+		default:
+			ok = p.skip(child)
+		}
+		if !ok {
+			return false
+		}
+	}
+}
+
+func (p *listingXML) skip(tag listingXMLTag) bool {
+	if tag.self {
+		return true
+	}
+	p.stack = append(p.stack[:0], tag.name)
+	for len(p.stack) > 0 {
+		child, end, ok := p.next()
+		switch {
+		case !ok || child.name == nil:
+			return false
+		case end:
+			if !bytes.Equal(child.name, p.stack[len(p.stack)-1]) {
+				return false
+			}
+			p.stack = p.stack[:len(p.stack)-1]
+		case !child.self:
+			if len(p.stack) == 10000 {
+				return false
+			}
+			p.stack = append(p.stack, child.name)
+		}
+	}
+	return true
+}
+
+func (p *listingXML) text(tag listingXMLTag) (string, bool) {
+	value, ok := p.textRaw(tag)
+	if !ok {
+		return "", false
+	}
+	return listingXMLText(value)
+}
+
+func (p *listingXML) plainText(tag listingXMLTag) ([]byte, bool) {
+	value, ok := p.textRaw(tag)
+	if !ok || bytes.IndexByte(value, '&') >= 0 || bytes.IndexByte(value, '\r') >= 0 || !validListingXMLText(value) {
+		return nil, false
+	}
+	return value, true
+}
+
+func (p *listingXML) textRaw(tag listingXMLTag) ([]byte, bool) {
+	if tag.self {
+		return nil, true
+	}
+	start := p.pos
+	for p.pos < len(p.data) {
+		relative := bytes.IndexByte(p.data[p.pos:], '<')
+		if relative < 0 {
+			return nil, false
+		}
+		p.pos += relative
+		if p.pos+1 >= len(p.data) || p.data[p.pos+1] != '/' {
+			return nil, false
+		}
+		value := p.data[start:p.pos]
+		closing, ok := p.close()
+		if !ok || !bytes.Equal(closing, tag.name) {
+			return nil, false
+		}
+		return value, true
+	}
+	return nil, false
+}
+
+func (p *listingXML) next() (listingXMLTag, bool, bool) {
+	for p.pos < len(p.data) {
+		if p.data[p.pos] != '<' {
+			next := bytes.IndexByte(p.data[p.pos:], '<')
+			if next < 0 {
+				if !validListingXMLText(p.data[p.pos:]) {
+					return listingXMLTag{}, false, false
+				}
+				p.pos = len(p.data)
+				break
+			}
+			if !validListingXMLText(p.data[p.pos : p.pos+next]) {
+				return listingXMLTag{}, false, false
+			}
+			p.pos += next
+		}
+		switch {
+		case bytes.HasPrefix(p.data[p.pos:], []byte("<?xml")) && !p.rootSeen && (p.pos == 0 || p.pos == 3):
+			end := bytes.Index(p.data[p.pos+5:], []byte("?>"))
+			if end < 0 {
+				return listingXMLTag{}, false, false
+			}
+			declaration := p.data[p.pos : p.pos+5+end+2]
+			if !validListingXMLDeclaration(declaration) {
+				return listingXMLTag{}, false, false
+			}
+			p.pos += 5 + end + 2
+			continue
+		case bytes.HasPrefix(p.data[p.pos:], []byte("</")):
+			name, ok := p.close()
+			return listingXMLTag{name: name}, true, ok
+		case p.pos+1 >= len(p.data) || p.data[p.pos+1] == '!' || p.data[p.pos+1] == '?':
+			return listingXMLTag{}, false, false
+		}
+		return p.open()
+	}
+	return listingXMLTag{}, false, true
+}
+
+func (p *listingXML) open() (listingXMLTag, bool, bool) {
+	p.pos++
+	start := p.pos
+	for p.pos < len(p.data) && listingXMLNameByte(p.data[p.pos], p.pos == start) {
+		p.pos++
+	}
+	name := p.data[start:p.pos]
+	if len(name) == 0 || bytes.IndexByte(name, ':') >= 0 {
+		return listingXMLTag{}, false, false
+	}
+	hasNamespace := false
+	for p.pos < len(p.data) {
+		for p.pos < len(p.data) && isListingXMLSpace(p.data[p.pos]) {
+			p.pos++
+		}
+		if p.pos >= len(p.data) {
+			return listingXMLTag{}, false, false
+		}
+		switch p.data[p.pos] {
+		case '>':
+			p.pos++
+			p.rootSeen = true
+			return listingXMLTag{name: name}, false, true
+		case '/':
+			if p.pos+1 >= len(p.data) || p.data[p.pos+1] != '>' {
+				return listingXMLTag{}, false, false
+			}
+			p.pos += 2
+			p.rootSeen = true
+			return listingXMLTag{name: name, self: true}, false, true
+		default:
+			attrStart := p.pos
+			for p.pos < len(p.data) && p.data[p.pos] != '=' && p.data[p.pos] != '>' && !isListingXMLSpace(p.data[p.pos]) {
+				p.pos++
+			}
+			attr := p.data[attrStart:p.pos]
+			if !bytes.Equal(attr, []byte("xmlns")) || hasNamespace {
+				return listingXMLTag{}, false, false
+			}
+			hasNamespace = true
+			for p.pos < len(p.data) && isListingXMLSpace(p.data[p.pos]) {
+				p.pos++
+			}
+			if p.pos >= len(p.data) || p.data[p.pos] != '=' {
+				return listingXMLTag{}, false, false
+			}
+			p.pos++
+			for p.pos < len(p.data) && isListingXMLSpace(p.data[p.pos]) {
+				p.pos++
+			}
+			if p.pos >= len(p.data) || (p.data[p.pos] != '\'' && p.data[p.pos] != '"') {
+				return listingXMLTag{}, false, false
+			}
+			quote := p.data[p.pos]
+			p.pos++
+			valueStart := p.pos
+			for p.pos < len(p.data) && p.data[p.pos] != quote {
+				if p.data[p.pos] == '<' {
+					return listingXMLTag{}, false, false
+				}
+				p.pos++
+			}
+			if p.pos >= len(p.data) || bytes.IndexByte(p.data[valueStart:p.pos], '\r') >= 0 || !validListingXMLText(p.data[valueStart:p.pos]) {
+				return listingXMLTag{}, false, false
+			}
+			p.pos++
+		}
+	}
+	return listingXMLTag{}, false, false
+}
+
+func (p *listingXML) close() ([]byte, bool) {
+	p.pos += 2
+	start := p.pos
+	for p.pos < len(p.data) && listingXMLNameByte(p.data[p.pos], p.pos == start) {
+		p.pos++
+	}
+	name := p.data[start:p.pos]
+	if len(name) == 0 || bytes.IndexByte(name, ':') >= 0 {
+		return nil, false
+	}
+	for p.pos < len(p.data) && isListingXMLSpace(p.data[p.pos]) {
+		p.pos++
+	}
+	if p.pos >= len(p.data) || p.data[p.pos] != '>' {
+		return nil, false
+	}
+	p.pos++
+	return name, true
+}
+
+func listingXMLNameByte(value byte, first bool) bool {
+	return value >= 'A' && value <= 'Z' || value >= 'a' && value <= 'z' || value == '_' || !first && (value >= '0' && value <= '9' || value == '-' || value == '.')
+}
+
+func validListingXMLDeclaration(declaration []byte) bool {
+	for _, valid := range [][]byte{
+		[]byte(`<?xml version="1.0"?>`),
+		[]byte(`<?xml version="1.0" encoding="UTF-8"?>`),
+		[]byte(`<?xml version="1.0" encoding="utf-8"?>`),
+		[]byte(`<?xml version='1.0'?>`),
+		[]byte(`<?xml version='1.0' encoding='UTF-8'?>`),
+		[]byte(`<?xml version='1.0' encoding='utf-8'?>`),
+	} {
+		if bytes.Equal(declaration, valid) {
+			return true
+		}
+	}
+	return false
+}
+
+func isListingXMLSpace(value byte) bool {
+	return value == ' ' || value == '\t' || value == '\n' || value == '\r'
+}
+
+func validListingXMLRune(value rune) bool {
+	return value == '\t' || value == '\n' || value == '\r' || value >= 0x20 && value <= 0xD7FF || value >= 0xE000 && value <= 0xFFFD || value >= 0x10000 && value <= 0x10FFFF
+}
+
+func validListingXMLText(src []byte) bool {
+	if bytes.Contains(src, []byte("]]>")) {
+		return false
+	}
+	for i := 0; i < len(src); {
+		if src[i] == '&' {
+			_, size, ok := listingXMLEntity(src[i:])
+			if !ok {
+				return false
+			}
+			i += size
+			continue
+		}
+		r, size := utf8.DecodeRune(src[i:])
+		if size == 1 && r == utf8.RuneError || !validListingXMLRune(r) {
+			return false
+		}
+		i += size
+	}
+	return true
+}
+
+func listingXMLText(src []byte) (string, bool) {
+	switch {
+	case bytes.IndexByte(src, '\r') >= 0 || !validListingXMLText(src):
+		return "", false
+	case bytes.IndexByte(src, '&') < 0:
+		return string(src), true
+	}
+	var text strings.Builder
+	text.Grow(len(src))
+	appendListingXMLText(&text, src)
+	return text.String(), true
+}
+
+func appendListingXMLText(dst *strings.Builder, src []byte) {
+	for len(src) > 0 {
+		index := bytes.IndexByte(src, '&')
+		if index < 0 {
+			dst.Write(src)
+			return
+		}
+		dst.Write(src[:index])
+		r, size, _ := listingXMLEntity(src[index:])
+		dst.WriteRune(r)
+		src = src[index+size:]
+	}
+}
+
+func listingXMLEntity(src []byte) (rune, int, bool) {
+	end := bytes.IndexByte(src, ';')
+	if end < 2 {
+		return 0, 0, false
+	}
+	entity := src[1:end]
+	switch string(entity) {
+	case "amp":
+		return '&', end + 1, true
+	case "lt":
+		return '<', end + 1, true
+	case "gt":
+		return '>', end + 1, true
+	case "apos":
+		return '\'', end + 1, true
+	case "quot":
+		return '"', end + 1, true
+	}
+	if entity[0] != '#' {
+		return 0, 0, false
+	}
+	base, digits := 10, entity[1:]
+	if len(digits) > 1 && digits[0] == 'x' {
+		base, digits = 16, digits[1:]
+	}
+	value, err := strconv.ParseUint(string(digits), base, 32)
+	r := rune(value)
+	return r, end + 1, err == nil && validListingXMLRune(r)
+}
+
 func (p *Prefix) list(n int, token, seek, prefix string) (*listResponse, error) {
 	return p.listContext(p.requestContext(), n, token, seek, prefix)
 }
@@ -216,27 +759,19 @@ func (p *Prefix) listContext(ctx context.Context, n int, token, seek, prefix str
 	if !ValidBucket(p.Bucket) {
 		return nil, badBucket(p.Bucket)
 	}
-	parts := []string{
-		"delimiter=%2F",
-		"list-type=2",
-	}
 	// make sure there's a '/' at the end and
 	// append the prefix
 	path := p.Path
-	if path != "" && path != "." {
-		if !strings.HasSuffix(path, "/") {
-			path += "/" + prefix
-		} else {
-			path += prefix
-		}
-	} else {
+	switch {
+	case path == "" || path == ".":
 		// NOTE: if p.Path was "." this will replace
 		// it with prefix which may be ""; this is
 		// the intended behavior
 		path = prefix
-	}
-	if path != "" {
-		parts = append(parts, "prefix="+queryEscape(path))
+	case !strings.HasSuffix(path, "/"):
+		path += "/" + prefix
+	default:
+		path += prefix
 	}
 	// the seek parameter is only meaningful
 	// if it is "larger" than the prefix being listed;
@@ -246,23 +781,39 @@ func (p *Prefix) listContext(ctx context.Context, n int, token, seek, prefix str
 	if seek != "" && (seek < prefix || !strings.HasPrefix(seek, prefix)) {
 		return nil, fmt.Errorf("seek %q not compatible with prefix %q", seek, prefix)
 	}
-	if seek != "" {
-		parts = append(parts, "start-after="+queryEscape(p.join(seek)))
+	switch {
+	case ctx == nil:
+		return nil, fmt.Errorf("executing request: s3 request: nil context")
+	case ctx.Err() != nil:
+		return nil, fmt.Errorf("executing request: %w", ctx.Err())
 	}
-	if n > 0 {
-		parts = append(parts, fmt.Sprintf("max-keys=%d", n))
-	}
+	req := fasthttp.AcquireRequest()
+	defer fasthttp.ReleaseRequest(req)
+	setURI(req, p.Key, p.Bucket, "", "")
+	uri := req.URI()
+	query := uri.QueryString()[:0]
 	if token != "" {
-		parts = append(parts, "continuation-token="+url.QueryEscape(token))
+		query = append(query, "continuation-token="...)
+		query = appendQueryEscape(query, token)
+		query = append(query, '&')
 	}
-	sort.Strings(parts)
-	query := "?" + strings.Join(parts, "&")
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURI(p.Key, p.Bucket, query), nil)
-	if err != nil {
-		return nil, fmt.Errorf("creating http request: %w", err)
+	query = append(query, "delimiter=%2F&encoding-type=url&list-type=2"...)
+	if n > 0 {
+		query = append(query, "&max-keys="...)
+		query = strconv.AppendInt(query, int64(n), 10)
 	}
-	p.Key.SignV4(req, nil)
-	res, err := flakyDo(p.client(), req)
+	if path != "" {
+		query = append(query, "&prefix="...)
+		query = appendQueryEscape(query, path)
+	}
+	if seek != "" {
+		query = append(query, "&start-after="...)
+		query = appendQueryEscape(query, p.join(seek))
+	}
+	uri.SetQueryStringBytes(query)
+	req.Header.SetMethod(fasthttp.MethodGet)
+	signRequest(p.Key, req, nil)
+	res, err := flakyFast(ctx, req)
 	if err != nil {
 		return nil, fmt.Errorf("executing request: %w", err)
 	}
@@ -278,12 +829,38 @@ func (p *Prefix) listContext(ctx context.Context, n int, token, seek, prefix str
 		// as an empty filesystem
 		return nil, fs.ErrNotExist
 	default:
-		return nil, fmt.Errorf("s3 list objects s3://%s/%s: %s", p.Bucket, p.Path, res.Status)
+		return nil, fmt.Errorf("s3 list objects s3://%s/%s: %s", p.Bucket, p.Path, res.status())
 	}
 
-	var ret listResponse
-	if err := xml.NewDecoder(res.Body).Decode(&ret); err != nil {
+	body := xmlBodies.Get().(*bytes.Buffer)
+	body.Reset()
+	defer func() {
+		if body.Cap() <= 256<<10 {
+			body.Reset()
+			xmlBodies.Put(body)
+		}
+	}()
+	_, err = body.ReadFrom(res.Body)
+	if err != nil {
 		return nil, fmt.Errorf("xml decoding response: %w", err)
+	}
+	ret, err := decodeListResponse(body.Bytes())
+	if err != nil {
+		return nil, fmt.Errorf("xml decoding response: %w", err)
+	}
+	if ret.EncodingType == "url" {
+		for i := range ret.Contents {
+			ret.Contents[i].Reader.Path, err = url.PathUnescape(ret.Contents[i].Reader.Path)
+			if err != nil {
+				return nil, fmt.Errorf("decoding object key: %w", err)
+			}
+		}
+		for i := range ret.CommonPrefixes {
+			ret.CommonPrefixes[i].Path, err = url.PathUnescape(ret.CommonPrefixes[i].Path)
+			if err != nil {
+				return nil, fmt.Errorf("decoding prefix: %w", err)
+			}
+		}
 	}
 	return &ret, nil
 }
@@ -338,15 +915,13 @@ func (p *Prefix) readDirAtContext(ctx context.Context, n int, token, seek, patte
 		if ignoreKey(ret.Contents[i].Path(), false) {
 			continue
 		}
-		name := ret.Contents[i].Name()
-		match, err := patmatch(pattern, name)
-		if err != nil {
+		switch match, err := patmatch(pattern, ret.Contents[i].Name()); {
+		case err != nil:
 			return nil, "", err
-		} else if !match {
+		case !match:
 			continue
 		}
 		ret.Contents[i].Key = p.Key
-		ret.Contents[i].Client = p.client()
 		ret.Contents[i].Bucket = p.Bucket
 		ret.Contents[i].Reader.ctx = ctx
 		out = append(out, &ret.Contents[i])
@@ -355,16 +930,14 @@ func (p *Prefix) readDirAtContext(ctx context.Context, n int, token, seek, patte
 		if ignoreKey(ret.CommonPrefixes[i].Path, true) {
 			continue
 		}
-		name := ret.CommonPrefixes[i].Name()
-		match, err := patmatch(pattern, name)
-		if err != nil {
+		switch match, err := patmatch(pattern, ret.CommonPrefixes[i].Name()); {
+		case err != nil:
 			return nil, "", err
-		} else if !match {
+		case !match:
 			continue
 		}
 		ret.CommonPrefixes[i].Key = p.Key
 		ret.CommonPrefixes[i].Bucket = p.Bucket
-		ret.CommonPrefixes[i].Client = p.Client
 		ret.CommonPrefixes[i].ctx = ctx
 		out = append(out, &ret.CommonPrefixes[i])
 	}
@@ -375,11 +948,4 @@ func (p *Prefix) readDirAtContext(ctx context.Context, n int, token, seek, patte
 		err = io.EOF
 	}
 	return out, ret.NextToken, err
-}
-
-func (p *Prefix) client() *http.Client {
-	if p.Client == nil {
-		return &DefaultClient
-	}
-	return p.Client
 }

@@ -15,9 +15,11 @@
 package s3
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"io/fs"
+	"net/http"
 	"testing"
 	"time"
 
@@ -27,6 +29,14 @@ import (
 )
 
 func TestFile(t *testing.T) {
+	t.Run("invalid seek whence", func(t *testing.T) {
+		file := NewFile(nil, "test-bucket", "object", "etag", 10)
+		assert.NotPanics(t, func() {
+			pos, err := file.Seek(0, 99)
+			assert.Error(t, err)
+			assert.Zero(t, pos)
+		})
+	})
 	t.Run("basic properties", func(t *testing.T) {
 		bucket := "test-bucket"
 		mockServer := mock.New(bucket, "us-east-1")
@@ -52,7 +62,7 @@ func TestFile(t *testing.T) {
 		assert.Equal(t, int64(len(content)), file.Size())
 		assert.False(t, file.IsDir())
 		assert.Equal(t, fs.FileMode(0644), file.Mode())
-		assert.Equal(t, fs.FileMode(0644), file.Type())
+		assert.Equal(t, fs.FileMode(0), file.Type())
 
 		// Test Stat
 		info, err := file.Stat()
@@ -248,13 +258,9 @@ func TestFile(t *testing.T) {
 		defer file.Close()
 
 		modTime := file.ModTime()
-		// ModTime might be zero for mock server, so just check it's not nil
-		assert.NotNil(t, modTime)
-		// For real S3, this would be between beforePut and afterPut
-		if !modTime.IsZero() {
-			assert.True(t, modTime.After(beforePut) || modTime.Equal(beforePut))
-			assert.True(t, modTime.Before(afterPut) || modTime.Equal(afterPut))
-		}
+		assert.False(t, modTime.IsZero())
+		assert.WithinDuration(t, beforePut, modTime, time.Second)
+		assert.WithinDuration(t, afterPut, modTime, time.Second)
 	})
 
 	t.Run("error handling", func(t *testing.T) {
@@ -363,4 +369,34 @@ func TestFile(t *testing.T) {
 			assert.Equal(t, 10, n)
 		}
 	})
+}
+
+func TestFileWriteTo(t *testing.T) {
+	server := mock.New("test-bucket", "us-east-1")
+	defer server.Close()
+	server.PutObject("copy/object", []byte("read once"))
+	key := aws.DeriveKey("", "access", "secret", "us-east-1", "s3")
+	key.BaseURI = server.URL()
+	bucket := NewBucket(key, "test-bucket")
+
+	file, err := bucket.Open("copy/object")
+	assert.NoError(t, err)
+	var dst bytes.Buffer
+	_, err = io.Copy(&dst, file)
+	assert.NoError(t, err)
+	assert.Equal(t, "read once", dst.String())
+	assert.NoError(t, file.Close())
+	assert.Len(t, server.GetRequestsWithMethod(http.MethodGet), 1)
+
+	server.Clear()
+	server.PutObject("copy/empty", nil)
+	bucket.Lazy = true
+	file, err = bucket.Open("copy/empty")
+	assert.NoError(t, err)
+	dst.Reset()
+	_, err = io.Copy(&dst, file)
+	assert.NoError(t, err)
+	assert.Empty(t, dst.Bytes())
+	assert.NoError(t, file.Close())
+	assert.Empty(t, server.GetRequestsWithMethod(http.MethodGet))
 }

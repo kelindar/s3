@@ -23,11 +23,13 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // helper to run STS-based tests with a mocked STS service
@@ -53,6 +55,27 @@ func withSTSServer(t *testing.T, handler http.HandlerFunc, fn func(client *http.
 }
 
 func TestCreds(t *testing.T) {
+	t.Chdir(t.TempDir())
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	for _, key := range []string{
+		"AWS_ACCESS_KEY_ID",
+		"AWS_SECRET_ACCESS_KEY",
+		"AWS_REGION",
+		"AWS_DEFAULT_REGION",
+		"AWS_SESSION_TOKEN",
+		"AWS_PROFILE",
+		"AWS_DEFAULT_PROFILE",
+		"AWS_CONFIG_FILE",
+		"AWS_SHARED_CREDENTIALS_FILE",
+		"AWS_ROLE_ARN",
+		"AWS_WEB_IDENTITY_TOKEN_FILE",
+		"AWS_ROLE_SESSION_NAME",
+	} {
+		t.Setenv(key, "")
+	}
+
 	t.Run("scan", func(t *testing.T) {
 		var foo, bar, baz, quux string
 		basespec := []scanspec{
@@ -78,14 +101,14 @@ func TestCreds(t *testing.T) {
 		spec := make([]scanspec, len(basespec))
 		copy(spec, basespec)
 		err := scan(strings.NewReader(text), "default", spec)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		assert.Equal(t, "foo_result", foo)
 		assert.Equal(t, "bar_result", bar)
 		assert.Equal(t, "baz_result", baz)
 		assert.Equal(t, "quux_result", quux)
 		copy(spec, basespec)
 		err = scan(strings.NewReader(text), "section2", spec)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		assert.Equal(t, "section2_result", foo)
 		assert.Equal(t, "section2_bar_result", bar)
 	})
@@ -94,16 +117,12 @@ func TestCreds(t *testing.T) {
 		dir := t.TempDir()
 		tokenFile := filepath.Join(dir, "token")
 		err := os.WriteFile(tokenFile, []byte("tok"), 0600)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 
-		os.Setenv("AWS_REGION", "us-west-1")
-		defer os.Unsetenv("AWS_REGION")
-		os.Setenv("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/test")
-		defer os.Unsetenv("AWS_ROLE_ARN")
-		os.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", tokenFile)
-		defer os.Unsetenv("AWS_WEB_IDENTITY_TOKEN_FILE")
-		os.Setenv("AWS_ROLE_SESSION_NAME", "mysession")
-		defer os.Unsetenv("AWS_ROLE_SESSION_NAME")
+		t.Setenv("AWS_REGION", "us-west-1")
+		t.Setenv("AWS_ROLE_ARN", "arn:aws:iam::123456789012:role/test")
+		t.Setenv("AWS_WEB_IDENTITY_TOKEN_FILE", tokenFile)
+		t.Setenv("AWS_ROLE_SESSION_NAME", "mysession")
 
 		handler := func(w http.ResponseWriter, r *http.Request) {
 			assert.Equal(t, "application/xml", r.Header.Get("Accept"))
@@ -130,7 +149,7 @@ func TestCreds(t *testing.T) {
 
 		withSTSServer(t, handler, func(client *http.Client) {
 			id, secret, region, token, expiration, err := WebIdentityCreds(client)
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			assert.Equal(t, "AKID", id)
 			assert.Equal(t, "SECRET", secret)
 			assert.Equal(t, "us-west-1", region)
@@ -148,36 +167,90 @@ func TestCreds(t *testing.T) {
 		t.Setenv("HOME", t.TempDir())
 
 		id, secret, region, token, err := AmbientCreds("")
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		assert.Equal(t, "AKID", id)
 		assert.Equal(t, "SECRET", secret)
 		assert.Equal(t, "us-east-2", region)
 		assert.Equal(t, "TOKEN", token)
+	})
+	t.Run("file profiles", func(t *testing.T) {
+		for _, profile := range []string{"default", "named"} {
+			t.Run(profile, func(t *testing.T) {
+				dir := t.TempDir()
+				config := filepath.Join(dir, "config")
+				credentials := filepath.Join(dir, "credentials")
+				section := profile
+				if profile != "default" {
+					section = "profile " + profile
+				}
+				require.NoError(t, os.WriteFile(config, []byte("["+section+"]\nregion=us-east-2\n"), 0600))
+				require.NoError(t, os.WriteFile(credentials, []byte("["+profile+"]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\naws_session_token=TOKEN\n"), 0600))
+				t.Setenv("AWS_CONFIG_FILE", config)
+				t.Setenv("AWS_SHARED_CREDENTIALS_FILE", credentials)
+				t.Setenv("AWS_PROFILE", profile)
+				id, secret, region, token, err := AmbientCreds("")
+				require.NoError(t, err)
+				assert.Equal(t, "AKID", id)
+				assert.Equal(t, "SECRET", secret)
+				assert.Equal(t, "us-east-2", region)
+				assert.Equal(t, "TOKEN", token)
+			})
+		}
 	})
 
 	t.Run("load credentials", func(t *testing.T) {
 		dir := t.TempDir()
 		path := filepath.Join(dir, "credentials")
 
-		assert.NoError(t, os.WriteFile(path, []byte("[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n"), 0644))
+		require.NoError(t, os.WriteFile(path, []byte("[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n"), 0644))
 
-		id, secret, err := loadCredentials(path, "default")
-		assert.NoError(t, err)
+		id, secret, token, err := loadCredentials(path, "default")
+		require.NoError(t, err)
 		assert.Equal(t, "AKID", id)
 		assert.Equal(t, "SECRET", secret)
+		assert.Empty(t, token)
+	})
+
+	t.Run("check special file", func(t *testing.T) {
+		reader, writer, err := os.Pipe()
+		require.NoError(t, err)
+		t.Cleanup(func() {
+			assert.NoError(t, reader.Close())
+			assert.NoError(t, writer.Close())
+		})
+
+		info, err := reader.Stat()
+		require.NoError(t, err)
+		assert.ErrorContains(t, check(info), "is a special file")
+	})
+
+	t.Run("check permissions", func(t *testing.T) {
+		path := filepath.Join(t.TempDir(), "credentials")
+		require.NoError(t, os.WriteFile(path, nil, 0600))
+		if runtime.GOOS != "windows" {
+			require.NoError(t, os.Chmod(path, 0666))
+		}
+
+		info, err := os.Stat(path)
+		require.NoError(t, err)
+		if runtime.GOOS == "windows" {
+			assert.NoError(t, check(info))
+			return
+		}
+		assert.ErrorContains(t, check(info), "is world-writeable")
 	})
 
 	t.Run("ambient local", func(t *testing.T) {
-		wd, _ := os.Getwd()
+		wd := t.TempDir()
+		t.Chdir(wd)
 		path := filepath.Join(wd, ".aws", "credentials")
-		defer os.RemoveAll(filepath.Dir(path))
 
-		assert.NoError(t, os.MkdirAll(filepath.Dir(path), os.ModePerm))
-		assert.NoError(t, os.WriteFile(path, []byte("[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n"), 0644))
+		require.NoError(t, os.MkdirAll(filepath.Dir(path), os.ModePerm))
+		require.NoError(t, os.WriteFile(path, []byte("[default]\naws_access_key_id=AKID\naws_secret_access_key=SECRET\n"), 0644))
 
 		// Verify that the credentials are loaded from the local file
 		id, secret, region, token, err := AmbientCreds("eu-central-1")
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		assert.Equal(t, "AKID", id)
 		assert.Equal(t, "SECRET", secret)
 		assert.Equal(t, "eu-central-1", region)
@@ -185,8 +258,8 @@ func TestCreds(t *testing.T) {
 
 		// Verify that the credentials are loaded from the local file
 		key, err := AmbientKey("s3", "eu-central-1", DefaultDerive)
-		assert.NoError(t, err)
-		assert.NotNil(t, key)
+		require.NoError(t, err)
+		require.NotNil(t, key)
 		assert.Equal(t, "AKID", key.AccessKey)
 		assert.Equal(t, "SECRET", key.Secret)
 		assert.Equal(t, "eu-central-1", key.Region)

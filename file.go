@@ -21,6 +21,7 @@ import (
 	"io"
 	"io/fs"
 	"path"
+	"slices"
 	"strings"
 	"time"
 
@@ -66,6 +67,9 @@ func (f *File) Open() (fs.File, error) { return f, nil }
 // If you need to read a sub-range of the
 // object, consider using f.Reader.RangeReader
 func (f *File) Read(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
 	if f.body != nil {
 		n, err := f.body.Read(p)
 		f.pos += int64(n)
@@ -77,6 +81,9 @@ func (f *File) Read(p []byte) (int, error) {
 		// reading the response fast enough
 		f.body.Close()
 		f.body = nil
+	}
+	if f.pos >= f.Reader.Size {
+		return 0, io.EOF
 	}
 
 	body, err := f.Reader.RangeReader(f.pos, f.Size()-f.pos)
@@ -90,6 +97,11 @@ func (f *File) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// WriteTo implements io.WriterTo using the file's current position and body.
+func (f *File) WriteTo(w io.Writer) (int64, error) {
+	return io.Copy(w, struct{ io.Reader }{f})
+}
+
 // Info implements fs.DirEntry.Info
 //
 // Info returns exactly the same thing as f.Stat
@@ -99,8 +111,8 @@ func (f *File) Info() (fs.FileInfo, error) {
 
 // Type implements fs.DirEntry.Type
 //
-// Type returns exactly the same thing as f.Mode
-func (f *File) Type() fs.FileMode { return f.Mode() }
+// Type returns only the file type bits.
+func (f *File) Type() fs.FileMode { return f.Mode().Type() }
 
 // Close implements fs.File.Close
 func (f *File) Close() error {
@@ -127,7 +139,7 @@ func (f *File) Seek(offset int64, whence int) (int64, error) {
 	case io.SeekEnd:
 		newpos = f.Reader.Size + offset
 	default:
-		panic("invalid seek whence")
+		return f.pos, fmt.Errorf("invalid seek whence %d", whence)
 	}
 	if newpos < 0 || newpos > f.Reader.Size {
 		return f.pos, fmt.Errorf("invalid seek offset %d", newpos)
@@ -187,30 +199,32 @@ func (p *Prefix) VisitDir(name, seek, pattern string, walk fsutil.VisitDirFn) er
 			subp.Path += "/"
 		}
 	}
-	token := ""
-	for {
+	var entries []fs.DirEntry
+	for token := ""; ; {
 		d, tok, err := subp.readDirAt(-1, token, seek, pattern)
 		if err != nil && err != io.EOF {
 			return &fs.PathError{Op: "visit", Path: subp.Path, Err: err}
 		}
-
-		// despite being called "start-after", the
-		// S3 API includes the seek key in the list
-		// response, which is not consistent with
-		// fsutil.VisitDir, so filter it out here...
-		if len(d) > 0 && d[0].Name() == seek {
-			d = d[1:]
+		if len(entries) == 0 {
+			entries = d
+		} else {
+			entries = append(entries, d...)
 		}
-
-		for i := range d {
-			err := walk(d[i])
-			if err != nil {
-				return err
-			}
-		}
-		if err == io.EOF {
-			return nil
+		if err == io.EOF || tok == "" {
+			break
 		}
 		token = tok
 	}
+	// S3 orders prefixes with their trailing slash, which can put a directory
+	// name before files from earlier pages once that slash is removed.
+	slices.SortFunc(entries, func(a, b fs.DirEntry) int { return strings.Compare(a.Name(), b.Name()) })
+	for _, entry := range entries {
+		if entry.Name() <= seek {
+			continue
+		}
+		if err := walk(entry); err != nil {
+			return err
+		}
+	}
+	return nil
 }

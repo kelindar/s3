@@ -1,0 +1,826 @@
+package s3
+
+import (
+	"context"
+	"crypto/hmac"
+	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"slices"
+	"strings"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/kelindar/s3/aws"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/valyala/fasthttp"
+)
+
+func doSigned(ctx context.Context, key *aws.SigningKey, method, uri string, body []byte) (*response, error) {
+	switch {
+	case ctx == nil:
+		return nil, errors.New("s3 request: nil context")
+	case ctx.Err() != nil:
+		return nil, ctx.Err()
+	}
+	req := fasthttp.AcquireRequest()
+	defer fasthttp.ReleaseRequest(req)
+	req.SetRequestURI(uri)
+	req.Header.SetMethod(method)
+	signRequest(key, req, body)
+	return flakyFast(ctx, req)
+}
+
+func BenchmarkRequest(b *testing.B) {
+	for _, object := range []string{"object", "folder/a b+%&☃"} {
+		b.Run(object, func(b *testing.B) {
+			key := aws.DeriveKey("", "access", "secret", "us-east-1", "s3")
+			var req fasthttp.Request
+			setURI(&req, key, "bucket", object, "")
+			signRequest(key, &req, nil)
+			b.ReportAllocs()
+			b.ResetTimer()
+			for range b.N {
+				req.Reset()
+				setURI(&req, key, "bucket", object, "")
+				signRequest(key, &req, nil)
+			}
+		})
+	}
+}
+
+func TestHTTPS(t *testing.T) {
+	for _, test := range []struct {
+		name, method, target            string
+		bucket, object, endpoint, query string
+		body                            []byte
+		headers                         [][2]string
+		untrusted                       bool
+	}{
+		{name: "empty", method: http.MethodGet, target: "/"},
+		{name: "payload", method: http.MethodPut, target: "/a/../b%2Fc%2B%26%E2%98%83?partNumber=1&uploadId=id%2B%2F%3D", body: []byte("payload")},
+		{name: "conditional", method: http.MethodPut, target: "/bucket/object", body: []byte("payload"), headers: [][2]string{{"if-match", `"etag"`}, {"if-unmodified-since", "Tue, 15 Nov 1994 08:12:31 GMT"}}},
+		{name: "copy", method: http.MethodPut, target: "/bucket/object?partNumber=1&uploadId=id%2B%2F%3D", headers: [][2]string{{"x-amz-copy-source", "/bucket/a%20b%25"}, {"x-amz-copy-source-if-match", `"etag"`}, {"x-amz-copy-source-range", "bytes=1-5242880"}}},
+		{name: "header whitespace", method: http.MethodPut, target: "/bucket/object", headers: [][2]string{{"if-unmodified-since", "  Tue,  15\tNov 1994 08:12:31 GMT  "}}},
+		{name: "native object", method: http.MethodPut, target: "/bucket/folder/a%20b%2B%25%26%E2%98%83", bucket: "bucket", object: "folder/a b+%&☃", body: []byte("payload")},
+		{name: "native endpoint", method: http.MethodPut, target: "/gateway/s3/bucket/a/../b//c%20d", bucket: "bucket", object: "a/../b//c d", endpoint: "/gateway/s3", body: []byte("payload")},
+		{name: "native multipart", method: http.MethodPut, target: "/gateway/s3/bucket.name/folder/a%2Bb?partNumber=1&uploadId=id%2B%2F%3D", bucket: "bucket.name", object: "folder/a+b", endpoint: "/gateway/s3", query: "partNumber=1&uploadId=id%2B%2F%3D", body: []byte("part payload")},
+		{name: "untrusted", method: http.MethodGet, target: "/", untrusted: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			names := []string{"host", "x-amz-content-sha256", "x-amz-date", "x-amz-security-token"}
+			for _, header := range test.headers {
+				names = append(names, header[0])
+			}
+			slices.Sort(names)
+			signed := strings.Join(names, ";")
+			var requests atomic.Int32
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+				requests.Add(1)
+				assert.NotNil(t, req.TLS)
+				assert.Equal(t, test.method, req.Method)
+				assert.Equal(t, test.target, req.RequestURI)
+				assert.Equal(t, "session-token", req.Header.Get("X-Amz-Security-Token"))
+				body, err := io.ReadAll(req.Body)
+				assert.NoError(t, err)
+				assert.Equal(t, string(test.body), string(body))
+				stamp := req.Header.Get("X-Amz-Date")
+				if _, err := time.Parse("20060102T150405Z", stamp); !assert.NoError(t, err) {
+					w.WriteHeader(http.StatusForbidden)
+					return
+				}
+				payload := fmt.Sprintf("%x", sha256.Sum256(nil))
+				if test.body != nil {
+					payload = "UNSIGNED-PAYLOAD"
+				}
+				assert.Equal(t, payload, req.Header.Get("X-Amz-Content-Sha256"))
+
+				// Rebuild SigV4 independently from the request received over TLS.
+				// https://docs.aws.amazon.com/IAM/latest/UserGuide/reference_sigv-create-signed-request.html
+				var canonical strings.Builder
+				fmt.Fprintf(&canonical, "%s\n%s\n%s\n", req.Method, req.URL.EscapedPath(), strings.ReplaceAll(req.URL.Query().Encode(), "+", "%20"))
+				for _, name := range names {
+					value := req.Header.Get(name)
+					if name == "host" {
+						value = req.Host
+					}
+					value = strings.Join(strings.FieldsFunc(strings.TrimSpace(value), func(r rune) bool { return r == ' ' }), " ")
+					fmt.Fprintf(&canonical, "%s:%s\n", name, value)
+				}
+				fmt.Fprintf(&canonical, "\n%s\n%s", signed, payload)
+				scope := stamp[:8] + "/us-east-1/s3/aws4_request"
+				toSign := fmt.Sprintf("AWS4-HMAC-SHA256\n%s\n%s\n%x", stamp, scope, sha256.Sum256([]byte(canonical.String())))
+				key := []byte("AWS4test-secret")
+				for _, value := range []string{stamp[:8], "us-east-1", "s3", "aws4_request", toSign} {
+					hash := hmac.New(sha256.New, key)
+					_, _ = hash.Write([]byte(value))
+					key = hash.Sum(nil)
+				}
+				want := fmt.Sprintf("AWS4-HMAC-SHA256 Credential=test-access/%s, SignedHeaders=%s, Signature=%x", scope, signed, key)
+				assert.Equal(t, want, req.Header.Get("Authorization"))
+				_, _ = io.WriteString(w, "response")
+			}))
+			defer server.Close()
+
+			original := defaultClient
+			client := newClient(original.Dial)
+			if !test.untrusted {
+				roots := x509.NewCertPool()
+				roots.AddCert(server.Certificate())
+				client.TLSConfig = &tls.Config{RootCAs: roots}
+			}
+			defaultClient = client
+			t.Cleanup(func() {
+				client.CloseIdleConnections()
+				defaultClient = original
+			})
+			key := aws.DeriveKey(server.URL+test.endpoint, "test-access", "test-secret", "us-east-1", "s3")
+			key.Token = "session-token"
+			var req *fasthttp.Request
+			switch {
+			case test.query != "":
+				u := uploader{Key: key, Bucket: test.bucket, Object: test.object}
+				req = u.signedRequest(test.method, test.query, test.body, test.headers...)
+			default:
+				req = fasthttp.AcquireRequest()
+				if test.bucket != "" {
+					setURI(req, key, test.bucket, test.object, "")
+				} else {
+					req.SetRequestURI(server.URL + test.target)
+				}
+				req.Header.SetMethod(test.method)
+				signRequest(key, req, test.body, test.headers...)
+			}
+			defer fasthttp.ReleaseRequest(req)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			res, err := flakyFast(ctx, req)
+			if test.untrusted {
+				var certificate x509.UnknownAuthorityError
+				assert.ErrorAs(t, err, &certificate)
+				assert.Zero(t, requests.Load())
+				return
+			}
+			require.NoError(t, err)
+			defer res.Body.Close()
+			body, err := io.ReadAll(res.Body)
+			require.NoError(t, err)
+			assert.Equal(t, "response", string(body))
+			assert.EqualValues(t, 1, requests.Load())
+		})
+	}
+}
+
+func TestConnectionWait(t *testing.T) {
+	for _, name := range []string{"release", "cancel", "deadline"} {
+		t.Run(name, func(t *testing.T) {
+			previous := defaultClient
+			client := newClient(previous.Dial)
+			client.MaxConnsPerHost = 1
+			defaultClient = client
+			defer func() {
+				client.CloseIdleConnections()
+				defaultClient = previous
+			}()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.WriteString(w, "body")
+			}))
+			defer server.Close()
+			key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
+			first, err := doSigned(context.Background(), key, http.MethodGet, server.URL, nil)
+			require.NoError(t, err)
+			defer first.Body.Close()
+
+			ctx := context.Background()
+			cancel := func() {}
+			switch name {
+			case "cancel":
+				ctx, cancel = context.WithCancel(ctx)
+			case "deadline":
+				ctx, cancel = context.WithTimeout(ctx, 200*time.Millisecond)
+			}
+			defer cancel()
+			finished := make(chan error, 1)
+			go func() {
+				res, err := doSigned(ctx, key, http.MethodGet, server.URL, nil)
+				if res != nil {
+					_, err = io.Copy(io.Discard, res.Body)
+					_ = res.Body.Close()
+				}
+				finished <- err
+			}()
+			select {
+			case err := <-finished:
+				t.Fatalf("request returned while the connection was occupied: %v", err)
+			case <-time.After(20 * time.Millisecond):
+			}
+
+			switch name {
+			case "release":
+				_, err := io.Copy(io.Discard, first.Body)
+				require.NoError(t, err)
+				require.NoError(t, first.Body.Close())
+			case "cancel":
+				cancel()
+			}
+			select {
+			case err := <-finished:
+				switch name {
+				case "release":
+					assert.NoError(t, err)
+				case "cancel":
+					assert.ErrorIs(t, err, context.Canceled)
+				case "deadline":
+					assert.ErrorIs(t, err, context.DeadlineExceeded)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("request did not stop after release or cancellation")
+			}
+		})
+	}
+}
+
+func TestClient(t *testing.T) {
+	t.Run("lost conditional response", func(t *testing.T) {
+		for name, condition := range map[string]Condition{"create": IfNoneMatch("*"), "replace": IfMatch("old")} {
+			t.Run(name, func(t *testing.T) {
+				var attempts atomic.Int32
+				var stored atomic.Value
+				stored.Store("")
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					body, err := io.ReadAll(r.Body)
+					if !assert.NoError(t, err) {
+						return
+					}
+					if attempts.Add(1) == 1 {
+						stored.Store(string(body))
+						conn, _, err := w.(http.Hijacker).Hijack()
+						if assert.NoError(t, err) {
+							_ = conn.Close()
+						}
+						return
+					}
+					w.WriteHeader(http.StatusPreconditionFailed)
+				}))
+				defer server.Close()
+				key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
+				_, applied, err := NewBucket(key, "bucket").WriteIf(context.Background(), "object", []byte("written"), condition)
+				assert.Equal(t, "written", stored.Load())
+				assert.Error(t, err, "the outcome is uncertain after a committed write loses its response")
+				assert.False(t, applied)
+				assert.EqualValues(t, 1, attempts.Load())
+			})
+		}
+	})
+
+	t.Run("write snapshot headers", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "match", r.Header.Get("If-Match"))
+			assert.Contains(t, r.Header.Get("Authorization"), "SignedHeaders=host;if-match;x-amz-content-sha256;x-amz-date")
+			w.WriteHeader(http.StatusPreconditionFailed)
+		}))
+		defer server.Close()
+		key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
+		reader := &Reader{Key: key, Bucket: "bucket", Path: "object", ETag: "match"}
+		n, err := reader.WriteTo(io.Discard)
+		assert.ErrorIs(t, err, ErrETagChanged)
+		assert.Zero(t, n)
+	})
+	t.Run("full copy rejects partial response", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Empty(t, r.Header.Get("Range"))
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = io.WriteString(w, "partial")
+		}))
+		defer server.Close()
+		key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
+		reader := &Reader{Key: key, Bucket: "bucket", Path: "object"}
+		n, err := reader.WriteTo(io.Discard)
+		assert.Error(t, err)
+		assert.Zero(t, n)
+	})
+
+	t.Run("exact body reuse", func(t *testing.T) {
+		var connections atomic.Int32
+		server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+			w.Header().Set("Content-Length", "4")
+			_, _ = io.WriteString(w, "body")
+		}))
+		server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+			if state == http.StateNew {
+				connections.Add(1)
+			}
+		}
+		server.Start()
+		defer server.Close()
+		key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
+		for range 2 {
+			res, err := doSigned(context.Background(), key, http.MethodGet, server.URL, nil)
+			require.NoError(t, err)
+			var data [4]byte
+			_, err = io.ReadFull(res.Body, data[:])
+			closeErr := res.Body.Close()
+			require.NoError(t, err)
+			assert.NoError(t, closeErr)
+			assert.Equal(t, "body", string(data[:]))
+		}
+		assert.EqualValues(t, 1, connections.Load())
+	})
+	t.Run("conditional failure does not retry", func(t *testing.T) {
+		var attempts atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "match", r.Header.Get("If-Match"))
+			assert.Equal(t, "Tue, 15 Nov 1994 08:12:31 GMT", r.Header.Get("If-Unmodified-Since"))
+			assert.Contains(t, r.Header.Get("Authorization"), "SignedHeaders=host;if-match;if-unmodified-since;x-amz-content-sha256;x-amz-date")
+			body, err := io.ReadAll(r.Body)
+			assert.NoError(t, err)
+			assert.Equal(t, "payload", string(body))
+			attempts.Add(1)
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}))
+		defer server.Close()
+		key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
+		etag, applied, err := NewBucket(key, "bucket").WriteIf(context.Background(), "object", []byte("payload"), func(header http.Header) error {
+			header.Set("If-Match", "match")
+			header.Set("If-Unmodified-Since", "Tue, 15 Nov 1994 08:12:31 GMT")
+			return nil
+		})
+		assert.Error(t, err)
+		assert.False(t, applied)
+		assert.Empty(t, etag)
+		assert.EqualValues(t, 1, attempts.Load())
+	})
+
+	t.Run("range headers", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "bytes=2-4", r.Header.Get("Range"))
+			assert.Equal(t, "match", r.Header.Get("If-Match"))
+			assert.Contains(t, r.Header.Get("Authorization"), "SignedHeaders=host;if-match;x-amz-content-sha256;x-amz-date")
+			w.WriteHeader(http.StatusPartialContent)
+			_, _ = io.WriteString(w, "cde")
+		}))
+		defer server.Close()
+		key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
+		reader := &Reader{Key: key, Bucket: "bucket", Path: "object", ETag: "match"}
+		body, err := reader.RangeReader(2, 3)
+		require.NoError(t, err)
+		defer body.Close()
+		contents, err := io.ReadAll(body)
+		require.NoError(t, err)
+		assert.Equal(t, "cde", string(contents))
+	})
+
+	t.Run("copy headers and retry", func(t *testing.T) {
+		var attempts atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "id+/=", r.URL.Query().Get("uploadId"))
+			assert.Equal(t, "/bucket/a%20b%25", r.Header.Get("X-Amz-Copy-Source"))
+			assert.Equal(t, "match", r.Header.Get("X-Amz-Copy-Source-If-Match"))
+			assert.Equal(t, "bytes=1-5242880", r.Header.Get("X-Amz-Copy-Source-Range"))
+			assert.Contains(t, r.Header.Get("Authorization"), "SignedHeaders=host;x-amz-content-sha256;x-amz-copy-source;x-amz-copy-source-if-match;x-amz-copy-source-range;x-amz-date")
+			if attempts.Add(1) == 1 {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = io.WriteString(w, "retry")
+				return
+			}
+			_, _ = io.WriteString(w, `<CopyPartResult><ETag>copied</ETag></CopyPartResult>`)
+		}))
+		defer server.Close()
+		key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
+		u := &uploader{Key: key, Bucket: "bucket", Object: "object", id: "id+/=", started: true}
+		require.NoError(t, u.CopyFrom(context.Background(), 1, &Reader{Bucket: "bucket", Path: "a b%", ETag: "match", Size: MinPartSize + 1}, 1, MinPartSize+1))
+		require.Len(t, u.parts, 1)
+		assert.Equal(t, "copied", u.parts[0].ETag)
+		assert.EqualValues(t, 2, attempts.Load())
+	})
+
+	t.Run("abort does not retry", func(t *testing.T) {
+		var attempts atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			attempts.Add(1)
+			assert.Equal(t, http.MethodDelete, r.Method)
+			assert.Equal(t, "id+/=", r.URL.Query().Get("uploadId"))
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}))
+		defer server.Close()
+		key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
+		u := &uploader{Key: key, Bucket: "bucket", Object: "object", id: "id+/=", started: true}
+		assert.Error(t, u.Abort(context.Background()))
+		assert.EqualValues(t, 1, attempts.Load())
+		assert.True(t, u.started)
+	})
+
+	t.Run("connection reuse", func(t *testing.T) {
+		for _, name := range []string{"background", "cancel", "deadline"} {
+			t.Run(name, func(t *testing.T) {
+				var connections atomic.Int32
+				server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					_, _ = io.WriteString(w, "body")
+				}))
+				server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+					if state == http.StateNew {
+						connections.Add(1)
+					}
+				}
+				server.Start()
+				defer server.Close()
+
+				ctx := context.Background()
+				switch name {
+				case "cancel":
+					var cancel context.CancelFunc
+					ctx, cancel = context.WithCancel(ctx)
+					defer cancel()
+				case "deadline":
+					var cancel context.CancelFunc
+					ctx, cancel = context.WithTimeout(ctx, time.Second)
+					defer cancel()
+				}
+				key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
+				for range 2 {
+					res, err := doSigned(ctx, key, http.MethodGet, server.URL, nil)
+					require.NoError(t, err)
+					_, err = io.Copy(io.Discard, res.Body)
+					closeErr := res.Body.Close()
+					require.NoError(t, err)
+					require.NoError(t, closeErr)
+				}
+				assert.EqualValues(t, 1, connections.Load(), "a live context must not disable connection reuse")
+			})
+		}
+	})
+
+	t.Run("header timeout excludes body", func(t *testing.T) {
+		// Scale the default header limit down to avoid waiting a minute in the test.
+		const headerTimeout = 100 * time.Millisecond
+		previous := defaultClient
+		client := newClient(previous.Dial)
+		client.ReadTimeout = headerTimeout
+		defaultClient = client
+		defer func() {
+			client.CloseIdleConnections()
+			defaultClient = previous
+		}()
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Length", "4")
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			time.Sleep(3 * headerTimeout)
+			_, _ = io.WriteString(w, "body")
+		}))
+		defer server.Close()
+		key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
+		res, err := doSigned(context.Background(), key, http.MethodGet, server.URL, nil)
+		require.NoError(t, err)
+		defer res.Body.Close()
+		body, err := io.ReadAll(res.Body)
+		assert.NoError(t, err)
+		assert.Equal(t, "body", string(body))
+	})
+
+	t.Run("header timeout enforced", func(t *testing.T) {
+		previous := defaultClient
+		client := newClient(previous.Dial)
+		client.ReadTimeout = 20 * time.Millisecond
+		defaultClient = client
+		defer func() {
+			client.CloseIdleConnections()
+			defaultClient = previous
+		}()
+		release := make(chan struct{})
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			<-release
+		}))
+		defer server.Close()
+		defer close(release)
+		req := fasthttp.AcquireRequest()
+		defer fasthttp.ReleaseRequest(req)
+		req.SetRequestURI(server.URL)
+		res, err := doFastRequest(context.Background(), req)
+		assert.Nil(t, res)
+		assert.ErrorIs(t, err, fasthttp.ErrTimeout)
+	})
+
+	t.Run("released cancellation", func(t *testing.T) {
+		var connections atomic.Int32
+		var requests atomic.Int32
+		release := make(chan struct{})
+		server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Length", "4")
+			if requests.Add(1) == 2 {
+				w.WriteHeader(http.StatusOK)
+				w.(http.Flusher).Flush()
+				<-release
+			}
+			_, _ = io.WriteString(w, "body")
+		}))
+		server.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+			if state == http.StateNew {
+				connections.Add(1)
+			}
+		}
+		server.Start()
+		defer server.Close()
+		defer close(release)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
+		first, err := doSigned(ctx, key, http.MethodGet, server.URL, nil)
+		require.NoError(t, err)
+		_, err = io.Copy(io.Discard, first.Body)
+		closeErr := first.Body.Close()
+		require.NoError(t, err)
+		require.NoError(t, closeErr)
+		second, err := doSigned(context.Background(), key, http.MethodGet, server.URL, nil)
+		require.NoError(t, err)
+		defer second.Body.Close()
+		cancel()
+		time.Sleep(20 * time.Millisecond)
+		release <- struct{}{}
+		body, err := io.ReadAll(second.Body)
+		assert.NoError(t, err)
+		assert.Equal(t, "body", string(body))
+		assert.EqualValues(t, 1, connections.Load())
+	})
+
+	t.Run("cancel during dial", func(t *testing.T) {
+		started := make(chan struct{})
+		release := make(chan struct{})
+		peers := make(chan net.Conn, 1)
+		previous := defaultClient
+		client := newClient(func(string) (net.Conn, error) {
+			close(started)
+			<-release
+			conn, peer := net.Pipe()
+			_ = peer.SetReadDeadline(time.Now().Add(time.Second))
+			peers <- peer
+			return conn, nil
+		})
+		defaultClient = client
+		defer func() {
+			client.CloseIdleConnections()
+			defaultClient = previous
+		}()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		key := aws.DeriveKey("", "access", "secret", "us-east-1", "s3")
+		finished := make(chan error, 1)
+		go func() {
+			res, err := doSigned(ctx, key, http.MethodGet, "http://127.0.0.1:1", nil)
+			if res != nil {
+				_ = res.Body.Close()
+			}
+			finished <- err
+		}()
+		<-started
+		cancel()
+		select {
+		case err := <-finished:
+			assert.ErrorIs(t, err, context.Canceled)
+		case <-time.After(time.Second):
+			t.Error("request did not stop during dialing")
+		}
+		close(release)
+		peer := <-peers
+		defer peer.Close()
+		var data [1]byte
+		_, err := peer.Read(data[:])
+		assert.ErrorIs(t, err, io.EOF, "a lease acquired after cancellation must be closed")
+	})
+
+	t.Run("close blocked read", func(t *testing.T) {
+		release := make(chan struct{})
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Length", "4")
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			<-release
+		}))
+		defer server.Close()
+		defer close(release)
+		key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
+		res, err := doSigned(context.Background(), key, http.MethodGet, server.URL, nil)
+		require.NoError(t, err)
+		defer res.Body.Close()
+		finished := make(chan error, 1)
+		go func() {
+			_, err := io.ReadAll(res.Body)
+			finished <- err
+		}()
+		assert.Eventually(t, func() bool {
+			if res.Body.readLock.TryLock() {
+				res.Body.readLock.Unlock()
+				return false
+			}
+			return true
+		}, time.Second, time.Millisecond)
+		assert.NoError(t, res.Body.Close())
+		select {
+		case err := <-finished:
+			assert.Error(t, err)
+		case <-time.After(time.Second):
+			t.Error("body read did not stop after closing")
+		}
+	})
+
+	t.Run("blocked body cancellation", func(t *testing.T) {
+		for _, test := range []struct {
+			name string
+			err  error
+		}{
+			{name: "cancel", err: context.Canceled},
+			{name: "deadline", err: context.DeadlineExceeded},
+		} {
+			t.Run(test.name, func(t *testing.T) {
+				release := make(chan struct{})
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					w.Header().Set("Content-Length", "4")
+					w.WriteHeader(http.StatusOK)
+					w.(http.Flusher).Flush()
+					<-release
+				}))
+				defer server.Close()
+				defer close(release)
+				ctx, cancel := context.WithCancel(context.Background())
+				if test.err == context.DeadlineExceeded {
+					cancel()
+					ctx, cancel = context.WithTimeout(context.Background(), 100*time.Millisecond)
+				}
+				defer cancel()
+				key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
+				res, err := doSigned(ctx, key, http.MethodGet, server.URL, nil)
+				require.NoError(t, err)
+				defer res.Body.Close()
+				if test.err == context.Canceled {
+					stop := time.AfterFunc(20*time.Millisecond, cancel)
+					defer stop.Stop()
+				}
+				_, err = io.ReadAll(res.Body)
+				assert.ErrorIs(t, err, test.err)
+			})
+		}
+	})
+
+	t.Run("signed cancellation", func(t *testing.T) {
+		key := aws.DeriveKey("http://127.0.0.1:1", "access", "secret", "us-east-1", "s3")
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		res, err := doObject(ctx, key, http.MethodGet, "bucket", "object", nil)
+		assert.Nil(t, res)
+		assert.ErrorIs(t, err, context.Canceled)
+		res, err = doObject(nil, key, http.MethodGet, "bucket", "object", nil)
+		assert.Nil(t, res)
+		assert.Error(t, err)
+	})
+
+	t.Run("signed request", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "/a/../b%2Fc%2B%26", r.URL.EscapedPath())
+			assert.Equal(t, "a=1&b=%2B", r.URL.RawQuery)
+			assert.Equal(t, http.MethodPut, r.Method)
+			assert.Equal(t, "session-token", r.Header.Get("X-Amz-Security-Token"))
+			assert.Equal(t, "UNSIGNED-PAYLOAD", r.Header.Get("X-Amz-Content-Sha256"))
+			assert.Contains(t, r.Header.Get("Authorization"), "SignedHeaders=host;x-amz-content-sha256;x-amz-date;x-amz-security-token")
+			_, err := time.Parse("20060102T150405Z", r.Header.Get("X-Amz-Date"))
+			assert.NoError(t, err)
+			body, err := io.ReadAll(r.Body)
+			assert.NoError(t, err)
+			assert.Equal(t, []byte("payload"), body)
+			_, _ = w.Write([]byte("response"))
+		}))
+		defer server.Close()
+		key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
+		key.Token = "session-token"
+		res, err := doSigned(context.Background(), key, http.MethodPut, server.URL+"/a/../b%2Fc%2B%26?a=1&b=%2B", []byte("payload"))
+		require.NoError(t, err)
+		defer res.Body.Close()
+		body, err := io.ReadAll(res.Body)
+		require.NoError(t, err)
+		assert.Equal(t, []byte("response"), body)
+	})
+
+	t.Run("path and response", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "/a/../b%2Fc", r.URL.EscapedPath())
+			assert.Equal(t, "match", r.Header.Get("If-Match"))
+			w.Header().Set("ETag", `"tag"`)
+			_, _ = w.Write([]byte("payload"))
+		}))
+		defer server.Close()
+		req := fasthttp.AcquireRequest()
+		defer fasthttp.ReleaseRequest(req)
+		req.SetRequestURI(server.URL + "/a/../b%2Fc")
+		req.Header.Set("If-Match", "match")
+		res, err := doFastRequest(context.Background(), req)
+		require.NoError(t, err)
+		defer res.Body.Close()
+		assert.Equal(t, http.StatusOK, res.StatusCode)
+		assert.Equal(t, int64(7), res.ContentLength)
+		assert.Equal(t, `"tag"`, res.Header.Get("ETag"))
+		body, err := io.ReadAll(res.Body)
+		require.NoError(t, err)
+		assert.Equal(t, []byte("payload"), body)
+		assert.NoError(t, res.Body.Close())
+		_, err = res.Body.Read(make([]byte, 1))
+		assert.ErrorIs(t, err, io.ErrClosedPipe)
+	})
+
+	t.Run("retry body", func(t *testing.T) {
+		var attempts atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			body, err := io.ReadAll(r.Body)
+			assert.NoError(t, err)
+			assert.Equal(t, []byte("payload"), body)
+			if attempts.Add(1) == 1 {
+				w.WriteHeader(http.StatusServiceUnavailable)
+			}
+		}))
+		defer server.Close()
+		key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
+		res, err := doSigned(context.Background(), key, http.MethodPut, server.URL, []byte("payload"))
+		require.NoError(t, err)
+		defer res.Body.Close()
+		assert.Equal(t, http.StatusOK, res.StatusCode)
+		assert.Equal(t, int32(2), attempts.Load())
+	})
+
+	t.Run("deadline", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			time.Sleep(30 * time.Millisecond)
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer server.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Millisecond)
+		defer cancel()
+		req := fasthttp.AcquireRequest()
+		defer fasthttp.ReleaseRequest(req)
+		req.SetRequestURI(server.URL)
+		res, err := doFastRequest(ctx, req)
+		assert.Nil(t, res)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, context.DeadlineExceeded)
+	})
+
+	t.Run("cancelled body", func(t *testing.T) {
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			_, _ = w.Write([]byte("payload"))
+		}))
+		defer server.Close()
+		ctx, cancel := context.WithCancel(context.Background())
+		req := fasthttp.AcquireRequest()
+		defer fasthttp.ReleaseRequest(req)
+		req.SetRequestURI(server.URL)
+		res, err := doFastRequest(ctx, req)
+		require.NoError(t, err)
+		cancel()
+		var one [1]byte
+		_, err = res.Body.Read(one[:])
+		assert.ErrorIs(t, err, context.Canceled)
+		assert.NoError(t, res.Body.Close())
+	})
+
+	t.Run("cancel in flight", func(t *testing.T) {
+		started := make(chan struct{})
+		release := make(chan struct{})
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			close(started)
+			<-release
+			w.WriteHeader(http.StatusOK)
+		}))
+		defer server.Close()
+		defer close(release)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		req := fasthttp.AcquireRequest()
+		defer fasthttp.ReleaseRequest(req)
+		req.SetRequestURI(server.URL)
+		finished := make(chan error, 1)
+		go func() {
+			res, err := doFastRequest(ctx, req)
+			if res != nil {
+				_ = res.Body.Close()
+			}
+			finished <- err
+		}()
+		select {
+		case <-started:
+		case <-time.After(time.Second):
+			t.Fatal("request did not start")
+		}
+		cancel()
+		select {
+		case err := <-finished:
+			assert.ErrorIs(t, err, context.Canceled)
+		case <-time.After(time.Second):
+			t.Fatal("request did not stop after cancellation")
+		}
+	})
+}

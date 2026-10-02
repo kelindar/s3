@@ -17,37 +17,111 @@ package mock
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
+	"encoding/xml"
+	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptest"
 	"strconv"
 	"strings"
-	"sync"
 	"testing"
 
 	"github.com/kelindar/s3"
 	"github.com/kelindar/s3/aws"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/valyala/fasthttp"
 )
 
-func TestUploadIDConcurrent(t *testing.T) {
-	const count = 100
-	ids := make(chan string, count)
-	var group sync.WaitGroup
-	for range count {
-		group.Add(1)
-		go func() {
-			defer group.Done()
-			ids <- generateUploadID()
-		}()
-	}
-	group.Wait()
-	close(ids)
+func TestWriteMultipartXML(t *testing.T) {
+	var body bytes.Buffer
+	require.NoError(t, writeXMLFields(&body, "InitiateMultipartUploadResult",
+		"Bucket", "test", "Key", "a&b<key>", "UploadId", "id-1"))
+	var got InitiateMultipartUploadResponse
+	require.NoError(t, xml.Unmarshal(body.Bytes(), &got))
+	assert.Equal(t, "test", got.Bucket)
+	assert.Equal(t, "a&b<key>", got.Key)
+	assert.Equal(t, "id-1", got.UploadId)
+}
 
-	seen := make(map[string]struct{}, count)
-	for id := range ids {
-		assert.NotContains(t, seen, id)
-		seen[id] = struct{}{}
+func TestRequestLogging(t *testing.T) {
+	server := New("test-bucket", "us-east-1")
+	defer server.Close()
+	put := func(content string) {
+		req := httptest.NewRequest(http.MethodPut, "/test-bucket/object", strings.NewReader(content))
+		server.ServeHTTP(httptest.NewRecorder(), req)
 	}
+
+	put("logged")
+	logs := server.GetRequestLog()
+	assert.Len(t, logs, 1)
+	assert.Equal(t, []byte("logged"), logs[0].Body)
+
+	server.SetRequestLogging(false)
+	put("not logged")
+	assert.Equal(t, 1, server.RequestCount())
+	content, ok := server.ObjectContent("object")
+	assert.True(t, ok)
+	assert.Equal(t, []byte("not logged"), content)
+
+	server.SetRequestLogging(true)
+	req := httptest.NewRequest(http.MethodGet, "/test-bucket/object", nil)
+	server.ServeHTTP(httptest.NewRecorder(), req)
+	assert.Equal(t, 2, server.RequestCount())
+}
+
+func TestFastMockParity(t *testing.T) {
+	server := New("test-bucket", "us-east-1")
+	defer server.Close()
+	server.SetRequestLogging(false)
+	server.PutObject("dir/key.txt", []byte("payload"))
+	server.PutObject("dir/sub/key.txt", []byte("nested"))
+	server.PutObject("dir/../odd.txt", []byte("dots"))
+
+	for _, tc := range []struct {
+		name, method, target string
+		headers              map[string]string
+	}{
+		{"list", http.MethodGet, "/test-bucket/?list-type=2&prefix=dir%2F&delimiter=%2F", nil},
+		{"page", http.MethodGet, "/test-bucket/?list-type=2&prefix=dir%2F&max-keys=1", nil},
+		{"get", http.MethodGet, "/test-bucket/dir/key.txt", nil},
+		{"head", http.MethodHead, "/test-bucket/dir/key.txt", nil},
+		{"range", http.MethodGet, "/test-bucket/dir/key.txt", map[string]string{"Range": "bytes=1-3"}},
+		{"if-match", http.MethodGet, "/test-bucket/dir/key.txt", map[string]string{"If-Match": "mismatch"}},
+		{"missing", http.MethodGet, "/test-bucket/missing", nil},
+		{"dot-segment", http.MethodGet, "/test-bucket/dir/../odd.txt", nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			request := httptest.NewRequest(tc.method, tc.target, nil)
+			var fastRequest fasthttp.Request
+			fastRequest.SetRequestURI(tc.target)
+			fastRequest.Header.SetMethod(tc.method)
+			for key, value := range tc.headers {
+				request.Header.Set(key, value)
+				fastRequest.Header.Set(key, value)
+			}
+			standard := httptest.NewRecorder()
+			server.ServeHTTP(standard, request)
+			var ctx fasthttp.RequestCtx
+			ctx.Init(&fastRequest, nil, nil)
+			server.fastHandler()(&ctx)
+			assert.Equal(t, standard.Code, ctx.Response.StatusCode())
+			assert.Equal(t, standard.Body.Bytes(), ctx.Response.Body())
+			for _, header := range []string{"Content-Type", "Content-Range", "Content-Length", "ETag", "Last-Modified"} {
+				if value := standard.Header().Get(header); value != "" {
+					assert.Equal(t, value, string(ctx.Response.Header.Peek(header)), header)
+				}
+			}
+		})
+	}
+	response, err := http.Get(server.URL() + "/test-bucket/dir/../odd.txt")
+	require.NoError(t, err)
+	defer response.Body.Close()
+	body, err := io.ReadAll(response.Body)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, response.StatusCode)
+	assert.Equal(t, []byte("dots"), body)
 }
 
 func TestServer(t *testing.T) {
@@ -198,14 +272,9 @@ func TestServer(t *testing.T) {
 		etag := mockServer.PutObject("head-test.txt", testContent)
 
 		// Test HEAD request directly using HTTP client to ensure handleHeadObject is tested
-		key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
-		key.BaseURI = mockServer.URL()
-
 		// Make a direct HEAD request to test the handler
 		req, err := http.NewRequest("HEAD", mockServer.URL()+"/test-bucket/head-test.txt", nil)
 		assert.NoError(t, err)
-
-		key.SignV4(req, nil)
 
 		client := &http.Client{}
 		resp, err := client.Do(req)
@@ -220,7 +289,6 @@ func TestServer(t *testing.T) {
 		// Test HEAD request for non-existent object
 		req2, err := http.NewRequest("HEAD", mockServer.URL()+"/test-bucket/non-existent.txt", nil)
 		assert.NoError(t, err)
-		key.SignV4(req2, nil)
 
 		resp2, err := client.Do(req2)
 		assert.NoError(t, err)
@@ -335,6 +403,14 @@ func TestServer(t *testing.T) {
 		finalContent, found := mockServer.ObjectContent("multipart-test.bin")
 		assert.True(t, found)
 		assert.Equal(t, testData, finalContent)
+		var partHashes []byte
+		for start := 0; start < len(testData); start += s3.MinPartSize {
+			sum := md5.Sum(testData[start:min(start+s3.MinPartSize, len(testData))])
+			partHashes = append(partHashes, sum[:]...)
+		}
+		object, found := mockServer.GetObject("multipart-test.bin")
+		require.True(t, found)
+		assert.Equal(t, fmt.Sprintf(`"%x-%d"`, md5.Sum(partHashes), len(partHashes)/md5.Size), object.ETag)
 
 		// Verify multipart upload requests were made
 		assert.True(t, mockServer.HasRequestWithMethod("POST")) // Initiate multipart
@@ -390,14 +466,11 @@ func TestServer(t *testing.T) {
 		assert.False(t, exists)
 
 		// Test S3 Select and multipart abort via direct HTTP
-		key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
-		key.BaseURI = mockServer.URL()
 		client := &http.Client{}
 
 		// Test S3 Select
 		mockServer.PutObject("test.json", []byte(`{"id": 1}`))
 		req, _ := http.NewRequest("POST", mockServer.URL()+"/test-bucket/test.json?select=", strings.NewReader("SELECT * FROM S3Object"))
-		key.SignV4(req, []byte("SELECT * FROM S3Object"))
 		resp, err := client.Do(req)
 		assert.NoError(t, err)
 		defer resp.Body.Close()
@@ -405,7 +478,6 @@ func TestServer(t *testing.T) {
 
 		// Test multipart initiate and abort
 		req2, _ := http.NewRequest("POST", mockServer.URL()+"/test-bucket/test.bin?uploads=", nil)
-		key.SignV4(req2, nil)
 		resp2, err := client.Do(req2)
 		assert.NoError(t, err)
 		defer resp2.Body.Close()
@@ -421,7 +493,6 @@ func TestServer(t *testing.T) {
 		}
 
 		req3, _ := http.NewRequest("DELETE", mockServer.URL()+"/test-bucket/test.bin?uploadId="+uploadID, nil)
-		key.SignV4(req3, nil)
 		resp3, err := client.Do(req3)
 		assert.NoError(t, err)
 		defer resp3.Body.Close()

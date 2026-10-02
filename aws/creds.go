@@ -17,6 +17,7 @@ package aws
 
 import (
 	"bufio"
+	"cmp"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -26,6 +27,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"time"
 )
@@ -86,9 +88,7 @@ func AmbientCreds(regionName string) (id, secret, region, token string, err erro
 	token = envdefault("", "AWS_SESSION_TOKEN")
 
 	// Resolve region if not provided
-	if region = regionName; regionName == "" {
-		region = envdefault(regionName, "AWS_REGION", "AWS_DEFAULT_REGION")
-	}
+	region = cmp.Or(regionName, envdefault("", "AWS_REGION", "AWS_DEFAULT_REGION"))
 
 	home, err := os.UserHomeDir()
 	if err != nil {
@@ -112,7 +112,11 @@ func AmbientCreds(regionName string) (id, secret, region, token string, err erro
 		defer f.Close()
 
 		var ssoStartURL string
-		err = scan(f, fmt.Sprintf("profile %s", profile), []scanspec{
+		section := profile
+		if profile != "default" {
+			section = "profile " + profile
+		}
+		err = scan(f, section, []scanspec{
 			{"region", &region},
 			{"sso_start_url", &ssoStartURL},
 		})
@@ -128,13 +132,10 @@ func AmbientCreds(regionName string) (id, secret, region, token string, err erro
 	if id == "" || secret == "" {
 		switch {
 		case fileExists(homeCred):
-			id, secret, err = loadCredentials(homeCred, profile)
+			id, secret, token, err = loadCredentials(homeCred, profile)
 		case fileExists(hereCred):
-			id, secret, err = loadCredentials(hereCred, profile)
+			id, secret, token, err = loadCredentials(hereCred, profile)
 		}
-
-		// credentials file never contain a session token, so it should be reset
-		token = ""
 	}
 
 	switch {
@@ -154,7 +155,7 @@ func WebIdentityCreds(client *http.Client) (id, secret, region, token string, ex
 	region = os.Getenv("AWS_REGION")
 	roleARN := os.Getenv("AWS_ROLE_ARN")
 	webIdentityTokenFile := os.Getenv("AWS_WEB_IDENTITY_TOKEN_FILE")
-	roleSessionName := os.Getenv("AWS_ROLE_SESSION_NAME")
+	roleSessionName := cmp.Or(os.Getenv("AWS_ROLE_SESSION_NAME"), "default")
 	switch {
 	case region == "":
 		return "", "", "", "", time.Time{}, fmt.Errorf("AWS_REGION not set")
@@ -163,18 +164,13 @@ func WebIdentityCreds(client *http.Client) (id, secret, region, token string, ex
 	case webIdentityTokenFile == "":
 		return "", "", "", "", time.Time{}, fmt.Errorf("AWS_WEB_IDENTITY_TOKEN_FILE not set")
 	}
-	if roleSessionName == "" {
-		roleSessionName = "default"
-	}
 
 	webIdentityToken, err := os.ReadFile(webIdentityTokenFile)
 	if err != nil {
 		return "", "", "", "", time.Time{}, fmt.Errorf("can't read web-identity token from %q: %w", webIdentityTokenFile, err)
 	}
 
-	if client == nil {
-		client = http.DefaultClient
-	}
+	client = cmp.Or(client, http.DefaultClient)
 
 	u, _ := url.Parse("https://sts.amazonaws.com/?Action=AssumeRoleWithWebIdentity&Version=2011-06-15")
 	q := u.Query()
@@ -256,12 +252,8 @@ func AmbientKey(service, regionName string, derive DeriveFn) (*SigningKey, error
 // S3EndPoint returns the endpoint of the object
 // storage service.
 func S3EndPoint(region string) string {
-	endPoint := os.Getenv("S3_ENDPOINT")
-	if endPoint == "" {
-		endPoint = fmt.Sprintf("https://s3.%s.amazonaws.com", region)
-	}
-	endPoint = strings.TrimSuffix(endPoint, "/")
-	return endPoint
+	endPoint := cmp.Or(os.Getenv("S3_ENDPOINT"), fmt.Sprintf("https://s3.%s.amazonaws.com", region))
+	return strings.TrimSuffix(endPoint, "/")
 }
 
 // B2EndPoint returns the endpoint of the Backblaze B2
@@ -314,11 +306,12 @@ func scan(in io.Reader, section string, into []scanspec) error {
 }
 
 // we don't allow credentials to be loaded
-// from world-writeable locations
+// from world-writeable locations. On Windows, access is governed by ACLs and
+// FileMode synthesizes permissions from the read-only attribute instead.
 func check(info fs.FileInfo) error {
 	mode := info.Mode()
 	switch {
-	case mode&2 != 0:
+	case runtime.GOOS != "windows" && mode&0002 != 0:
 		return fmt.Errorf("%s is world-writeable %o", info.Name(), mode)
 	case mode&fs.ModeType != 0:
 		return fmt.Errorf("%s is a special file", info.Name())
@@ -365,28 +358,29 @@ func EC2Role(role, service string, derive DeriveFn) (*SigningKey, error) {
 }
 
 // loadCredentials loads the credentials from the credentials file
-// and returns the id and secret.
-func loadCredentials(credentialsfile, profile string) (id, secret string, err error) {
+// and returns the id, secret, and optional session token.
+func loadCredentials(credentialsfile, profile string) (id, secret, token string, err error) {
 	f, err := os.Open(credentialsfile)
 	if err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 	defer f.Close()
 
 	info, err := f.Stat()
 	if err != nil {
-		return "", "", fmt.Errorf("examining credentials: %w", err)
+		return "", "", "", fmt.Errorf("examining credentials: %w", err)
 	}
 
 	if err := check(info); err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 
 	if err := scan(f, profile, []scanspec{
 		{"aws_access_key_id", &id},
 		{"aws_secret_access_key", &secret},
+		{"aws_session_token", &token},
 	}); err != nil {
-		return "", "", err
+		return "", "", "", err
 	}
 
 	return

@@ -52,10 +52,10 @@ func Metadata(path string) (io.ReadCloser, error) {
 	}
 	req.Header.Set("X-Aws-Ec2-Metadata-Token", string(token))
 	res, err = http.DefaultClient.Do(req)
-	if err != nil {
+	switch {
+	case err != nil:
 		return nil, err
-	}
-	if res.StatusCode != 200 {
+	case res.StatusCode != 200:
 		res.Body.Close()
 		return nil, fmt.Errorf("aws.Metadata: %s", res.Status)
 	}
@@ -86,15 +86,14 @@ func MetadataString(path string) (string, error) {
 	return string(buf), err
 }
 
-// when we are running on EC2,
-// we can guess the region thusly:
+// ec2Region reads the region from EC2 metadata.
 func ec2Region() (string, error) {
-	str, err := MetadataString("placement/availability-zone")
-	if err != nil {
+	str, err := MetadataString("placement/region")
+	switch {
+	case err != nil:
 		return "", err
+	case len(str) == 0:
+		return "", fmt.Errorf("unexpected region string %q", str)
 	}
-	if len(str) == 0 || str[len(str)-1] < 'a' || str[len(str)-1] > 'z' {
-		return "", fmt.Errorf("unexpected AZ string %q", str)
-	}
-	return str[:len(str)-1], nil
+	return str, nil
 }

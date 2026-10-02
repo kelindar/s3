@@ -15,10 +15,15 @@
 package s3
 
 import (
+	"bytes"
+	"encoding/xml"
 	"fmt"
 	"io"
 	"io/fs"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,7 +31,49 @@ import (
 	"github.com/kelindar/s3/fsutil"
 	"github.com/kelindar/s3/mock"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
+
+func TestListEncoding(t *testing.T) {
+	t.Run("escaped paths and opaque token", func(t *testing.T) {
+		object := "control\x01 +%☃.txt"
+		directory := "dir\x02 +%☃/"
+		token := "opaque%2B+token"
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			assert.Equal(t, "url", r.URL.Query().Get("encoding-type"))
+			key, prefix, encoding := object, directory, ""
+			if r.URL.Query().Get("encoding-type") == "url" {
+				key, prefix, encoding = url.PathEscape(object), url.PathEscape(directory), "url"
+			}
+			_, _ = fmt.Fprintf(w, `<ListBucketResult><EncodingType>%s</EncodingType><Contents><Key>%s</Key><ETag>etag%%2B</ETag><Size>0</Size></Contents><CommonPrefixes><Prefix>%s</Prefix></CommonPrefixes><NextContinuationToken>%s</NextContinuationToken></ListBucketResult>`, encoding, key, prefix, token)
+		}))
+		defer server.Close()
+		key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
+		prefix := &Prefix{Key: key, Bucket: "test-bucket", Path: "."}
+		result, err := prefix.list(0, "", "", "")
+		require.NoError(t, err)
+		require.Len(t, result.Contents, 1)
+		require.Len(t, result.CommonPrefixes, 1)
+		assert.Equal(t, object, result.Contents[0].Path())
+		assert.Equal(t, directory, result.CommonPrefixes[0].Path)
+		assert.Equal(t, "etag%2B", result.Contents[0].ETag)
+		assert.Equal(t, token, result.NextToken)
+	})
+
+	t.Run("invalid percent encoding", func(t *testing.T) {
+		for _, content := range []string{`<Contents><Key>bad%xy</Key></Contents>`, `<CommonPrefixes><Prefix>bad%xy/</Prefix></CommonPrefixes>`} {
+			t.Run(content, func(t *testing.T) {
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					_, _ = fmt.Fprintf(w, `<ListBucketResult><EncodingType>url</EncodingType>%s</ListBucketResult>`, content)
+				}))
+				defer server.Close()
+				key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
+				_, err := (&Prefix{Key: key, Bucket: "test-bucket", Path: "."}).list(0, "", "", "")
+				assert.Error(t, err)
+			})
+		}
+	})
+}
 
 func TestPrefix(t *testing.T) {
 	t.Run("basic properties", func(t *testing.T) {
@@ -121,7 +168,7 @@ func TestPrefix(t *testing.T) {
 		prefix.dirEOF = true
 		entries, err = prefix.ReadDir(-1)
 		assert.Empty(t, entries)
-		assert.ErrorIs(t, err, io.EOF)
+		assert.NoError(t, err)
 	})
 
 	t.Run("open", func(t *testing.T) {
@@ -421,25 +468,182 @@ func TestPrefix(t *testing.T) {
 		}
 	})
 
-	t.Run("client", func(t *testing.T) {
-		bucket := "test-bucket"
-		key := aws.DeriveKey("", "fake-access-key", "fake-secret-key", "us-east-1", "s3")
+}
 
-		// Test with nil client
-		prefix := &Prefix{
-			Key:    key,
-			Bucket: bucket,
-			Path:   "test/",
-			Client: nil,
+func TestSubdirectoryFS(t *testing.T) {
+	server := mock.New("test-bucket", "us-east-1")
+	defer server.Close()
+	key := aws.DeriveKey(server.URL(), "access", "secret", "us-east-1", "s3")
+	server.PutObject("logs/", nil)
+	for i := range 1001 {
+		server.PutObject(fmt.Sprintf("logs/file-%04d", i), []byte("contents"))
+	}
+	sub, err := fs.Sub(NewBucket(key, "test-bucket"), "logs")
+	require.NoError(t, err)
+	t.Run("open file", func(t *testing.T) {
+		data, err := fs.ReadFile(sub, "file-0000")
+		require.NoError(t, err)
+		assert.Equal(t, "contents", string(data))
+	})
+	t.Run("repeat listing", func(t *testing.T) {
+		for range 2 {
+			entries, err := fs.ReadDir(sub, ".")
+			require.NoError(t, err)
+			require.Len(t, entries, 1001)
+			assert.Equal(t, "file-0000", entries[0].Name())
+			assert.Equal(t, "file-1000", entries[1000].Name())
 		}
+	})
+	for _, n := range []int{-1, 0, 1500, 1} {
+		t.Run(fmt.Sprint(n), func(t *testing.T) {
+			p := &Prefix{Key: key, Bucket: "test-bucket", Path: "logs/"}
+			entries, err := p.ReadDir(n)
+			require.NoError(t, err)
+			want := 1001
+			if n == 1 {
+				want = 1
+			}
+			require.Len(t, entries, want)
+			assert.Equal(t, "file-0000", entries[0].Name())
+			if n <= 0 {
+				entries, err = p.ReadDir(n)
+				assert.Empty(t, entries)
+				assert.NoError(t, err)
+			}
+		})
+	}
+}
 
-		client := prefix.client()
-		assert.Equal(t, &DefaultClient, client)
+func TestListQuery(t *testing.T) {
+	server := mock.New("test-bucket", "us-east-1")
+	defer server.Close()
+	key := aws.DeriveKey("", "test", "test", "us-east-1", "s3")
+	key.BaseURI = server.URL()
+	prefix := &Prefix{Key: key, Bucket: "test-bucket", Path: "dir/"}
 
-		// Test with custom client
-		customClient := &http.Client{}
-		prefix.Client = customClient
-		client = prefix.client()
-		assert.Equal(t, customClient, client)
+	_, err := prefix.list(7, "next+ page", "file 2", "file")
+	require.NoError(t, err)
+	requests := server.GetRequestLog()
+	require.Len(t, requests, 1)
+	assert.Equal(t, "continuation-token=next%2B%20page&delimiter=%2F&encoding-type=url&list-type=2&max-keys=7&prefix=dir%2Ffile&start-after=dir%2Ffile%202", requests[0].Query)
+}
+
+func BenchmarkListXMLDecode(b *testing.B) {
+	for _, count := range []int{100, 1000} {
+		var fixture bytes.Buffer
+		fixture.WriteString("<ListBucketResult><IsTruncated>false</IsTruncated>")
+		for i := range count {
+			fmt.Fprintf(&fixture, "<Contents><Key>folder/file-%04d.txt</Key><LastModified>2026-01-02T03:04:05.000Z</LastModified><ETag>etag</ETag><Size>1</Size></Contents>", i)
+		}
+		fixture.WriteString("</ListBucketResult>")
+		data := fixture.Bytes()
+		b.Run(fmt.Sprint(count), func(b *testing.B) {
+			b.ReportAllocs()
+			for range b.N {
+				result, err := decodeListResponse(data)
+				switch {
+				case err != nil:
+					b.Fatal(err)
+				case len(result.Contents) != count:
+					b.Fatalf("decoded %d entries, want %d", len(result.Contents), count)
+				}
+			}
+		})
+	}
+}
+
+func TestListResponseDecode(t *testing.T) {
+	tests := []struct {
+		name string
+		xml  string
+	}{
+		{name: "empty", xml: `<ListBucketResult/>`},
+		{name: "objects and prefixes", xml: `<ListBucketResult xmlns="urn:s3"><IsTruncated>true</IsTruncated><Contents><Key>folder/a&amp;b.txt</Key><LastModified>2026-01-02T03:04:05.000Z</LastModified><ETag>&quot;e&quot;</ETag><Size>12</Size><StorageClass>STANDARD</StorageClass></Contents><CommonPrefixes><Prefix>folder/sub/</Prefix></CommonPrefixes><EncodingType>url</EncodingType><NextContinuationToken>next&amp;page</NextContinuationToken><Owner><ID>ignored</ID></Owner></ListBucketResult>`},
+		{name: "reordered fields", xml: `<ListBucketResult><NextContinuationToken>token</NextContinuationToken><Contents><Size>0</Size><ETag>etag</ETag><Key>key</Key></Contents><IsTruncated>false</IsTruncated></ListBucketResult>`},
+		{name: "numeric entities", xml: `<ListBucketResult><Contents><Key>emoji-&#x1F600;-&#38;.txt</Key></Contents></ListBucketResult>`},
+		{name: "invalid text terminator", xml: `<ListBucketResult><Contents><Key>a]]>b</Key></Contents></ListBucketResult>`},
+		{name: "escaped text terminator", xml: `<ListBucketResult><Contents><Key>a]]&gt;b</Key></Contents></ListBucketResult>`},
+		{name: "encoded scalar fallback", xml: `<ListBucketResult><IsTruncated>&#116;rue</IsTruncated><Contents><Key>key</Key><LastModified>2026-01-02T03:04:05&#90;</LastModified><Size>&#49;</Size></Contents></ListBucketResult>`},
+		{name: "xml declaration", xml: `<?xml version="1.0" encoding="UTF-8"?><ListBucketResult/>`},
+		{name: "comment fallback", xml: `<ListBucketResult><!--page--><Contents><Key>key</Key></Contents></ListBucketResult>`},
+		{name: "prefixed fallback", xml: `<s:ListBucketResult xmlns:s="urn:s3"><s:Contents><s:Key>key</s:Key></s:Contents></s:ListBucketResult>`},
+		{name: "invalid declaration", xml: `<?xml garbage?><ListBucketResult/>`},
+		{name: "invalid attribute", xml: `<ListBucketResult xmlns!="urn:s3"/>`},
+		{name: "bad scalar", xml: `<ListBucketResult><Contents><Size>bad</Size></Contents></ListBucketResult>`},
+		{name: "truncated", xml: `<ListBucketResult><Contents><Key>key</Key></Contents>`},
+	}
+	type standardListResponse listResponse
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got, err := decodeListResponse([]byte(test.xml))
+			var want listResponse
+			wantErr := xml.Unmarshal([]byte(test.xml), (*standardListResponse)(&want))
+			assert.Equal(t, wantErr != nil, err != nil)
+			if err == nil && wantErr == nil {
+				assert.Equal(t, want, got)
+			}
+		})
+	}
+}
+
+func TestListResponseOwnership(t *testing.T) {
+	data := []byte(`<ListBucketResult><Contents><Key>file.txt</Key><ETag>&quot;tag&quot;</ETag></Contents><CommonPrefixes><Prefix>dir/</Prefix></CommonPrefixes><NextContinuationToken>next</NextContinuationToken></ListBucketResult>`)
+	result, err := decodeListResponse(data)
+	require.NoError(t, err)
+	require.Len(t, result.Contents, 1)
+	require.Len(t, result.CommonPrefixes, 1)
+	for i := range data {
+		data[i] = 'x'
+	}
+	assert.Equal(t, "file.txt", result.Contents[0].Path())
+	assert.Equal(t, `"tag"`, result.Contents[0].ETag)
+	assert.Equal(t, "dir/", result.CommonPrefixes[0].Path)
+	assert.Equal(t, "next", result.NextToken)
+}
+
+func TestListReservation(t *testing.T) {
+	for _, size := range []int{1024, 3 << 20} {
+		t.Run(fmt.Sprint(size), func(t *testing.T) {
+			key := bytes.Repeat([]byte{'k'}, size)
+			p := listingXML{data: make([]byte, size+(32<<10))}
+			page := listResponse{Contents: make([]File, 1, 1000)}
+			require.NotPanics(t, func() { p.addObject(&page, key, []byte("tag")) })
+			p.flushObjects(&page)
+			assert.LessOrEqual(t, p.values.Cap(), 2*len(p.data), "reservation is bounded by the response size, allowing allocator rounding")
+			assert.Equal(t, string(key), page.Contents[0].Reader.Path)
+		})
+	}
+}
+
+func TestListBatchOwnership(t *testing.T) {
+	var body bytes.Buffer
+	body.WriteString("<ListBucketResult>")
+	for i := range 257 {
+		fmt.Fprintf(&body, "<Contents><ETag>&quot;tag-%d-%s&quot;</ETag><Key>dir/file-%04d%s&amp;x</Key><Size>%d</Size></Contents>", i, strings.Repeat("t", i%131), i, strings.Repeat("x", i%257), i)
+	}
+	body.WriteString("</ListBucketResult>")
+	data := body.Bytes()
+	var want standardListResponse
+	require.NoError(t, xml.Unmarshal(data, &want))
+	got, err := decodeListResponse(data)
+	require.NoError(t, err)
+	assert.Equal(t, listResponse(want), got)
+	clear(data)
+	assert.Equal(t, listResponse(want), got)
+}
+
+func FuzzListResponseDecode(f *testing.F) {
+	f.Add([]byte(`<ListBucketResult><Contents><Key>a]]>b</Key></Contents></ListBucketResult>`))
+	f.Add([]byte(`<ListBucketResult><Contents><Key>key</Key><Size>1</Size></Contents></ListBucketResult>`))
+	f.Add([]byte(`<ListBucketResult><CommonPrefixes><Prefix>dir/</Prefix></CommonPrefixes></ListBucketResult>`))
+	f.Add([]byte(`<ListBucketResult><IsTruncated>invalid</IsTruncated></ListBucketResult>`))
+	f.Fuzz(func(t *testing.T, data []byte) {
+		got, err := decodeListResponse(data)
+		var want standardListResponse
+		wantErr := xml.Unmarshal(data, &want)
+		assert.Equal(t, wantErr == nil, err == nil)
+		if err == nil {
+			assert.Equal(t, listResponse(want), got)
+		}
 	})
 }
