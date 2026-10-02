@@ -24,6 +24,7 @@ var defaultClient = newClient(func(addr string) (net.Conn, error) {
 func newClient(dial fasthttp.DialFunc) *fasthttp.Client {
 	return &fasthttp.Client{
 		ReadTimeout:               60 * time.Second,
+		MaxConnWaitTimeout:        60 * time.Second,
 		Dial:                      dial,
 		DisablePathNormalizing:    true,
 		StreamResponseBody:        true,

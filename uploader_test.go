@@ -24,6 +24,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/kelindar/s3/aws"
 	"github.com/kelindar/s3/mock"
@@ -301,6 +302,60 @@ func TestPartSize(t *testing.T) {
 	for _, size := range []int64{int64(MinPartSize) * MaxParts, int64(MinPartSize)*MaxParts + 1, 1<<63 - 1} {
 		partSize := calculatePartSize(size)
 		assert.LessOrEqual(t, (size-1)/partSize+1, int64(MaxParts), "size %d", size)
+	}
+}
+
+func TestCleanupTimeout(t *testing.T) {
+	for _, name := range []string{"upload", "compose"} {
+		t.Run(name, func(t *testing.T) {
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			aborted := make(chan struct{})
+			release := make(chan struct{})
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method {
+				case http.MethodPost:
+					_, _ = io.WriteString(w, `<InitiateMultipartUploadResult><Bucket>test-bucket</Bucket><Key>out</Key><UploadId>id</UploadId></InitiateMultipartUploadResult>`)
+				case http.MethodPut:
+					cancel()
+					w.WriteHeader(http.StatusPreconditionFailed)
+				case http.MethodDelete:
+					close(aborted)
+					if name == "compose" {
+						w.Header().Set("Content-Length", "4")
+						w.WriteHeader(http.StatusInternalServerError)
+						w.(http.Flusher).Flush()
+					}
+					<-release
+				}
+			}))
+			defer server.Close()
+			defer close(release)
+			key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
+			bucket := NewBucket(key, "test-bucket")
+			finished := make(chan error, 1)
+			go func() {
+				var err error
+				switch name {
+				case "upload":
+					err = bucket.WriteFrom(ctx, "out", bytes.NewReader(make([]byte, MinPartSize)), MinPartSize)
+				case "compose":
+					_, err = bucket.Compose(ctx, "out", []CopyPart{{SourceKey: "source", ETag: "etag", Size: MinPartSize}})
+				}
+				finished <- err
+			}()
+			select {
+			case <-aborted:
+			case <-time.After(time.Second):
+				t.Fatal("cancelled multipart operation did not attempt cleanup")
+			}
+			select {
+			case err := <-finished:
+				assert.ErrorIs(t, err, context.Canceled)
+			case <-time.After(6 * time.Second):
+				t.Fatal("multipart cleanup did not time out")
+			}
+		})
 	}
 }
 

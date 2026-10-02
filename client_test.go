@@ -179,6 +179,75 @@ func TestHTTPS(t *testing.T) {
 	}
 }
 
+func TestConnectionWait(t *testing.T) {
+	for _, name := range []string{"release", "cancel", "deadline"} {
+		t.Run(name, func(t *testing.T) {
+			previous := defaultClient
+			client := newClient(previous.Dial)
+			client.MaxConnsPerHost = 1
+			defaultClient = client
+			defer func() {
+				client.CloseIdleConnections()
+				defaultClient = previous
+			}()
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = io.WriteString(w, "body")
+			}))
+			defer server.Close()
+			key := aws.DeriveKey(server.URL, "access", "secret", "us-east-1", "s3")
+			first, err := doSigned(context.Background(), key, http.MethodGet, server.URL, nil)
+			require.NoError(t, err)
+			defer first.Body.Close()
+
+			ctx := context.Background()
+			cancel := func() {}
+			switch name {
+			case "cancel":
+				ctx, cancel = context.WithCancel(ctx)
+			case "deadline":
+				ctx, cancel = context.WithTimeout(ctx, 200*time.Millisecond)
+			}
+			defer cancel()
+			finished := make(chan error, 1)
+			go func() {
+				res, err := doSigned(ctx, key, http.MethodGet, server.URL, nil)
+				if res != nil {
+					_, err = io.Copy(io.Discard, res.Body)
+					_ = res.Body.Close()
+				}
+				finished <- err
+			}()
+			select {
+			case err := <-finished:
+				t.Fatalf("request returned while the connection was occupied: %v", err)
+			case <-time.After(20 * time.Millisecond):
+			}
+
+			switch name {
+			case "release":
+				_, err := io.Copy(io.Discard, first.Body)
+				require.NoError(t, err)
+				require.NoError(t, first.Body.Close())
+			case "cancel":
+				cancel()
+			}
+			select {
+			case err := <-finished:
+				switch name {
+				case "release":
+					assert.NoError(t, err)
+				case "cancel":
+					assert.ErrorIs(t, err, context.Canceled)
+				case "deadline":
+					assert.ErrorIs(t, err, context.DeadlineExceeded)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("request did not stop after release or cancellation")
+			}
+		})
+	}
+}
+
 func TestClient(t *testing.T) {
 	t.Run("lost conditional response", func(t *testing.T) {
 		for name, condition := range map[string]Condition{"create": IfNoneMatch("*"), "replace": IfMatch("old")} {

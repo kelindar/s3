@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/kelindar/s3/aws"
 	"github.com/valyala/fasthttp"
@@ -427,6 +428,7 @@ func (u *uploader) ETag() string {
 }
 
 // Abort aborts a multi-part upload.
+// It waits at most five seconds, or less if ctx expires sooner.
 //
 // Abort is *not* safe to call concurrently
 // with Start, Close, or UploadPart.
@@ -443,6 +445,9 @@ func (u *uploader) Abort(ctx context.Context) error {
 	if !u.started || u.finished {
 		return nil
 	}
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+
 	req := u.signedRequest(fasthttp.MethodDelete, "uploadId="+queryEscape(u.id), nil)
 	defer fasthttp.ReleaseRequest(req)
 	res, err := doFastRequest(ctx, req)
