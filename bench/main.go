@@ -13,7 +13,7 @@ import (
 	"time"
 
 	sdkaws "github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/aws/signer/v4"
+	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	sdk "github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/kelindar/bench"
 	"github.com/kelindar/s3"
@@ -28,7 +28,7 @@ const (
 )
 
 func main() {
-	bench.Run(suite, bench.WithFile("bench.gob"), bench.WithReference())
+	bench.Run(suite, bench.WithFile("bench.gob"), bench.WithConfidence(95), bench.WithReference())
 }
 
 func suite(b *bench.B) {
