@@ -225,9 +225,9 @@ func TestReadAtBounds(t *testing.T) {
 			assert.ErrorIs(t, err, test.err)
 			if test.n == 2 {
 				assert.Equal(t, "cd", string(dst[:n]))
-			} else {
-				assert.Equal(t, before, requests.Load())
+				return
 			}
+			assert.Equal(t, before, requests.Load())
 		})
 	}
 	for _, test := range []struct{ off, width int64 }{{-1, 1}, {0, -1}, {1<<63 - 1, 2}, {0, 0}} {

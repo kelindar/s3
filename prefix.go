@@ -186,10 +186,10 @@ func (p *Prefix) ReadDir(n int) ([]fs.DirEntry, error) {
 }
 
 func (p *Prefix) readDirContext(ctx context.Context, n int) ([]fs.DirEntry, error) {
-	if p.dirEOF {
-		if n > 0 {
-			return nil, io.EOF
-		}
+	switch {
+	case p.dirEOF && n > 0:
+		return nil, io.EOF
+	case p.dirEOF:
 		return nil, nil
 	}
 	var entries []fs.DirEntry

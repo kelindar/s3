@@ -482,10 +482,7 @@ func (u *uploader) UploadFrom(ctx context.Context, r io.ReaderAt, size int64) er
 	if len(u.parts) == 0 && cap(u.parts) < partCount {
 		u.parts = make([]tagpart, 0, partCount)
 	}
-	parallel := 0
-	if nonfinal > 0 {
-		parallel = min(int(nonfinal), 40)
-	}
+	parallel := int(min(max(nonfinal, 0), 40))
 
 	g, uploadCtx := errgroup.WithContext(ctx)
 	g.SetLimit(parallel)

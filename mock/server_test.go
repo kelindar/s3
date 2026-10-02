@@ -55,11 +55,11 @@ func TestRangeBounds(t *testing.T) {
 			start, end, err := parseRange(test.header, test.length)
 			if test.invalid {
 				assert.Error(t, err)
-			} else {
-				require.NoError(t, err)
-				assert.Equal(t, test.start, start)
-				assert.Equal(t, test.end, end)
+				return
 			}
+			require.NoError(t, err)
+			assert.Equal(t, test.start, start)
+			assert.Equal(t, test.end, end)
 		})
 	}
 }
@@ -241,9 +241,9 @@ func TestFastMultipart(t *testing.T) {
 			assert.Equal(t, "NoSuchUpload", missing.Code)
 			if test.logging {
 				assert.Equal(t, 7, m.RequestCount())
-			} else {
-				assert.Zero(t, m.RequestCount())
+				return
 			}
+			assert.Zero(t, m.RequestCount())
 		})
 	}
 }

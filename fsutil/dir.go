@@ -407,17 +407,12 @@ func walkInto(f fs.FS, name, seek, pattern string, d DirEntry, fn WalkDirFn) err
 		}
 		return err
 	}
-	err := visitDir(f, name, seek1, pattern1, outer)
-	if err == fs.SkipAll {
-		err = nil
-	}
-	if err != nil {
+	if err := visitDir(f, name, seek1, pattern1, outer); err != nil && err != fs.SkipAll {
 		// report err to caller
-		err = fn(name, d, err)
-		if err != nil {
-			if err == fs.SkipDir {
-				err = nil
-			}
+		switch err := fn(name, d, err); {
+		case err == fs.SkipDir:
+			return nil
+		case err != nil:
 			return err
 		}
 	}

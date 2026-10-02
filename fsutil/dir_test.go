@@ -124,9 +124,9 @@ func TestVisitDirSkip(t *testing.T) {
 				assert.Equal(t, 1, calls)
 				if tc.want == nil {
 					assert.NoError(t, err)
-				} else {
-					assert.ErrorIs(t, err, tc.want)
+					return
 				}
+				assert.ErrorIs(t, err, tc.want)
 			})
 		}
 	}

@@ -148,15 +148,14 @@ func (b *Bucket) write(ctx context.Context, key string, contents []byte, conditi
 	var res *response
 	var err error
 	var ifMatch string
-	if condition == nil {
+	switch {
+	case condition == nil:
 		res, err = doObject(ctx, b.key, http.MethodPut, b.bkt, key, contents)
-	} else {
-		switch {
-		case ctx == nil:
-			return "", false, errors.New("s3 request: nil context")
-		case ctx.Err() != nil:
-			return "", false, ctx.Err()
-		}
+	case ctx == nil:
+		return "", false, errors.New("s3 request: nil context")
+	case ctx.Err() != nil:
+		return "", false, ctx.Err()
+	default:
 		header := make(http.Header)
 		if err := condition(header); err != nil {
 			return "", false, fmt.Errorf("s3 PUT condition: %w", err)

@@ -235,9 +235,9 @@ func TestCreds(t *testing.T) {
 		require.NoError(t, err)
 		if runtime.GOOS == "windows" {
 			assert.NoError(t, check(info))
-		} else {
-			assert.ErrorContains(t, check(info), "is world-writeable")
+			return
 		}
+		assert.ErrorContains(t, check(info), "is world-writeable")
 	})
 
 	t.Run("ambient local", func(t *testing.T) {
